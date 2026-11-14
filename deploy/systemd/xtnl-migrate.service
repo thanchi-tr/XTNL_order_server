@@ -1,0 +1,53 @@
+# XTNL schema migrations (src/db/migrate.py; operations.md s12). Install as
+# /etc/systemd/system/xtnl-migrate.service on both engine nodes.
+#
+# An OPERATOR job: run it once, from either node, BEFORE a rolling switchover:
+#     sudo systemctl start xtnl-migrate.service && journalctl -u xtnl-migrate -n 50
+# It is never pulled in by xtnl-engine.service (no WantedBy / Requires): schema changes are
+# expand / contract and must not run at engine start-up. When both units are started in one transaction,
+# Before= makes the migration finish first.
+#
+# The runner applies src/db/migrations/NNNN_*.sql in order, each in its own transaction with
+# lock_timeout 2 s (a lost lock wait or deadlock is rolled back and retried 5 times with back-off, so no
+# Restart= is needed), under a session advisory lock (concurrent runs serialise), and refuses a changed
+# applied file (MigrationDrift). It prints only the redacted DSN.
+
+[Unit]
+Description=XTNL PostgreSQL schema migrations (operator job, before a switchover)
+Documentation=file:///opt/xtnl/order-server/docs/runbooks/install-node.md
+After=network-online.target
+Wants=network-online.target
+Before=xtnl-engine.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+User=xtnl
+Group=xtnl
+WorkingDirectory=/opt/xtnl/order-server
+EnvironmentFile=/etc/xtnl/engine.env
+# Optional override: ORDER_SERVER_DSN for the schema-owner role (DDL rights the engine role lacks).
+EnvironmentFile=-/etc/xtnl/migrate.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# journald tag; rsyslog (deploy/observability/logs) writes it to /var/log/xtnl/xtnl-migrate.log for the off-node shipping
+SyslogIdentifier=xtnl-migrate
+ExecStart=/opt/xtnl/order-server/.venv/bin/python -m src.db.migrate
+TimeoutStartSec=600
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+UMask=0027

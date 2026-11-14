@@ -1,0 +1,12 @@
+# pgBackRest repo cipher passphrase (operations.md s8; IMPLEMENTATION_PLAN 7.3). Install on both PostgreSQL
+# members (and the DR stack) as
+#     /etc/pgbackrest/conf.d/xtnl-cipher.conf    0640 root:postgres
+# with the passphrase rendered from Secrets Manager by the provisioning job (never typed into a shell or a
+# ticket). pgBackRest concatenates every *.conf in /etc/pgbackrest/conf.d with /etc/pgbackrest/pgbackrest.conf,
+# so archive-push / archive-get (run by PostgreSQL under Patroni), the replica restore, xtnl-pitr-guard,
+# xtnl-pg-backup and the operator commands all read it without any environment variable.
+# Losing this passphrase makes every backup and archived WAL in the repo unreadable: keep it in Secrets Manager
+# in BOTH regions (the Melbourne DR restore needs it too).
+
+[global]
+repo1-cipher-pass=CHANGE_ME

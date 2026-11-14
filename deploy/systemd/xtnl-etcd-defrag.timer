@@ -1,0 +1,15 @@
+# Runs xtnl-etcd-defrag.service weekly on every etcd member (operations.md §1). All three fire together; the
+# etcd lock makes it rolling. Saturday 04:00 UTC, while FX markets are closed.
+#     sudo systemctl enable --now xtnl-etcd-defrag.timer
+
+[Unit]
+Description=XTNL weekly rolling etcd defrag
+
+[Timer]
+OnCalendar=Sat *-*-* 04:00:00 UTC
+RandomizedDelaySec=2min
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

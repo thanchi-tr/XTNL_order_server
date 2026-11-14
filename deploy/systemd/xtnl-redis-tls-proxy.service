@@ -1,0 +1,50 @@
+# XTNL Redis TLS proxy for the Melbourne dashboard (operations.md s9 Dashboard; IMPLEMENTATION_PLAN 7.3). Install
+# as /etc/systemd/system/xtnl-redis-tls-proxy.service on engine nodes A and B (apt install stunnel4), with
+# deploy/redis/redis-tls-proxy.conf rendered to /etc/xtnl/redis-tls-proxy.conf and the certificates in
+# /etc/xtnl/redis-tls-proxy/ (0600 root). It listens on ${NODE_IP}:6380 (mutual TLS) and forwards to the local
+# Redis on 127.0.0.1:6379, where the dashboard can only use the read-only ACL user xtnl_dashboard.
+# It never touches the engine and never sends anything to a broker; stopping it only blanks the dashboard's
+# live values (they are then shown as stale).
+
+[Unit]
+Description=XTNL Redis TLS proxy for the read-only Melbourne dashboard
+After=network-online.target redis-server.service
+Wants=network-online.target
+ConditionPathExists=/etc/xtnl/redis-tls-proxy.conf
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/bin/stunnel /etc/xtnl/redis-tls-proxy.conf
+LoadCredential=tls.crt:/etc/xtnl/redis-tls-proxy/tls.crt
+LoadCredential=tls.key:/etc/xtnl/redis-tls-proxy/tls.key
+LoadCredential=client-ca.crt:/etc/xtnl/redis-tls-proxy/client-ca.crt
+SyslogIdentifier=xtnl-redis-tls-proxy
+Restart=always
+RestartSec=5
+
+MemoryMax=128M
+TasksMax=64
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

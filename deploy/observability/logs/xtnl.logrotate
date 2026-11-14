@@ -1,0 +1,15 @@
+# XTNL log files written by rsyslog (logs/30-xtnl-rsyslog.conf). Install as /etc/logrotate.d/xtnl on both engine
+# nodes. The off-node copy lives in CloudWatch Logs (retention 90 days); the node keeps 7 days.
+/var/log/xtnl/*.log {
+    daily
+    rotate 7
+    maxsize 512M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate
+    endscript
+}

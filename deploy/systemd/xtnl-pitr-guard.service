@@ -1,0 +1,25 @@
+# XTNL PITR guard (operations.md §8): an immediate incremental backup after a dropped WAL or a timeline
+# switch. Install as /etc/systemd/system/xtnl-pitr-guard.service on both PostgreSQL members, with
+# deploy/observability/xtnl-pitr-guard.sh as /usr/local/bin/xtnl-pitr-guard and xtnl-pitr-guard.timer.
+# Started every minute by the timer; it never touches the engine and never sends anything to a broker.
+
+[Unit]
+Description=XTNL PITR guard (incremental backup after WAL loss / timeline switch)
+Documentation=file:///opt/xtnl/order-server/docs/runbooks/off-node-alerts.md
+After=patroni.service
+ConditionPathExists=/usr/local/bin/xtnl-pitr-guard
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+ExecStart=/usr/local/bin/xtnl-pitr-guard check
+TimeoutStartSec=6h
+StateDirectory=xtnl-pitr-guard
+StateDirectoryMode=0750
+Environment=XTNL_PITR_STATE_DIR=/var/lib/xtnl-pitr-guard
+# The repo cipher passphrase comes from /etc/pgbackrest/conf.d/xtnl-cipher.conf (deploy/patroni/pgbackrest.conf),
+# which also serves the Patroni on_role_change callback (no systemd environment there).
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes

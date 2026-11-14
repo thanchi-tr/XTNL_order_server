@@ -1,0 +1,13 @@
+# Runs xtnl-pitr-guard.service every minute (operations.md §8). Enable on both PostgreSQL members:
+#     sudo systemctl enable --now xtnl-pitr-guard.timer
+
+[Unit]
+Description=XTNL PITR guard every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

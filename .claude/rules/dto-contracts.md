@@ -1,0 +1,55 @@
+---
+paths:
+  - "src/dto/**"
+  - "src/pubsub/**"
+---
+
+# DTO Schema & Pub-Sub Isolation Rules
+
+1. **Strict Topic Separation (one bounded queue per entity):**
+   - `orders.internal.dto`: `OrderDTO` state transitions (`PENDING`, `WORKING`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`, `REJECTED`).
+   - `position.state.dto`: `PositionDTO` (open trades: units, stop, take-profit, `OPEN` / `CLOSED`).
+   - `market.price.dto`: `PriceDTO` ticks.
+   - `account.state.dto`: `AccountDTO` and `CashFlowDTO` (both account-scoped).
+   - Never multiplex orders, positions, prices and account data on the same `asyncio.Queue` or stream channel.
+2. **Versioning (which copy of an entity is newer):**
+   - **`seq_id`** is stamped by the ingestion orchestrator, never by an adapter. It is a hybrid logical clock, `seq_id = max(epoch_ms << 20, last + 1)`, seeded at start-up (**before** SM4 SNAPSHOTTING) from `MAX(seq_id)` in PostgreSQL, and re-seeded after every epoch bump (LEADER_INIT). It gives event-log order and is the **last** tie-breaker only. `checksum` covers the broker payload fields, not `seq_id` or the version fields.
+   - Every stateful DTO (`OrderDTO`, `PositionDTO`, `AccountDTO`) carries `broker_updated_at_ms`, `broker_seq: Optional[int]` and `source: Literal["STREAM", "REST"]`.
+   - **Declared per (adapter, entity type):**
+     - whether `broker_seq` exists. If it does, every row of that type carries one; a row that lacks it inherits the entity's last seen `broker_seq`.
+     - whether broker time exists. If any source of the type lacks a broker record timestamp (e.g. StoneX account data, or StoneX positions whose stream item carries none), every row of that type uses **local time**: receipt time for stream rows, send time for REST rows.
+     - In the broker-time domain, an untimed REST row is labelled with the adapter's **stream watermark** at send time. Never put a local-clock value in the broker-time slot.
+   - **Compare in two steps:**
+     1. Key = (`broker_seq`, `broker_updated_at_ms`, `observed_seq`). `observed_seq` is the HLC value when the row was observed: the arrival for a `STREAM` row, and the moment the request was **sent** for a `REST` row. At equal broker revision and time, the later observation wins: a REST row read after a stream frame beats it, and a stream frame that arrived after the REST request was sent beats the REST row. (An untimed REST row is still labelled with the stream watermark's broker time; its later `observed_seq` wins the tie.)
+     2. If the incoming checksum equals the stored checksum (same content), the write is a **no-op**: it only advances the stored version, in PostgreSQL's current row (`orders_state`, `positions_state`, `account_state`) in the same transaction and then in Redis, with both digests updated. It produces no feed entry and no history row. `seq_id` breaks a tie only when the keys are equal and the content differs.
+   - A `broker_updated_at_ms` more than 5 s ahead of local receipt is rejected with reason `future_timestamp` (DLQ + alert).
+   - In Lua, compare versions as zero-padded fixed-width strings (or split `(ms, counter)` pairs), never with `tonumber()`.
+3. **Immutable Canonical Fields (all `frozen=True`, `Decimal` for money and quantities):**
+   - `OrderDTO`: `client_order_id`, `broker_order_id`, `account_id`, `adapter_id`, `symbol`, `side: Literal["BUY", "SELL"]`, `status: OrderStatus`, `entry_price`, `stop_loss: Optional`, `take_profit: Optional`, `ordered_units: Optional`, `remaining_units: Optional` (ordered − filled), `instrument_unknown: bool`, `raw_qty: Optional`, `is_reduce_only: bool`, `linked_position_id: Optional[str]`, the version fields, `seq_id`, `checksum`.
+     - `instrument_unknown: bool` (also on `PositionDTO`): true when the symbol is still missing after an instrument refresh; the unit fields are then null and `raw_qty` carries the broker quantity. The RiskSweep treats such an entity as UNKNOWN (`risk_unknown`, a capped SOFT state after 30 s), and its `opening_units` are unknown, so aggregate risk is UNKNOWN too. Units are non-null whenever `instrument_unknown` is false.
+     - `is_reduce_only` is set only from explicit broker evidence: a cTrader `closingOrder` or SL/TP order type, a StoneX if-done stop/limit child of a parent order, or a StoneX closing trade (an order that closes or offsets a referenced position, `linked_position_id` = that position).
+     - No risk field: Oversee owns risk.
+   - `PositionDTO`: `position_id`, `account_id`, `adapter_id`, `symbol`, `side`, `units: Optional`, `instrument_unknown: bool`, `raw_qty: Optional`, `entry_price`, `stop_loss: Optional`, `take_profit: Optional`, `status: Literal["OPEN", "CLOSED"]`, `opened_by_client_order_id: Optional`, `accrued_swap`, `commission`, the version fields, `seq_id`, `checksum`. No unrealised P&L: positions are marked from prices.
+   - `AccountDTO` is **versioned on state only**: `account_id`, `adapter_id`, `currency`, `balance`, `realised_pnl_today`, the version fields, `seq_id`, `checksum`. Its current row lives in PostgreSQL `account_state`; history in `account_snapshots`.
+     - The live mark-to-market fields (`equity: Optional` (None on cTrader), `margin_used`, `free_margin`, `unrealised_pnl`) are not versioned. They go to the coalesced Redis key `account_live:{account_id}`.
+   - `CashFlowDTO`: `transaction_id` (dedupe key), `account_id`, `adapter_id`, `kind: Literal["DEPOSIT", "WITHDRAWAL", "TRADE_PNL", "FINANCING", "COMMISSION", "ADJUSTMENT"]`, `amount`, `currency`, `broker_ts`, `seq_id`, `checksum`. Only `DEPOSIT` / `WITHDRAWAL` are transfers; the other kinds explain balance moves as P&L. `TRADE_PNL` is the realised P&L of one closing deal (cTrader deal `closePositionDetail`; StoneX trade history, to confirm), keyed by the deal id, so every booked balance move has a ledger entry.
+   - `PriceDTO`: `adapter_id`, `symbol`, `bid`, `ask`, `spread_pips`, `timestamp_ms`, `seq_id`. Prices are per (adapter, symbol): both brokers may quote the same symbol, and each position is marked with its own adapter's prices.
+   - `InstrumentSpec`: `adapter_id`, `symbol`, `base_ccy`, `quote_ccy`, `pnl_ccy`, `contract_size`, `unit_kind: Literal["UNITS", "CENTI_UNITS", "LOTS", "CONTRACTS", "STAKE"]`, `point_size`, `min_qty`, `swap_booked_to_balance: bool`. Mark thresholds such as `max_clean_spread_pips` live in rule config, not here.
+4. **Non-Blocking Publish:** `put_nowait()` into bounded queues. Never block the ingestion loop on subscribers or on database / disk I/O.
+   - `QueueFull`, schema-invalid and `future_timestamp` events on the order, position and account topics go to `DlqSpooler.offer()`: a pure in-memory append, with no I/O, no `fsync` and no `await`.
+   - The spooler's `flush()` task batch-inserts into `events_dlq`. When PostgreSQL is down it writes the spill file through `asyncio.to_thread`. The file is drained into `events_dlq` (idempotent on a payload hash) as soon as PostgreSQL accepts writes again, and at start-up after a crash; any node may drain its own file (`tier-persistence.md` §5).
+   - **Never stop reading a socket.** If the topic queue **and** the spooler ring are both full, set `backpressure_overflow`:
+     - drop price frames at the parser;
+     - open a **gap** for order / position / account frames that could not be handed over, delete that stream's `conn:` health key, and set its PostgreSQL `stream_health.conn_lost_at` (cleared once the gap is reconciled), which is what Oversee's fence reads;
+     - once the ring is below 50 %, SM4 enters `RESYNCING`.
+   - Consumer-side failures (unacked, timed out) also go to `events_dlq`. `market.price.dto` keeps the latest tick per (adapter_id, symbol).
+5. **Transitions:**
+   - **Initial status:** an entity is created in whatever status it is first observed in. That is `PENDING` from a stream, or any status from a snapshot or resync; a first observation is never a violation.
+   - Accept a change only when the version compare in §2 says it is newer and `[checksum valid]`. A **lower** version is dropped and recorded in `event_log` only, never parked.
+   - **Amends:** a same-status change of `stop_loss` / `take_profit` with a newer version is legal (`WORKING`, `PARTIALLY_FILLED`, `OPEN` self-loops).
+   - **Violations** go to the DLQ: an illegal transition (e.g. `FILLED → WORKING`), a missing `client_order_id` where the orchestrator requires one, or `future_timestamp`. Accepted deviation: `require_client_order_id` is off by default, because StoneX's `client_order_id` is its broker `OrderId` (there is no client-assigned id to require).
+   - **Fills:** **opening** fills open or grow the position (SM7). **Reducing** fills (closing trades, and filled reduce-only children) reduce or close the linked position and never open a new one. On StoneX, the first ORDERS item that reports filled units > 0 emits `PositionDTO(OPEN)`. Later ORDERS items for that `OrderId` update **both** the `OrderDTO` (`remaining_units`, status) and the `PositionDTO` (units) until the order is terminal; after that they map to the `PositionDTO` only. On cTrader, positions arrive natively.
+   - A partial fill seen while `PENDING` is applied as an implied ack (`PENDING → WORKING → PARTIALLY_FILLED`).
+   - SM7 instances are created only from `PositionDTO`s.
+6. **Single Publisher:** Only the ingestion orchestrator publishes to the four topics. Adapters, the DLQ recovery worker, and Oversee never publish directly.
+7. **Oversee Is Not a Bus Subscriber:** Oversee never subscribes to a bus topic. Its feed observer reads the post-commit Redis Stream `oversee:feed`; its RiskSweep reads PostgreSQL and the Redis price / live keys (`oversee-rules.md` §1–§2).

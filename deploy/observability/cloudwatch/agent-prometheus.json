@@ -1,0 +1,776 @@
+{
+ "agent": {
+  "run_as_user": "cwagent"
+ },
+ "logs": {
+  "logs_collected": {
+   "files": {
+    "collect_list": [
+     {
+      "file_path": "/var/log/xtnl/xtnl-engine.log",
+      "log_group_name": "/xtnl/engine",
+      "log_stream_name": "{hostname}/xtnl-engine",
+      "retention_in_days": 90,
+      "timezone": "UTC"
+     },
+     {
+      "file_path": "/var/log/xtnl/xtnl-migrate.log",
+      "log_group_name": "/xtnl/ops",
+      "log_stream_name": "{hostname}/xtnl-migrate",
+      "retention_in_days": 90,
+      "timezone": "UTC"
+     },
+     {
+      "file_path": "/var/log/xtnl/xtnl-pitr-guard.log",
+      "log_group_name": "/xtnl/ops",
+      "log_stream_name": "{hostname}/xtnl-pitr-guard",
+      "retention_in_days": 90,
+      "timezone": "UTC"
+     },
+     {
+      "file_path": "/var/log/xtnl/xtnl-pg-backup.log",
+      "log_group_name": "/xtnl/ops",
+      "log_stream_name": "{hostname}/xtnl-pg-backup",
+      "retention_in_days": 90,
+      "timezone": "UTC"
+     },
+     {
+      "file_path": "/var/log/xtnl/xtnl-etcd-defrag.log",
+      "log_group_name": "/xtnl/ops",
+      "log_stream_name": "{hostname}/xtnl-etcd-defrag",
+      "retention_in_days": 90,
+      "timezone": "UTC"
+     }
+    ]
+   }
+  },
+  "force_flush_interval": 5,
+  "metrics_collected": {
+   "prometheus": {
+    "prometheus_config_path": "/opt/aws/amazon-cloudwatch-agent/etc/xtnl-prometheus.yaml",
+    "emf_processor": {
+     "metric_namespace": "XTNL",
+     "metric_declaration": [
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_exporter_up$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "role"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_node_role$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_engine_epoch$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_epoch_change_age_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_epoch_changes_30m$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_safe_hold$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_leader_colocated_with_primary$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_lease_renew_p99_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_lease_remaining_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "subject"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_health_record_age_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "subject"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_health_hard_checks_ok$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "subject"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_health_campaign_eligible$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "subject"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_health_spill_file_bytes$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "member"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_etcd_endpoint_healthy$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_etcd_has_leader$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "member"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_etcd_db_quota_ratio$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_etcd_alarms_active$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "member"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_patroni_member_running$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_patroni_has_leader$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_patroni_sync_standby_count$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "member"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_pg_replication_lag_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "member"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_pg_timeline$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "member"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_wal_archive_failed_total$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "member"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_wal_archive_age_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "mount"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_disk_used_ratio$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_redis_used_memory_ratio$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_feed_stream_length$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_feed_pending_entries$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_feed_oldest_pending_age_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "adapter",
+         "stream"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_ingest_events_total$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "topic"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_bus_queue_depth$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_dlq_spool_ring_depth$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "status"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_dlq_rows$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "adapter",
+         "state"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_adapter_state$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "adapter"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_rest_bucket_tokens$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "adapter",
+         "priority"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_rest_requests_total$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "stream"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_frames_lost_total$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_risksweep_pass_duration_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_risksweep_oldest_pass_age_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_event_loop_lag_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_clock_offset_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "adapter"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_token_age_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "adapter"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_token_expires_in_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "cert"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_cert_expires_in_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_engine_uptime_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_suspended_gaps_total$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_offline_gap_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "adapter",
+         "complete"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_catchup_runs_total$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "adapter",
+         "kind"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_catchup_rows_total$"
+       ]
+      }
+     ]
+    }
+   }
+  }
+ },
+ "_comment": "GENERATED by deploy/observability/gen_alerts.py; scrape job xtnl-engine on :9464 every 5 s (cloudwatch/xtnl-prometheus.yaml); logs from /var/log/xtnl"
+}

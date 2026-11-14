@@ -1,0 +1,181 @@
+# Patroni (>= 4.0) configuration template for PostgreSQL 17 (operations.md s1, s3, s7, s8).
+# Install as /etc/patroni/patroni.yml on engine nodes A and B (never on the witness). Replace ${...}.
+# Passwords are NOT in this file: Patroni reads them from its environment file /etc/patroni/patroni.env
+# (0600 root): PATRONI_SUPERUSER_PASSWORD, PATRONI_REPLICATION_PASSWORD, PATRONI_REWIND_PASSWORD,
+# PATRONI_RESTAPI_PASSWORD, filled from AWS Secrets Manager at provisioning time.
+#
+# Invariants (asserted by tests/deploy/test_deploy_assets.py):
+#   * synchronous_mode: true: a commit is acknowledged only once the sync standby has flushed it -> RPO 0
+#     for committed data while the sync standby is healthy, and Patroni only ever promotes the sync standby.
+#   * synchronous_mode_strict: false (operations.md s1, s3, s6): when the standby is lost, commits stall
+#     for at most ~20 s (wal_sender_timeout 10 s + keepalives) until Patroni drops the sync requirement;
+#     the cluster then runs ASYNC and the off-node "sync standby missing" alert fires as CRITICAL
+#     (suppressed only inside a declared maintenance window). Setting it to true would stall every engine
+#     commit until an operator acts, which the 24/7 design rejects. To pin RPO 0 during a drill:
+#         patronictl edit-config -s synchronous_mode_strict=true    (and back to false afterwards)
+#     Runbook: failover-and-switchover.md, "standby lost".
+#   * ttl 15 / loop_wait 5 / retry_timeout 5, failsafe_mode, primary_start_timeout 0 (promote the sync
+#     standby at once instead of retrying a primary that will not restart).
+#   * idle_in_transaction_session_timeout 10 s: the integrity worker's MAX_TXN_MS (15 000 ms,
+#     src/integrity/worker.py) must be >= statement_timeout (5 s, set by the engine pool) + this value.
+#   * archive_mode=always on both members, pgBackRest stanza 'xtnl' (deploy/patroni/pgbackrest.conf).
+
+scope: xtnl-pg
+namespace: /service/
+name: '${PG_MEMBER_NAME}'                      # pg-a | pg-b
+
+log:
+  level: INFO
+  type: json
+
+restapi:
+  listen: ${NODE_IP}:8008
+  connect_address: ${NODE_IP}:8008
+  certfile: /etc/patroni/pki/${PG_MEMBER_NAME}.crt
+  keyfile: /etc/patroni/pki/${PG_MEMBER_NAME}.key
+  cafile: /etc/patroni/pki/ca.crt
+  authentication:
+    username: patroni_api                      # password: PATRONI_RESTAPI_PASSWORD
+
+ctl:
+  certfile: /etc/patroni/pki/${PG_MEMBER_NAME}.crt
+  keyfile: /etc/patroni/pki/${PG_MEMBER_NAME}.key
+  cacert: /etc/patroni/pki/ca.crt
+
+etcd3:
+  hosts:
+    - ${NODE_A_IP}:2379
+    - ${NODE_B_IP}:2379
+    - ${WITNESS_IP}:2379
+  protocol: https
+  cacert: /etc/etcd/pki/ca.crt
+  # Client certificate for etcd client-cert-auth (deploy/etcd/etcd.conf.yml), issued by the same internal CA
+  # as the engine's XTNL_ETCD_CERT. Paths are placeholders; the key file stays 0640 root:postgres.
+  cert: /etc/patroni/pki/${PG_MEMBER_NAME}-etcd-client.crt
+  key: /etc/patroni/pki/${PG_MEMBER_NAME}-etcd-client.key
+
+bootstrap:
+  dcs:
+    ttl: 15
+    loop_wait: 5
+    retry_timeout: 5
+    maximum_lag_on_failover: 1048576     # only matters while degraded to async; sync standby is always eligible
+    synchronous_mode: true
+    synchronous_mode_strict: false       # degrade to async with a CRITICAL alert, never stall forever
+    synchronous_node_count: 1
+    failsafe_mode: true
+    primary_start_timeout: 0
+    check_timeline: true
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        # --- replication / durability (RPO 0) ---
+        wal_level: replica
+        hot_standby: 'on'
+        synchronous_commit: 'on'
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_keep_size: 2GB
+        wal_sender_timeout: 10s
+        wal_receiver_timeout: 10s
+        wal_log_hints: 'on'
+        # --- WAL archiving to the Tier 3 image (pgBackRest stanza placeholder 'xtnl') ---
+        # RPO <= archive_timeout (operations.md s8). The encrypted repo's passphrase is read by pgBackRest from
+        # /etc/pgbackrest/conf.d/xtnl-cipher.conf (postgres-readable), never from Patroni's environment.
+        archive_mode: always
+        archive_command: 'pgbackrest --stanza=xtnl archive-push %p'
+        archive_timeout: 60s
+        # --- engine transaction bounds ---
+        idle_in_transaction_session_timeout: 10s
+        lock_timeout: 0
+        # --- connections and keepalives (~5 s dead-peer detection) ---
+        max_connections: 200
+        tcp_keepalives_idle: 5
+        tcp_keepalives_interval: 2
+        tcp_keepalives_count: 3
+        tcp_user_timeout: 10000
+        # --- memory (16 GB node shared with Redis, etcd and the engine; size per instance) ---
+        shared_buffers: 3GB
+        effective_cache_size: 8GB
+        work_mem: 16MB
+        maintenance_work_mem: 512MB
+        # --- autovacuum (operations.md s11) ---
+        autovacuum_vacuum_scale_factor: 0.05
+        autovacuum_analyze_scale_factor: 0.02
+        autovacuum_vacuum_cost_limit: 2000
+        # --- observability ---
+        log_min_duration_statement: 500
+        log_lock_waits: 'on'
+        log_line_prefix: '%m [%p] %q%u@%d app=%a '
+        track_io_timing: 'on'
+        timezone: UTC
+        password_encryption: scram-sha-256
+        ssl: 'on'
+  initdb:
+    - encoding: UTF8
+    - locale: C.UTF-8
+    - data-checksums          # Step 2 of the integrity worker relies on page checksums
+
+postgresql:
+  listen: ${NODE_IP}:5432,127.0.0.1:5432
+  connect_address: ${NODE_IP}:5432
+  data_dir: /var/lib/postgresql/17/main
+  bin_dir: /usr/lib/postgresql/17/bin
+  pgpass: /var/lib/postgresql/.pgpass_patroni
+  # A promotion is a timeline switch: xtnl-pitr-guard (deploy/observability/xtnl-pitr-guard.sh) takes an
+  # immediate incremental backup, detached (operations.md s8 'PITR horizon broken').
+  callbacks:
+    on_role_change: /usr/local/bin/xtnl-pitr-guard
+  authentication:
+    superuser:
+      username: postgres                     # password: PATRONI_SUPERUSER_PASSWORD
+    replication:
+      username: replicator                   # password: PATRONI_REPLICATION_PASSWORD
+    rewind:
+      username: rewind_user                  # password: PATRONI_REWIND_PASSWORD
+  parameters:
+    unix_socket_directories: /var/run/postgresql
+    ssl_cert_file: /etc/patroni/pki/${PG_MEMBER_NAME}-pg.crt
+    ssl_key_file: /etc/patroni/pki/${PG_MEMBER_NAME}-pg.key
+    ssl_ca_file: /etc/patroni/pki/ca.crt
+  # Replicas are created from the pgBackRest repository first (fast, does not load the primary), then
+  # pg_basebackup as a fallback. `patronictl reinit` uses the same order.
+  create_replica_methods:
+    - pgbackrest
+    - basebackup
+  pgbackrest:
+    command: /usr/bin/pgbackrest --stanza=xtnl --delta restore
+    keep_data: true
+    no_params: true
+  basebackup:
+    checkpoint: fast
+  recovery_conf:
+    # same cipher include as archive_command (deploy/patroni/pgbackrest.conf)
+    restore_command: 'pgbackrest --stanza=xtnl archive-get %f "%p"'
+  pg_hba:
+    - local   all          postgres                       peer
+    - hostssl replication  replicator   ${NODE_A_IP}/32   scram-sha-256
+    - hostssl replication  replicator   ${NODE_B_IP}/32   scram-sha-256
+    - hostssl all          rewind_user  ${NODE_A_IP}/32   scram-sha-256
+    - hostssl all          rewind_user  ${NODE_B_IP}/32   scram-sha-256
+    - hostssl xtnl         xtnl_engine  ${NODE_A_IP}/32   scram-sha-256
+    - hostssl xtnl         xtnl_engine  ${NODE_B_IP}/32   scram-sha-256
+    - hostssl xtnl         xtnl_owner   ${NODE_A_IP}/32   scram-sha-256
+    - hostssl xtnl         xtnl_owner   ${NODE_B_IP}/32   scram-sha-256
+    # Melbourne dashboard (read-only role over the WireGuard VPN); placeholder CIDR
+    - hostssl xtnl         xtnl_dashboard ${VPN_CIDR}     scram-sha-256
+    - host    all          all          0.0.0.0/0         reject
+
+# Linux watchdog (softdog): Patroni demotes itself if it cannot renew in time. 'required' refuses to run
+# as primary without /dev/watchdog; use 'automatic' only on a host without softdog.
+watchdog:
+  mode: required
+  device: /dev/watchdog
+  safety_margin: 5
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false

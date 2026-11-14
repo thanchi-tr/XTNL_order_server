@@ -1,0 +1,73 @@
+# etcd v3.5 member configuration template (operations.md s1, s2, s3).
+# Install as /etc/etcd/etcd.conf.yml on each of the three members and start with
+#     etcd --config-file /etc/etcd/etcd.conf.yml
+#
+# Members (quorum 2 of 3): replace the ${...} placeholders per member before use.
+#   etcd-a  engine node A   eu-west-2a   ${NODE_A_IP}
+#   etcd-b  engine node B   eu-west-2b   ${NODE_B_IP}
+#   etcd-w  witness         eu-west-2c   ${WITNESS_IP}   (small NON-burstable instance, runs only etcd)
+#
+# Timing must stay consistent with the engine lease (src/runtime/lease.py):
+#   lease TTL 15 s, renewed every 1 s, self-fence (hard exit) at 12 s without a renewal.
+#   Budget: fence - renew interval (11 s) > worst-case etcd election (2 x election-timeout = 5 s)
+#           + client endpoint failover (<= 2 s), so losing the witness or the etcd leader's zone never
+#   fences a healthy engine. Do not raise election-timeout above 2500 ms without re-doing this budget.
+#   Before any planned member restart: `etcdctl move-leader` away from it (runbook failover-and-switchover.md).
+#
+# Keys the engine uses: /xtnl/leader (lease-bound), /xtnl/health/<node> (lease-bound), /xtnl/safe_hold.
+# Patroni uses its own namespace (/service/xtnl-pg/).
+
+name: '${ETCD_NAME}'                       # etcd-a | etcd-b | etcd-w
+data-dir: /var/lib/etcd/data               # own gp3 volume per member, mounted at /var/lib/etcd
+wal-dir: /var/lib/etcd/wal
+
+# --- raft timing (ms) --------------------------------------------------------------------------------
+heartbeat-interval: 250
+election-timeout: 2500
+
+# --- cluster -------------------------------------------------------------------------------------------
+initial-advertise-peer-urls: https://${ETCD_SELF_IP}:2380
+listen-peer-urls: https://${ETCD_SELF_IP}:2380
+listen-client-urls: https://${ETCD_SELF_IP}:2379,https://127.0.0.1:2379
+advertise-client-urls: https://${ETCD_SELF_IP}:2379
+initial-cluster: etcd-a=https://${NODE_A_IP}:2380,etcd-b=https://${NODE_B_IP}:2380,etcd-w=https://${WITNESS_IP}:2380
+initial-cluster-token: '${ETCD_CLUSTER_TOKEN}'   # unique per cluster; a DR cluster gets a new cluster_id
+initial-cluster-state: new                        # 'existing' when replacing a member (member add first)
+strict-reconfig-check: true
+
+# --- storage and compaction ------------------------------------------------------------------------------
+auto-compaction-mode: periodic
+auto-compaction-retention: '1h'
+quota-backend-bytes: 2147483648            # 2 GiB; alert at 50 % (1 GiB) and on any etcd alarm
+snapshot-count: 10000
+max-request-bytes: 1572864
+# Defrag is a scheduled ROLLING job (one member at a time, only while 3/3 are healthy):
+# deploy/systemd/xtnl-etcd-defrag.timer on all three members runs deploy/jobs/xtnl-etcd-defrag.sh, which takes
+# an etcd lock, re-checks 3/3 health, moves leadership away from this member if it leads, then runs
+#     etcdctl --endpoints=https://${ETCD_SELF_IP}:2379 defrag
+
+# --- TLS (paths are placeholders; certificates from the internal CA, expiry alert at 30 days) -----------
+client-transport-security:
+  cert-file: /etc/etcd/pki/${ETCD_NAME}.crt
+  key-file: /etc/etcd/pki/${ETCD_NAME}.key
+  trusted-ca-file: /etc/etcd/pki/ca.crt
+  # The engine's HttpEtcdClient (src/runtime/etcd.py) verifies the server certificate against
+  # XTNL_ETCD_CA and presents the client certificate XTNL_ETCD_CERT / XTNL_ETCD_KEY (issued by this
+  # trusted-ca-file). Turn client-cert-auth on only once every client presents one: Patroni's etcd3
+  # section (deploy/patroni/patroni.yml) carries `cert` / `key` placeholders for its own client
+  # certificate. Until then access is limited to the three nodes by security groups. See install-node.md.
+  client-cert-auth: false
+  auto-tls: false
+peer-transport-security:
+  cert-file: /etc/etcd/pki/${ETCD_NAME}-peer.crt
+  key-file: /etc/etcd/pki/${ETCD_NAME}-peer.key
+  trusted-ca-file: /etc/etcd/pki/ca.crt
+  client-cert-auth: true
+  auto-tls: false
+
+# --- observability ---------------------------------------------------------------------------------------
+logger: zap
+log-level: info
+log-outputs: [stderr]
+listen-metrics-urls: http://127.0.0.1:2381
+enable-pprof: false

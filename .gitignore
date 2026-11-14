@@ -1,0 +1,67 @@
+# ---------------------------------------------------------------------------------------------------------------
+# XTNL order server. Nothing that holds a credential, account data or machine state is ever committed.
+# ---------------------------------------------------------------------------------------------------------------
+
+# --- Python -----------------------------------------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# --- test / type-check / coverage output ------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# --- secrets and environment (only the *.example templates are committed) ---------------------------------------
+.env
+.env.*
+*.env
+!*.env.example
+deploy/env/*
+!deploy/env/*.example
+# certificates, keys and token material
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+# Claude Code: per-user settings (the shared .claude/settings.json, rules, hooks and skills are committed)
+.claude/settings.local.json
+
+# --- runtime state, generated output and data ---------------------------------------------------------------------
+# DLQ spill files, Pine Script exports (python -m src.ops pinescript), partition archives
+var/
+*.spill
+*.jsonl.gz
+*.sha256
+# database dumps / backups
+*.dump
+*.sql.gz
+*.backup
+pgdata/
+# logs
+*.log
+/logs/
+
+# --- editors and operating systems --------------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+# OneDrive / Office temporary files
+~$*
+*.tmp

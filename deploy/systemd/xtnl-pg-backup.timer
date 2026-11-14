@@ -1,0 +1,15 @@
+# Runs xtnl-pg-backup.service once a day (operations.md §8): incremental, full on Saturday (FX closed).
+# Enable on both PostgreSQL members (only the primary's run backs up):
+#     sudo systemctl enable --now xtnl-pg-backup.timer
+
+[Unit]
+Description=XTNL daily pgBackRest backup
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 UTC
+RandomizedDelaySec=5min
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

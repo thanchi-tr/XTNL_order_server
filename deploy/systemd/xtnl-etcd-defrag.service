@@ -1,0 +1,27 @@
+# XTNL rolling etcd defrag (operations.md §1: a scheduled rolling defrag, one member at a time, only while 3/3
+# are healthy; IMPLEMENTATION_PLAN 6.4). Install as /etc/systemd/system/xtnl-etcd-defrag.service on all THREE
+# etcd hosts (node A, node B, witness), with deploy/jobs/xtnl-etcd-defrag.sh as /usr/local/bin/xtnl-etcd-defrag,
+# xtnl-etcd-defrag.timer and /etc/xtnl/etcd-defrag.env. The etcd lock serialises the three members; never sends
+# anything to a broker.
+
+[Unit]
+Description=XTNL rolling etcd defrag (this member, under the cluster-wide lock)
+Documentation=file:///opt/xtnl/order-server/docs/runbooks/install-node.md
+After=etcd.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/local/bin/xtnl-etcd-defrag
+
+[Service]
+Type=oneshot
+User=etcd
+Group=etcd
+# XTNL_ETCD_SELF_ENDPOINT, XTNL_ETCD_ENDPOINTS, ETCDCTL_CACERT, ETCDCTL_CERT, ETCDCTL_KEY
+EnvironmentFile=/etc/xtnl/etcd-defrag.env
+ExecStart=/usr/local/bin/xtnl-etcd-defrag run
+# waits for the other members' turns (each: defrag + health + 30 s settle)
+TimeoutStartSec=30min
+SyslogIdentifier=xtnl-etcd-defrag
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

@@ -1,0 +1,8 @@
+{
+  "listen": "${DASHBOARD_VPN_IP}:8444",
+  "token": "CHANGE_ME",
+  "tls_cert": "/etc/xtnl/dashboard/heartbeat.crt",
+  "tls_key": "/etc/xtnl/dashboard/heartbeat.key",
+  "path": "/xtnl/heartbeat",
+  "max_age_ms": 60000
+}

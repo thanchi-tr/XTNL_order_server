@@ -1,0 +1,67 @@
+# XTNL dead-man receiver (operations.md s9 "Push dead-man's switch"; IMPLEMENTATION_PLAN 6.4). Install as
+# /etc/systemd/system/xtnl-deadman-receiver.service on the MELBOURNE host only (never on the London engine nodes
+# or the witness: it must keep paging when London is gone).
+#
+# It accepts the engine leader's 15 s heartbeat (HTTPS POST, bearer token), pages through a channel OUTSIDE
+# eu-west-2 (SES in ap-southeast-4, an SMTP relay or a third-party push service) after 60 s of silence or when a
+# health field passes its threshold, and sends a daily test page. It never touches PostgreSQL or Redis and never
+# reaches a broker. Configuration: /etc/xtnl/deadman-receiver.env (deploy/env/deadman-receiver.env.example).
+
+[Unit]
+Description=XTNL dead-man receiver (Melbourne)
+Documentation=file:///opt/xtnl/order-server/docs/runbooks/deadman-alert.md
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/xtnl/order-server
+# XTNL_RECEIVER_TOKEN (+ _NEXT, _OVERLAP_S), XTNL_RECEIVER_LISTEN, XTNL_RECEIVER_PATH, XTNL_RECEIVER_TEST_PAGE_UTC,
+# channel variables, and optionally XTNL_SECRETS_SOURCE=aws-sm / _ID / _REGION (outside eu-west-2): the tokens then
+# follow the secret without a restart. Exit 75 (secret unreadable at start) is restarted; 78 (config) is not.
+EnvironmentFile=/etc/xtnl/deadman-receiver.env
+# TLS certificate and key, handed to the dynamic user as systemd credentials (never world-readable files)
+LoadCredential=tls.crt:/etc/xtnl/deadman-receiver/tls.crt
+LoadCredential=tls.key:/etc/xtnl/deadman-receiver/tls.key
+Environment=XTNL_RECEIVER_TLS_CERT=%d/tls.crt
+Environment=XTNL_RECEIVER_TLS_KEY=%d/tls.key
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+SyslogIdentifier=xtnl-deadman-receiver
+ExecStartPre=/opt/xtnl/order-server/.venv/bin/python -m src.deadman_receiver --check-config
+ExecStart=/opt/xtnl/order-server/.venv/bin/python -m src.deadman_receiver
+RestartPreventExitStatus=78
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+MemoryMax=256M
+TasksMax=32
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

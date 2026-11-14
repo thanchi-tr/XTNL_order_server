@@ -1,0 +1,66 @@
+# XTNL read-only dashboard (operations.md s9 Dashboard; IMPLEMENTATION_PLAN 5.6). Install as
+# /etc/systemd/system/xtnl-dashboard.service on the MELBOURNE dashboard host only (never on the London engine
+# nodes or the witness). It reaches PostgreSQL (role xtnl_dashboard, read-only) and both nodes' Redis over the
+# VPN through each node's TLS proxy (xtnl-redis-tls-proxy.service, mutual TLS on :6380) as the ACL user
+# xtnl_dashboard (GET / HGETALL on redis:boot_id, price:*, account_live:* only; deploy/redis/redis.conf).
+# Environment: deploy/env/dashboard.env.example; install: docs/runbooks/install-node.md "Melbourne dashboard host".
+# Leader heartbeat listener (operations.md s9: live values only when their redis:boot_id epoch is the latest leader
+# heartbeat's): /etc/xtnl/dashboard/heartbeat.json (0640 root:xtnl, deploy/env/dashboard-heartbeat.json.example),
+# https on ${DASHBOARD_VPN_IP}:8444 with /etc/xtnl/dashboard/heartbeat.crt / .key (0640 root:xtnl), reachable
+# from node A and node B only (security group). The unit runs as xtnl:xtnl, so it reads those files through the
+# group; --check-config (ExecStartPre) loads them and exits 78 when it cannot. Port 8444 > 1024: no capability.
+#
+# Read-only: GET / HEAD only, every PostgreSQL session runs default_transaction_read_only = on, Redis reads only.
+# Nothing here can send, modify or cancel an order, or change any engine state.
+
+[Unit]
+Description=XTNL read-only dashboard (Melbourne)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xtnl
+Group=xtnl
+WorkingDirectory=/opt/xtnl/order-server
+# XTNL_DASHBOARD_DSN, XTNL_DASHBOARD_REDIS_URLS, XTNL_DASHBOARD_ADDR, XTNL_DASHBOARD_FRESH_MS, XTNL_LOG_FORMAT
+EnvironmentFile=/etc/xtnl/dashboard.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+SyslogIdentifier=xtnl-dashboard
+ExecStartPre=/opt/xtnl/order-server/.venv/bin/python -m src.dashboard --check-config --heartbeat-file /etc/xtnl/dashboard/heartbeat.json
+ExecStart=/opt/xtnl/order-server/.venv/bin/python -m src.dashboard --heartbeat-file /etc/xtnl/dashboard/heartbeat.json
+RestartPreventExitStatus=78
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+MemoryMax=512M
+TasksMax=64
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

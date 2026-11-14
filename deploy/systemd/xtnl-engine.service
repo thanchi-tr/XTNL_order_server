@@ -1,0 +1,107 @@
+# XTNL Phase 1 engine node (operations.md s3, s4, s14). Install as /etc/systemd/system/xtnl-engine.service
+# on BOTH London engine nodes (eu-west-2a, eu-west-2b). Never on the witness.
+#
+# Phase 1 is read-only: this engine ingests broker state, runs Oversee and records halts. It never sends,
+# modifies or cancels orders and never closes positions.
+#
+# Timing chain (operations.md s3): watchdog 3 s < fence 12 s < etcd lease TTL 15 s.
+#   * src/runtime/supervisor.py LoopWatchdog sends READY=1 once, then WATCHDOG=1 every 1 s from the event
+#     loop, and withholds it when the held lease's lease_deadline has passed. Three missed beats -> SIGKILL.
+#   * The lease keeper thread hard-exits the process itself at 12 s without a renewal.
+#   * DRAINING (SIGTERM, planned switchover) must finish within 10 s; the keeper enforces it.
+
+[Unit]
+Description=XTNL Phase 1 engine node (read-only ingestion, Oversee, SM9 leader election)
+Documentation=file:///opt/xtnl/order-server/docs/runbooks/install-node.md
+# The engine starts only after chrony is synced (operations.md s14).
+Requires=chrony-wait.service
+After=network-online.target time-sync.target chrony-wait.service
+Wants=network-online.target
+# Local etcd / Patroni / Redis are NOT hard dependencies: the SM9 health gate (hard checks) decides whether
+# this node may campaign, so a local dependency outage keeps the node in STANDBY instead of stopping it.
+After=etcd.service patroni.service redis-server.service
+# If a migration job is started in the same transaction, it runs first. The engine never pulls it in:
+# migrations are an operator job run before a switchover, never at engine start-up (operations.md s12).
+After=xtnl-migrate.service
+# Crash-loop guard: with the RestartSteps back-off below, 20 starts in 15 min means a real crash loop.
+# The unit then stays failed and the off-node "standby not ready" alert pages (runbook: install-node.md).
+StartLimitIntervalSec=900
+StartLimitBurst=20
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=xtnl
+Group=xtnl
+WorkingDirectory=/opt/xtnl/order-server
+EnvironmentFile=/etc/xtnl/engine.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# journald tag; rsyslog (deploy/observability/logs) writes it to /var/log/xtnl/xtnl-engine.log for the off-node shipping
+SyslogIdentifier=xtnl-engine
+Environment=XTNL_SPILL_PATH=/var/lib/xtnl/dlq_spill.jsonl
+
+# Refuse to start on a bad configuration (exit 78 = EX_CONFIG, e.g. BROKER_ENV not sandbox/live_readonly,
+# fewer than three etcd endpoints, no dead-man URL). 78 is not restarted: fix the env file instead.
+ExecStartPre=/opt/xtnl/order-server/.venv/bin/python -m src.main --check-config
+ExecStart=/opt/xtnl/order-server/.venv/bin/python -m src.main
+RestartPreventExitStatus=78
+
+# --- supervision -------------------------------------------------------------------------------------
+WatchdogSec=3
+WatchdogSignal=SIGKILL
+Restart=always
+RestartSec=2
+# Exponential restart back-off 2 s -> 30 s (systemd >= 254; Ubuntu 24.04 ships 255). The SM9 60 s
+# campaign back-off after a fence / crash is enforced by the engine itself from leader_terms.
+RestartSteps=5
+RestartMaxDelaySec=30
+TimeoutStartSec=60
+# SIGTERM -> DRAINING (stop intake, flush the DlqSpooler to PostgreSQL or the local spill file, write
+# end_reason, release the lease). The keeper hard-exits after 10 s; 20 s leaves margin before SIGKILL.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=20
+SendSIGKILL=yes
+
+# --- resources (size per instance; c7i.2xlarge-class node shares RAM with PostgreSQL, Redis, etcd) -----
+MemoryHigh=3G
+MemoryMax=4G
+LimitNOFILE=65536
+TasksMax=512
+
+# --- filesystem layout ------------------------------------------------------------------------------
+# /var/lib/xtnl holds the DLQ spill file; /opt/xtnl/order-server/var is a symlink to it (xtnl.tmpfiles.conf).
+StateDirectory=xtnl
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/xtnl
+UMask=0027
+
+# --- hardening --------------------------------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+# AF_UNIX is needed for $NOTIFY_SOCKET (sd_notify) and an optional Redis unix socket.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

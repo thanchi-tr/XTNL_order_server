@@ -1,0 +1,9 @@
+{
+  "max_position_risk":       { "enabled": true, "flag_above_pct": "2.0", "halt_above_pct": "3.0" },
+  "max_aggregate_open_risk": { "enabled": true, "flag_above_pct": "3.0", "halt_above_pct": "5.0" },
+  "missing_stop_loss":       { "enabled": true, "grace_ms": 60000 },
+  "max_daily_loss":          { "enabled": true, "limit_pct_of_sod_equity": "5.0" },
+  "margin_usage":            { "enabled": false },
+  "sweep":                   { "escalate_after_ms": 1800000, "release_ms": 5000, "release_margin": "0.10" },
+  "marks":                   { "stale_mark_ms": 60000 }
+}

@@ -1,0 +1,78 @@
+# Local, DISPOSABLE PostgreSQL 17 + Redis 7.4 + single-member etcd for the integration tests.
+# Development only: never point these tests at a shared or production server (they truncate tables and
+# flush the selected Redis database). Ports bind to 127.0.0.1 only. See deploy/README.md.
+#
+#     docker compose -f deploy/docker-compose.dev.yml up -d --wait
+#     ORDER_SERVER_TEST_DSN=postgresql://xtnl:xtnl_dev_only@127.0.0.1:55432/xtnl_test
+#     ORDER_SERVER_TEST_REDIS=redis://127.0.0.1:56379/15
+#     docker compose -f deploy/docker-compose.dev.yml down -v
+#
+# 'xtnl_dev_only' is a throwaway local password for this container, not a credential for anything else.
+
+name: xtnl-dev
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: xtnl
+      POSTGRES_PASSWORD: xtnl_dev_only
+      POSTGRES_DB: xtnl_test
+      POSTGRES_INITDB_ARGS: --data-checksums
+    command:
+      - postgres
+      - -c
+      - idle_in_transaction_session_timeout=10s
+      - -c
+      - timezone=UTC
+    ports:
+      - "127.0.0.1:55432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xtnl -d xtnl_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis:
+    image: redis:7.4
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "127.0.0.1:56379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  etcd:
+    image: gcr.io/etcd-development/etcd:v3.5.17
+    command:
+      - etcd
+      - --name=etcd-dev
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.1:52379
+      - --heartbeat-interval=250
+      - --election-timeout=2500
+      - --auto-compaction-mode=periodic
+      - --auto-compaction-retention=1h
+    ports:
+      - "127.0.0.1:52379:2379"
+    tmpfs:
+      - /etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

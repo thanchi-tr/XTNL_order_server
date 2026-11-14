@@ -1,0 +1,6 @@
+# Deployment targets are Linux: keep LF in the repository and in checkouts (shell scripts, systemd units,
+# YAML / JSON / SQL / Python). PowerShell scripts are for Windows development machines.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.drawio text eol=lf

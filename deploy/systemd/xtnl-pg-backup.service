@@ -1,0 +1,32 @@
+# XTNL scheduled pgBackRest backup (operations.md §8: daily incremental, weekly full; IMPLEMENTATION_PLAN 6.4).
+# Install as /etc/systemd/system/xtnl-pg-backup.service on BOTH PostgreSQL members, with
+# deploy/jobs/xtnl-pg-backup.sh as /usr/local/bin/xtnl-pg-backup and xtnl-pg-backup.timer (enabled on both).
+# Only the current Patroni primary backs up; the replica's run exits 0. It never touches the engine, never
+# restores and never sends anything to a broker.
+
+[Unit]
+Description=XTNL scheduled pgBackRest backup (daily incremental, weekly full)
+Documentation=file:///opt/xtnl/order-server/docs/runbooks/install-node.md
+After=patroni.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/local/bin/xtnl-pg-backup
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+ExecStart=/usr/local/bin/xtnl-pg-backup auto
+# a full backup of a large cluster can take hours; retries inside the script add at most 2 x 300 s
+TimeoutStartSec=8h
+StateDirectory=xtnl-pg-backup
+StateDirectoryMode=0750
+Environment=XTNL_BACKUP_STATE_DIR=/var/lib/xtnl-pg-backup
+# The repo cipher passphrase comes from /etc/pgbackrest/conf.d/xtnl-cipher.conf (deploy/patroni/pgbackrest.conf),
+# the same source as WAL archiving and the PITR guard: no EnvironmentFile here.
+SyslogIdentifier=xtnl-pg-backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes

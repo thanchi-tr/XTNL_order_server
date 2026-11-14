@@ -1,0 +1,44 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body>
+<script src="https://viewer.diagrams.net/js/viewer-static.min.js"></script>
+<script>
+// Loads ?f=<file>.drawio and exposes window.measure() / window.audit()
+async function load(f){ return mxUtils.parseXml(await (await fetch(f, {cache:'no-store'})).text()); }
+function graphFor(file, d){
+  const div=document.createElement('div'); div.style.cssText='position:absolute;left:-6000px;top:0;width:3000px;height:3000px;overflow:hidden';
+  document.body.appendChild(div); const g=new Graph(div);
+  new mxCodec(file).decode(d.getElementsByTagName('mxGraphModel')[0], g.getModel()); g.view.validate(); return [g,div];
+}
+window.measure = async function(f){
+  const file=await load(f); const out={};
+  for (const d of file.getElementsByTagName('diagram')){
+    const [g,div]=graphFor(file,d); const pid=d.getAttribute('id');
+    for (const id in g.model.cells){ const c=g.model.cells[id]; if(!g.model.isVertex(c)) continue;
+      const s=g.view.getState(c); const st=s&&s.style; if(!st||st.shape==='swimlane'||st.shape==='umlActor'||st.shape==='ellipse') continue;
+      const t=s.text&&s.text.boundingBox; if(!t) continue; out[id.replace(/^[a-z]+-/, pid+':')]=Math.round(t.height); }
+    g.destroy(); div.remove(); }
+  return out;
+};
+window.audit = async function(f){
+  const file=await load(f); const rep={};
+  const inter=(a,b,t=1)=>a.x<b.x+b.width-t&&b.x<a.x+a.width-t&&a.y<b.y+b.height-t&&b.y<a.y+a.height-t;
+  for (const d of file.getElementsByTagName('diagram')){
+    const [g,div]=graphFor(file,d); const P=[], slack=[], V=[], L=[];
+    for (const id in g.model.cells){ const c=g.model.cells[id]; const s=g.view.getState(c); if(!s) continue; const st=s.style; const sid=id.replace(/^[a-z]+-/,'');
+      if (g.model.isVertex(c)) {
+        if (st.shape==='swimlane') continue;
+        if (!sid.startsWith('title') && !(st.dashed=='1' && !st.fillColor)) V.push({id:sid,b:new mxRectangle(s.x,s.y,s.width,s.height)});
+        const t=s.text&&s.text.boundingBox;
+        if (t && st.shape!=='umlActor' && !sid.startsWith('title')) {
+          if (t.height>s.height+2||t.width>s.width+2) P.push(`overflow ${sid}: ${Math.round(t.width)}x${Math.round(t.height)} > ${Math.round(s.width)}x${Math.round(s.height)}`);
+          const sl=s.height-t.height; if (st.shape!=='ellipse' && sl>40 && s.height>60) slack.push(`${sid}:${Math.round(sl)}`);
+        }
+        if (st.shape==='umlActor' && t) L.push({id:sid+' (actor label)',b:t,own:sid});
+      } else if (g.model.isEdge(c) && s.text && s.text.boundingBox && g.convertValueToString(c)) L.push({id:sid,b:s.text.boundingBox});
+    }
+    for (const l of L) for (const v of V) { if (l.own===v.id) continue; if (inter(l.b,v.b)) P.push(`label ${l.id} overlaps ${v.id}`); }
+    for (let i=0;i<L.length;i++) for (let j=i+1;j<L.length;j++) if (inter(L[i].b,L[j].b)) P.push(`label ${L[i].id} x ${L[j].id}`);
+    rep[d.getAttribute('name')]={problems:P, bigSlack:slack};
+    g.destroy(); div.remove(); }
+  return rep;
+};
+</script></body></html>
