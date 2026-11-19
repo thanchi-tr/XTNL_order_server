@@ -283,7 +283,8 @@ class MemGateReader:
     async def read(self, action: Action) -> GateContext:
         keys = await read_gate_keys(self.redis, self.run_id)
         node_epoch = self.inputs.node_epoch()
-        rows = [(s, *v) for (a, s), v in self.t.stream_health.items() if a == action.adapter_id]
+        adapter = self.account_adapter(action.account_id)    # K6: the account's own adapter (adapter_of)
+        rows = [(s, *v) for (a, s), v in self.t.stream_health.items() if a == adapter]
         open_health, reconciled_at, reconciled_epoch = reconcile_state(rows, node_epoch)
         evs = self.t.oversee.t.halt_events
         halt = None
@@ -295,12 +296,24 @@ class MemGateReader:
             node_epoch=node_epoch, engine_epoch=self.t.epoch, lease_valid=self.inputs.lease_valid(),
             halt_state=halt, max_halt_event_id=evs[-1].id if evs else None,
             settle_until_ms=self.inputs.settle_until_ms(), reconciled_at_ms=reconciled_at,
-            reconciled_epoch=reconciled_epoch, latest_open_ms=self.inputs.latest_open_ms(action.adapter_id),
+            reconciled_epoch=reconciled_epoch,
+            latest_open_ms=None if adapter is None else self.inputs.latest_open_ms(adapter),
             open_stream_health=open_health,
             stale_mark_symbols=frozenset(s for _, s in view.stale_symbols) if view else frozenset(),
             has_unknown_result=view.has_unknown if view else True,
             last_pass_ms=view.last_pass_ms if view else None, sweep_interval_ms=self.inputs.sweep_interval_ms,
-            catchup_verified=self.inputs.catchup_verified(action.adapter_id))
+            catchup_verified=adapter is not None and self.inputs.catchup_verified(adapter),
+            account_adapter_id=adapter)
+
+    def account_adapter(self, account_id: str) -> str | None:
+        """TieredGateContextReader's `adapter_of`: the account row's adapter, else its positions' / orders'."""
+        accounts = sorted(e.adapter_id for e in self.t.entities.values()
+                          if isinstance(e, AccountDTO) and e.account_id == account_id)
+        if accounts:
+            return accounts[0]
+        ents = sorted(e.adapter_id for e in self.t.entities.values()
+                      if isinstance(e, (OrderDTO, PositionDTO)) and e.account_id == account_id)
+        return ents[0] if ents else None     # the memory halt_breaches rows carry no adapter column
 
 
 async def _noop() -> None:

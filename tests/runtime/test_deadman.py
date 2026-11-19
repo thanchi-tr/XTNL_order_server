@@ -69,6 +69,15 @@ class Source:
     def degraded(self) -> Sequence[str]:
         return ["feed-observer"]
 
+    def arm_oldest_undelivered_notification_ms(self) -> int | None:
+        return None
+
+    def arm_overdue_positions(self) -> int | None:
+        return None
+
+    def arm_failed(self) -> None:
+        return None
+
 
 def test_payload_fields_and_ages() -> None:
     p = build_payload(Source(), NOW)

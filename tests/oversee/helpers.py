@@ -7,7 +7,7 @@ from types import MappingProxyType
 from typing import Any
 
 from src.dto import AccountDTO, AccountLive, CashFlowDTO, CashFlowKind, InstrumentSpec, OrderDTO, OrderStatus
-from src.dto import PositionDTO, PriceDTO, Side
+from src.dto import OrderKind, PositionDTO, PriceDTO, Side
 from src.oversee.dayroll import NEW_YORK, latest_roll_ms, trading_day_for_roll
 from src.oversee.snapshot import AccountSnapshot, CashFlowRow, CleanMark, SodMark, SymbolQuotes, TimedMid
 
@@ -42,12 +42,13 @@ def position(pid: str, side: Side = "BUY", units: str = "100000", entry: str = "
 
 def order(oid: str, side: Side = "BUY", status: OrderStatus = OrderStatus.WORKING, ordered: str = "100000",
           remaining: str | None = None, entry: str | None = "1.1000", stop: str | None = None,
-          reduce_only: bool = False, linked: str | None = None, symbol: str = "EURUSD") -> OrderDTO:
+          reduce_only: bool = False, linked: str | None = None, symbol: str = "EURUSD",
+          kind: OrderKind | None = None) -> OrderDTO:
     return OrderDTO(client_order_id=f"c-{oid}", broker_order_id=oid, account_id=ACCT, adapter_id=AD,
                     symbol=symbol, side=side, status=status, entry_price=D(entry) if entry else None,
                     stop_loss=D(stop) if stop else None, ordered_units=D(ordered),
                     remaining_units=D(remaining if remaining is not None else ordered),
-                    is_reduce_only=reduce_only, linked_position_id=linked)
+                    is_reduce_only=reduce_only, linked_position_id=linked, order_kind=kind)
 
 
 def account(balance: str = "100000", ccy: str = "USD") -> AccountDTO:

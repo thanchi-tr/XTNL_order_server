@@ -114,7 +114,7 @@ def test_daily_loss_hard_and_subject_is_account_day() -> None:
 
 def test_daily_loss_caps() -> None:
     losing = (position("P", "BUY", "100000", "1.1350"),)
-    cases = [dict(sod=sod(partial=True)), dict(cash_flow_request_pending=True),
+    cases = [dict(sod=sod(partial=True)),
              dict(last_status_or_units_change_ms=T0 - 1000, balance_committed_at_ms=T0 - 2000),
              dict(quotes={(AD, "EURUSD"): SymbolQuotes(latest=quote("1.1", T0 - 9000).latest)})]
     for extra in cases:
@@ -203,3 +203,43 @@ def test_registry_respects_enabled_flags() -> None:
     cfg = replace(CFG, margin_usage=replace(CFG.margin_usage, enabled=False))
     assert "margin_usage" not in RuleRegistry.from_config(cfg).rule_ids
     assert {"max_position_risk", "max_daily_loss", STALE_ACCOUNT_IMAGE} <= RuleRegistry.from_config(CFG).rule_ids
+
+
+def test_k12_daily_loss_caps_only_for_the_listed_reasons() -> None:
+    """K12 (oversee-rules.md §2, §6): SOFT cap only for partial_session, stale inputs and the balance skew window
+    (plus the registry's fence / integrity cap). An outstanding cash-flow request (an unexplained decrease asks the
+    orchestrator for fetch_cash_flows) does not cap: a real loss is HARD while the request is still in flight."""
+    rule = MaxDailyLossRule(CFG.max_daily_loss, M, CFG.sweep.skew_ms)
+    losing = (position("P", "BUY", "100000", "1.1350"),)                 # -3.5 %, plus a balance decrease
+    c = ctx(snap(positions=losing, account=account("99000")))
+    assert rule._cap_reasons(c, frozenset()) == []
+    r = run_rule(rule, c, rule.subjects(c)[0])
+    assert isinstance(r, Result) and r.level is Level.HARD_HALT and r.cap is Cap.NONE and r.wants_cash_flows
+    assert "cash_flow_request_pending" not in AccountSnapshot.__dataclass_fields__
+
+
+def test_k11_unexplained_increase_stays_excluded_while_pnl_unverified() -> None:
+    """K11 (oversee-rules.md §5): on a pnl_unverified day (a partial cash-flow fetch: it can drop DEPOSIT rows as
+    well as TRADE_PNL rows) today's unexplained increase stays excluded from equity_mark, whatever transfer_source
+    says, so a deposit missing from a truncated page can never offset a real loss (fail closed); the FLAG
+    pnl_unverified reports the day."""
+    plus = dict(account=account("101000"), positions=())               # +1 000 with no ledger row
+    verified = daily(**plus)
+    assert isinstance(verified, Result) and verified.level is Level.FLAG
+    assert verified.reason == "unexplained_balance_delta" and verified.risk_pct == D("0")
+    rule = MaxDailyLossRule(CFG.max_daily_loss, M, CFG.sweep.skew_ms)
+    for transfers in (True, False):
+        c = ctx(snap(pnl_source=False, transfer_source=transfers, **plus))
+        eq = c.equity()
+        assert eq.unexplained_delta == D("1000") and eq.excluded_increase == eq.unexplained_delta
+        assert eq.value == D("100000")
+        assert "pnl_unverified" in rule._flags(c, eq)                     # the day's FLAG is raised
+        unverified = daily(pnl_source=False, transfer_source=transfers, **plus)
+        assert isinstance(unverified, Result) and unverified.level is Level.FLAG and unverified.risk_pct == D("0")
+    # A missing deposit cannot hide a real loss: -4 % on the position and +1 000 unexplained is still HARD_HALT
+    hidden = daily(pnl_source=False, account=account("101000"),
+                   positions=(position("P", "BUY", "100000", "1.1400"),))
+    assert isinstance(hidden, Result) and hidden.level is Level.HARD_HALT
+    # A decrease always counts as loss, whatever the flags.
+    loss = daily(pnl_source=False, account=account("96000"), positions=())
+    assert isinstance(loss, Result) and loss.level is Level.HARD_HALT and loss.risk_pct == D("-4")

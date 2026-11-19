@@ -21,19 +21,20 @@ from collections.abc import Callable, Mapping
 import httpx
 
 from src.notifications.errors import safe_error
-from src.notifications.factory import ChannelSet, build_channels
+from src.notifications.factory import OVERSEE_CHANNEL_NAMES, ChannelSet, build_channels
 from src.notifications.mail import SmtpFactory, default_smtp_factory
-from src.notifications.settings import NotificationSettings
+from src.notifications.settings import OVERSEE_PREFIX, NotificationSettings
 from src.secrets.source import SecretsSource
 
 log = logging.getLogger(__name__)
 
 
-def settings_from_secrets(source: SecretsSource, environ: Mapping[str, str]) -> Callable[[], NotificationSettings]:
+def settings_from_secrets(source: SecretsSource, environ: Mapping[str, str], *,
+                          prefix: str = OVERSEE_PREFIX) -> Callable[[], NotificationSettings]:
     """A loader that reads the channel settings from the environment with the cached secret laid over it
-    (never blocks: `resolve_cached`)."""
+    (never blocks: `resolve_cached`). `prefix` is `XTNL_` (Oversee) or `XTNL_ARM_` (the ARM channels, S29)."""
     def load() -> NotificationSettings:
-        return NotificationSettings.from_env(source.resolve_cached(environ))
+        return NotificationSettings.from_env(source.resolve_cached(environ), prefix=prefix)
     return load
 
 
@@ -41,8 +42,10 @@ class RotatingChannels:
     def __init__(self, load: Callable[[], NotificationSettings], client: httpx.AsyncClient, *,
                  smtp_factory: SmtpFactory = default_smtp_factory,
                  invalidate: Callable[[], None] = lambda: None,
-                 initial: NotificationSettings | None = None) -> None:
+                 initial: NotificationSettings | None = None,
+                 names: tuple[str, str] = OVERSEE_CHANNEL_NAMES) -> None:
         self._load = load
+        self._names = names
         self._client = client
         self._smtp_factory = smtp_factory
         self._invalidate = invalidate
@@ -51,7 +54,7 @@ class RotatingChannels:
         self.rebuilds = 0
 
     def _build(self, settings: NotificationSettings) -> ChannelSet:
-        return build_channels(settings, self._client, smtp_factory=self._smtp_factory)
+        return build_channels(settings, self._client, smtp_factory=self._smtp_factory, names=self._names)
 
     @property
     def current(self) -> ChannelSet:

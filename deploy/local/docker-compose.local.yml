@@ -1,0 +1,213 @@
+# XTNL single-PC LIVE stack: PostgreSQL 17 + Redis 7.4 + single-member etcd for the engine that runs on this PC
+# (single-PC mode, .claude/rules/operations.md s17; runbook docs/runbooks/single-pc-autostart.md).
+#
+# Why this is not deploy/docker-compose.dev.yml:
+#   * Persistence. The dev stack keeps PostgreSQL and etcd on tmpfs: a Docker Desktop restart, a reboot or a
+#     Windows update wipes them. Here PostgreSQL (the single source of truth: orders, positions, engine_runs,
+#     adapter_coverage, catchup_runs) and etcd (its cluster_id is half of the engine epoch, operations.md s2;
+#     a new cluster_id FENCES the engine until an operator adopts it) live on named volumes that survive restarts.
+#     Redis stays in memory on purpose: it is a disposable duplicate the engine rebuilds from PostgreSQL (SM8).
+#   * Separation from the tests. The integration tests truncate database xtnl_test and flush Redis db 15 of the
+#     dev stack. This stack is a different compose project (xtnl-local), different containers, volumes and ports,
+#     so `docker compose -f deploy/docker-compose.dev.yml down -v` or a test run never touches live data.
+#   * Restart policy. Every service is `restart: unless-stopped`, so Docker Desktop brings the stack back on its
+#     own after a reboot; deploy/local/start-xtnl.ps1 still runs `up -d --wait` before it starts the engine.
+#
+#     docker compose -f deploy/local/docker-compose.local.yml up -d --wait     # start (idempotent)
+#     docker compose -f deploy/local/docker-compose.local.yml ps
+#     docker compose -f deploy/local/docker-compose.local.yml stop             # stop, data kept
+#     NEVER `down -v` here: -v deletes the xtnl_local_pg / xtnl_local_etcd / xtnl_local_redis_md volumes (all
+#     engine history, and the market-data store's AOF).
+#
+# Ports bind to 127.0.0.1 only and differ from the dev stack (55432 / 56379 / 56383 / 52379):
+#     PostgreSQL 127.0.0.1:55433   Redis 127.0.0.1:56380   etcd 127.0.0.1:52380
+#     Redis of the order-server API 127.0.0.1:56381 (service redis-api, below)
+#     redis-md, the market-data store 127.0.0.1:56382 (compose profile md, below)
+#
+# redis-md (docs/design/automated-risk-manager.md A2) holds ticks, bars and indicator values, which never go into
+# PostgreSQL. It is in compose profile `md`, so the plain `up -d --wait` above never starts or waits for it;
+# deploy/local/start-xtnl.ps1 starts it in its own non-fatal step only when the env file sets XTNL_MD_ENABLED=1:
+#     docker compose -f deploy/local/docker-compose.local.yml --profile md up -d redis-md
+# AOF on (appendfsync everysec), noeviction, and the design's ACL users (default off, md_writer, md_reader,
+# md_health) from %LOCALAPPDATA%/XTNL/redis-md/users.acl, mounted read-only. deploy/local/new-md-credentials.ps1
+# writes that file (#<sha256> password entries only, outside the repository and OneDrive); the passwords, the URLs
+# and the content-hash key live only in the Windows User environment. The healthcheck logs in as md_health
+# (nopass, +ping only), so it needs no secret.
+#
+# redis-api is a SEPARATE Redis for the order-server API (python -m src.api, the one network-facing process): it
+# holds only the weekly Pine Script cache (database 2, pinescript:*), so a compromise of the API process reaches
+# nothing of the engine's Redis (entity keys, halt:state). The API never gets REDIS_URL (src/api/settings.py
+# refuses to start with it; deploy/local/start-xtnl.ps1 removes it from the API's environment).
+#
+# 'xtnl_local_only' is a LOCAL-ONLY password for this loopback-bound container. It is not a credential for
+# anything else and must never be reused elsewhere. Broker credentials never appear in this file.
+
+name: xtnl-local
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: xtnl
+      POSTGRES_PASSWORD: xtnl_local_only   # local-only password (see header), loopback-bound container
+      POSTGRES_DB: xtnl
+      POSTGRES_INITDB_ARGS: --data-checksums
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - max_connections=40
+      - -c
+      - idle_in_transaction_session_timeout=10s
+      - -c
+      - timezone=UTC
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - xtnl_local_pg:/var/lib/postgresql/data
+    # A clean shutdown (checkpoint) instead of Docker's 10 s SIGKILL: no crash recovery after a Docker stop.
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xtnl -d xtnl"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    logging: *default-logging
+
+  redis:
+    image: redis:7.4
+    restart: unless-stopped
+    # No persistence: the engine rebuilds Redis from PostgreSQL after any loss (SM8, redis-loss.md).
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "127.0.0.1:56380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    logging: *default-logging
+
+  redis-api:
+    image: redis:7.4
+    restart: unless-stopped
+    # The order-server API's cache only: memory only, small, and the oldest cache entries go first when full.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 32mb
+      - --maxmemory-policy
+      - volatile-lru
+    ports:
+      - "127.0.0.1:56381:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    logging: *default-logging
+
+  etcd:
+    image: gcr.io/etcd-development/etcd:v3.5.17
+    restart: unless-stopped
+    command:
+      - etcd
+      - --name=etcd-local
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.1:52380
+      - --listen-peer-urls=http://localhost:2380
+      - --initial-advertise-peer-urls=http://localhost:2380
+      - --initial-cluster=etcd-local=http://localhost:2380
+      - --initial-cluster-token=xtnl-local
+      - --initial-cluster-state=new
+      - --heartbeat-interval=250
+      - --election-timeout=2500
+      - --auto-compaction-mode=periodic
+      - --auto-compaction-retention=1h
+    ports:
+      - "127.0.0.1:52380:2379"
+    volumes:
+      # The cluster_id lives here: it must survive restarts or the engine epoch changes and the engine fences.
+      - xtnl_local_etcd:/etcd-data
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    logging: *default-logging
+
+  redis-md:
+    profiles: ["md"]
+    image: redis:7.4
+    restart: unless-stopped
+    # Market data only (design A2, A5): AOF persistence, at most 1 GB of data, never evicted (the market-data layer
+    # enforces retention and sheds itself). The container limit is 2 x maxmemory: the AOF rewrite fork's
+    # copy-on-write headroom is not counted in maxmemory.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --aof-load-truncated
+      - "yes"
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - noeviction
+      - --aclfile
+      - /etc/redis-md/users.acl
+    ports:
+      - "127.0.0.1:56382:6379"
+    volumes:
+      - xtnl_local_redis_md:/data
+      # Outside the repository and OneDrive, read-only, and never created here: without it (run
+      # deploy/local/new-md-credentials.ps1) the service does not start, which start-xtnl.ps1 logs and moves past.
+      - type: bind
+        source: ${LOCALAPPDATA}/XTNL/redis-md/users.acl
+        target: /etc/redis-md/users.acl
+        read_only: true
+        bind:
+          create_host_path: false
+    mem_limit: 2g
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "--user", "md_health", "--pass", "unused", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    logging: *default-logging
+
+volumes:
+  xtnl_local_pg:
+    name: xtnl_local_pg
+  xtnl_local_etcd:
+    name: xtnl_local_etcd
+  xtnl_local_redis_md:
+    name: xtnl_local_redis_md

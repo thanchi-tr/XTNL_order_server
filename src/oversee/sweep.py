@@ -34,7 +34,7 @@ from src.oversee.notify import (
     alerts_for_transitions,
     is_acknowledged,
 )
-from src.oversee.risk import RiskUnknown, effective_stop, needs_stop
+from src.oversee.risk import RiskUnknown, effective_stop_detail, needs_stop
 from src.oversee.rules import INPUT_FLAG_RULES, STALE_MARK, EvalContext, Evaluation, RuleRegistry, stale_symbols
 from src.oversee.snapshot import AccountSnapshot, DependencyUnavailable, SnapshotReader, SodMark, StopWatchKey
 from src.oversee.states import StepParams, resolve_state, step_state
@@ -54,6 +54,27 @@ from src.oversee.types import (
 )
 
 log = logging.getLogger(__name__)
+
+#: K13: the `partial_session` start-of-day alert (oversee-rules.md §2 Day roll, §10). Not a rule: its episode key
+#: only gives the outbox row a `notification_dedupe` key, one per (account, trading_day).
+SOD_PARTIAL_SESSION = "sod_partial_session"
+
+
+def sod_partial_alert(account_id: str, sod: SodMark | None, now_ms: int) -> OutboxRow | None:
+    """K13: the `sod_partial_session` alert for a `partial_session` sod_marks row this pass writes, or None.
+
+    It is an outbox row in the same AccountWrite (one transaction) as the `sod_marks` row it reports (§10), so a
+    failed write, a CasConflict retry, a crash or a lost fence after the write neither loses nor repeats it: the
+    row commits with the alert or not at all, and a committed row is never rebuilt. Its episode key
+    (sod_partial_session, account, `<account>:<trading_day>`) is deduplicated by the relay through
+    `notification_dedupe`, so a row rebuilt over a placeholder still sends one alert per (account, trading_day),
+    across restarts and failovers."""
+    if sod is None or not sod.partial_session:
+        return None
+    day = sod.trading_day.isoformat()
+    episode: EpisodeKey = (SOD_PARTIAL_SESSION, "account", f"{account_id}:{day}", 0, int(Level.SOFT_HALT))
+    return OutboxRow("episode", "high", f"{SOD_PARTIAL_SESSION} account:{account_id} {day}",
+                     ",".join(sod.partial_reasons) or "partial_session", now_ms, episode, account_id)
 
 
 def _input_flag_state(s: BreachState) -> bool:
@@ -177,7 +198,10 @@ def decide_level(states: Iterable[BreachState], current: HaltLevel, hard_latch: 
 
 def stop_watch_changes(snap: AccountSnapshot, now_ms: int) -> tuple[dict[StopWatchKey, int], list[StopWatchKey]]:
     """stop_watch rows to set (first seen needing a stop without one) and to clear (stop seen, or
-    the entity no longer needs one / is gone) (§2 Deadlines). Unknown entities are left alone."""
+    the entity no longer needs one / is gone) (§2 Deadlines). Unknown entities are left alone. The deadline
+    follows `effective_stop_detail()` (design PR1): any effective stop clears it, including one with the
+    `stop_kind_inconsistent` caveat, which MissingStopLossRule judges against the pass's MarkBook mark as
+    UNKNOWN (the durable `unknown_since` / `unknown_grace_ms`, not this deadline)."""
     to_set: dict[StopWatchKey, int] = {}
     to_clear: list[StopWatchKey] = []
     live: set[StopWatchKey] = set()
@@ -189,7 +213,7 @@ def stop_watch_changes(snap: AccountSnapshot, now_ms: int) -> tuple[dict[StopWat
         live.add(key)
         try:
             missing = needs_stop(e, snap.positions, snap.orders) and \
-                effective_stop(e, snap.positions, snap.orders) is None
+                effective_stop_detail(e, snap.positions, snap.orders) is None
         except RiskUnknown:
             continue
         if missing and key not in snap.stop_watch:
@@ -605,9 +629,7 @@ class RiskSweep:
             try:
                 new_sod = build_sod_mark(snap, roll, now, self._cfg)
                 snap = replace(snap, sod=new_sod)
-                if new_sod.partial_session:
-                    self._page(Page("high", "sod_partial_session", snap.account_id,
-                                    ",".join(new_sod.partial_reasons), now))
+                # K13: a partial_session row's alert is an outbox row of the same write (`sod_partial_alert`).
                 self._unlatch("sod_missing", snap.account_id)
             except RiskUnknown as exc:
                 if now - roll >= self._cfg.sweep.sod_missing_page_ms:
@@ -615,8 +637,7 @@ class RiskSweep:
                                        trading_day_for_roll(roll).isoformat())
         else:
             self._unlatch("sod_missing", snap.account_id)
-        task = self._cf_tasks.get(snap.account_id)
-        return replace(snap, cash_flow_request_pending=task is not None and not task.done()), new_sod
+        return snap, new_sod
 
     async def _pass_account(self, acct: str, sweep_id: int) -> None:
         for attempt in (1, 2):
@@ -631,13 +652,14 @@ class RiskSweep:
             sw_set, sw_clear = stop_watch_changes(snap, now)
             alerted, held, why = self._split_alerts(snap, result.transitions, now)
             outbox = tuple(alerts_for_transitions(alerted))
+            sod_alert = sod_partial_alert(acct, new_sod, now)
             batch = AccountWrite(
                 account_id=acct, epoch=self._epoch(), sweep_id=sweep_id,
                 states=tuple(StateWrite(new, old.last_sweep_id if old else None,
                                         old.clear_generation if old else None)
                              for new, old in ((n, stored.get(n.key)) for n, _ in result.changed)),
                 stop_watch_set=tuple(sw_set.items()), stop_watch_clear=tuple(sw_clear),
-                events=tuple(result.transitions), outbox=outbox,
+                events=tuple(result.transitions), outbox=outbox + ((sod_alert,) if sod_alert is not None else ()),
                 sod_mark=new_sod)
             try:
                 await self._writer.write_account(batch)

@@ -6,6 +6,7 @@ here reads .env files.
 """
 from __future__ import annotations
 
+import logging
 import math
 import os
 from collections.abc import Mapping
@@ -14,6 +15,10 @@ from typing import Literal
 
 BrokerEnv = Literal["sandbox", "live_readonly"]
 ALLOWED_BROKER_ENVS: tuple[BrokerEnv, ...] = ("sandbox", "live_readonly")
+
+_log = logging.getLogger(__name__)
+_FLAG_ON = ("1", "true", "yes", "on")
+_FLAG_OFF = ("0", "false", "no", "off")
 
 
 class ExecutionLockedError(RuntimeError):
@@ -41,6 +46,62 @@ def _rest_limits(e: Mapping[str, str], prefix: str, rate: float, burst: int) -> 
     return r, b
 
 
+def _bars_cap(e: Mapping[str, str], prefix: str) -> int | None:
+    """``{prefix}_REST_BARS_PER_MIN``: the per-adapter cap on ``BARS`` REST reads per minute (design PR11). None
+    (unset) means the default, a quarter of the bucket's rate (``src.adapters.ratelimit.default_bars_per_min``).
+    Only the optional market-data / ARM services read at ``BARS``, so a bad value never stops start-up: it logs a
+    warning (the name only) and the default applies."""
+    name = f"{prefix}_REST_BARS_PER_MIN"
+    raw = (e.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        cap = int(raw)
+    except ValueError:
+        cap = 0
+    if cap < 1:
+        _log.warning("%s must be a whole number >= 1; the default (a quarter of the REST rate) applies", name)
+        return None
+    return cap
+
+
+# The BARS cap rule (design PR11) for readers outside the adapters (the ops CLI's admission check, which may not
+# import src.adapters). It is the same rule as `src/adapters/ratelimit.py` default / max / effective_bars_per_min;
+# tests/ops/test_arm_ops.py checks the two give the same caps.
+BARS_WINDOW_S = 60.0
+MAX_BARS_SHARE = 0.5
+#: The REST defaults (rate per second, burst) per settings prefix.
+REST_DEFAULTS: dict[str, tuple[float, int]] = {
+    "STONE_X": (STONEX_REST_RATE_PER_S, STONEX_REST_BURST),
+    "CTRADER": (CTRADER_REST_RATE_PER_S, CTRADER_REST_BURST),
+}
+
+
+def default_bars_per_min(rate_per_s: float) -> int:
+    """The default ``BARS`` cap: a quarter of the bucket's rate, per minute (at least 1)."""
+    return max(1, int(rate_per_s * BARS_WINDOW_S / 4))
+
+
+def max_bars_per_min(rate_per_s: float) -> int:
+    """The highest ``BARS`` cap allowed: half the bucket's rate, per minute (at least 1)."""
+    return max(1, int(rate_per_s * BARS_WINDOW_S * MAX_BARS_SHARE))
+
+
+def effective_bars_per_min(rate_per_s: float, bars_per_min: int | None) -> int:
+    """The cap a bucket uses for a configured value (None: the default), clamped to :func:`max_bars_per_min`."""
+    cap = default_bars_per_min(rate_per_s) if bars_per_min is None else int(bars_per_min)
+    return min(cap, max_bars_per_min(rate_per_s))
+
+
+def rest_bars_per_min(e: Mapping[str, str], prefix: str) -> int:
+    """The ``BARS`` cap per minute the adapter with settings prefix ``prefix`` (a :data:`REST_DEFAULTS` key) uses,
+    read exactly as the adapter's settings read it (``_rest_limits`` and ``_bars_cap``). A bad
+    ``{prefix}_REST_RATE_PER_S`` / ``{prefix}_REST_BURST`` raises ValueError, as the adapter's start-up does."""
+    rate, burst = REST_DEFAULTS[prefix]
+    r, _ = _rest_limits(e, prefix, rate, burst)
+    return effective_bars_per_min(r, _bars_cap(e, prefix))
+
+
 def broker_env(environ: Mapping[str, str] | None = None) -> BrokerEnv:
     """Return BROKER_ENV, refusing anything but sandbox / live_readonly (default sandbox)."""
     env = (environ if environ is not None else os.environ).get("BROKER_ENV", "sandbox")
@@ -64,6 +125,16 @@ def env_flag(e: Mapping[str, str], name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} must be 0 or 1")
 
 
+def tolerant_flag(e: Mapping[str, str], name: str) -> bool:
+    """An optional feature switch that must never stop start-up (design §C2 local flags): on only for
+    1/true/yes/on; unset, off values and anything unreadable are off. An unreadable value logs a warning (the
+    name only, never the value) and never raises."""
+    raw = (e.get(name) or "").strip().lower()
+    if raw and raw not in _FLAG_ON and raw not in _FLAG_OFF:
+        _log.warning("%s is not an on/off value (1/true/yes/on or 0/false/no/off); treated as off", name)
+    return raw in _FLAG_ON
+
+
 @dataclass(frozen=True)
 class StoneXSettings:
     """StoneX (CIAPI) settings. Variable names match the XTNL project so both can share secrets."""
@@ -78,12 +149,17 @@ class StoneXSettings:
     app_version: str = "1"
     rest_rate_per_s: float = STONEX_REST_RATE_PER_S
     rest_burst: int = STONEX_REST_BURST
+    rest_bars_per_min: int | None = None     # STONE_X_REST_BARS_PER_MIN; None = a quarter of the rate (PR11)
     # Downtime catch-up (StoneXAdapter.fetch_history). Both off until a live read-only probe confirmed the
     # behaviour; while off every StoneX history answer is reported incomplete (fail closed):
     # STONE_X_STOP_LIMIT_HISTORY=1 reads order/stoplimitorderhistory (stop / limit orders placed and finished
     # while off); STONE_X_HISTORY_PAGING_CONFIRMED=1 trusts order/tradehistory paging across pages.
     stop_limit_history: bool = True          # confirmed live 2026-11-14 (see the comment above)
     history_paging_confirmed: bool = True
+    # XTNL_STONEX_PRICE_UNFILTERED=1: setRequestedMaxFrequency("unfiltered") on PRICES subscriptions (design PR3,
+    # §C2). Off by default; turned on only after the PR3 probe. Parsed tolerantly (anything but an "on" value is
+    # off), so a typo never stops ingestion.
+    price_unfiltered: bool = False
 
     @staticmethod
     def from_env(environ: Mapping[str, str] | None = None) -> "StoneXSettings":
@@ -108,8 +184,10 @@ class StoneXSettings:
             env=env,
             rest_rate_per_s=rate,
             rest_burst=burst,
+            rest_bars_per_min=_bars_cap(e, "STONE_X"),
             stop_limit_history=env_flag(e, "STONE_X_STOP_LIMIT_HISTORY", default=True),
             history_paging_confirmed=env_flag(e, "STONE_X_HISTORY_PAGING_CONFIRMED", default=True),
+            price_unfiltered=tolerant_flag(e, "XTNL_STONEX_PRICE_UNFILTERED"),
         )
 
     def __repr__(self) -> str:  # never print secrets
@@ -139,6 +217,7 @@ class PepperstoneSettings:
     env: BrokerEnv = "sandbox"
     rest_rate_per_s: float = CTRADER_REST_RATE_PER_S
     rest_burst: int = CTRADER_REST_BURST
+    rest_bars_per_min: int | None = None     # CTRADER_REST_BARS_PER_MIN; None = a quarter of the rate (PR11)
 
     @property
     def ws_url(self) -> str:
@@ -177,6 +256,7 @@ class PepperstoneSettings:
             env=env,
             rest_rate_per_s=rate,
             rest_burst=burst,
+            rest_bars_per_min=_bars_cap(e, "CTRADER"),
         )
 
     def __repr__(self) -> str:  # never print secrets

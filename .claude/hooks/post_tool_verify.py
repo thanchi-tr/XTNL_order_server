@@ -9,7 +9,8 @@ import os
 import subprocess
 import sys
 
-WATCHED_DIRS = ("src/dto/", "src/adapters/", "src/pubsub/", "src/integrity/", "src/oversee/", "src/cache/", "src/db/")
+WATCHED_DIRS = ("src/dto/", "src/adapters/", "src/pubsub/", "src/integrity/", "src/oversee/", "src/cache/", "src/db/",
+                "src/riskmgr/", "src/marketdata/", "src/armconfig/", "src/runtime/", "src/notifications/")
 SCRIPT = os.path.join(".claude", "skills", "live-trading-server", "scripts", "verify_execution.py")
 
 

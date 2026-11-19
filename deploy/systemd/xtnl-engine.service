@@ -58,10 +58,13 @@ RestartSteps=5
 RestartMaxDelaySec=30
 TimeoutStartSec=60
 # SIGTERM -> DRAINING (stop intake, flush the DlqSpooler to PostgreSQL or the local spill file, write
-# end_reason, release the lease). The keeper hard-exits after 10 s; 20 s leaves margin before SIGKILL.
+# end_reason, release the lease). The keeper hard-exits after 10 s. A SIGTERM during the LEADER_INIT step-1 commit
+# waits for it (K15: its outcome must be known; COMMIT runs with statement_timeout 0, so only a sync-standby stall
+# bounds it, ~20 s until Patroni drops sync, operations.md §3), then the 1 s step unwind, then DRAINING:
+# 20 + 1 + 10 = 31 s, so 35 s still ends the term `switchover` instead of a SIGKILL that leaves it open.
 KillMode=mixed
 KillSignal=SIGTERM
-TimeoutStopSec=20
+TimeoutStopSec=35
 SendSIGKILL=yes
 
 # --- resources (size per instance; c7i.2xlarge-class node shares RAM with PostgreSQL, Redis, etcd) -----

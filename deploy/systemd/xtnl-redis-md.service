@@ -1,0 +1,80 @@
+# XTNL optional market-data store `redis-md` (design §A2, §A5, §C2; plan S37). Install as
+# /etc/systemd/system/xtnl-redis-md.service on engine nodes A and B with deploy/redis/redis-md.conf as
+# /etc/xtnl/redis-md.conf. INSTALLED BUT NOT ENABLED: the operator runs `systemctl enable --now xtnl-redis-md` only
+# together with XTNL_MD_ENABLED=1 in /etc/xtnl/engine.env (runbook marketdata.md "Enable"). With the flag off the
+# engine never connects to it.
+#
+# It holds market data only (ticks, bars, indicator values derived from the broker) and never sends anything to a
+# broker. It is not a dependency of xtnl-engine.service and not a node health check: stopping or losing it marks the
+# series GAPPED and never touches ingestion, Oversee, the gate or leadership.
+#
+# The ACL file is rendered at every start from the secrets source (ExecStartPre, run as root with `+`): the two
+# passwords come from XTNL_MD_REDIS_URL / XTNL_MD_REDIS_READER_URL in /etc/xtnl/engine.env or the Secrets Manager
+# secret it names, written as '#<sha256>' entries only to the runtime directory (tmpfs, 0640 root:redis). A refused
+# render (a URL missing or not pointing at 127.0.0.1:6381, an unknown secrets source) exits 78 (EX_CONFIG): fix the
+# secret, then `systemctl restart xtnl-redis-md`. A secrets source that cannot be read just now (AWS / network error
+# at boot, also an IAM denial) exits 75 (EX_TEMPFAIL) and the start is retried every RestartSec. Either way the start
+# limit below (20 starts in 15 min) ends the retries and leaves the unit `failed` (`systemctl reset-failed` after the
+# fix). RestartPreventExitStatus=78 also stops the restart where systemd applies it (the main process's exit status;
+# a failed ExecStartPre may still be retried until the start limit).
+
+[Unit]
+Description=XTNL redis-md market-data store (optional; enabled with XTNL_MD_ENABLED=1)
+Documentation=file:///opt/xtnl/order-server/docs/runbooks/marketdata.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/xtnl/redis-md.conf
+StartLimitIntervalSec=900
+StartLimitBurst=20
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=redis
+Group=redis
+# ExecStartPre needs the repository for `python -m src.ops.md_acl`; redis-server itself works in `dir`
+# (/var/lib/xtnl-redis-md, redis-md.conf).
+WorkingDirectory=/opt/xtnl/order-server
+Environment=PYTHONDONTWRITEBYTECODE=1
+RuntimeDirectory=xtnl-redis-md
+RuntimeDirectoryMode=0750
+StateDirectory=xtnl-redis-md
+StateDirectoryMode=0750
+ExecStartPre=+/opt/xtnl/order-server/.venv/bin/python -m src.ops.md_acl --env-file /etc/xtnl/engine.env --out /run/xtnl-redis-md/users.acl --group redis
+ExecStart=/usr/bin/redis-server /etc/xtnl/redis-md.conf
+RestartPreventExitStatus=78
+SyslogIdentifier=xtnl-redis-md
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+# --- resources: maxmemory 1gb (redis-md.conf); the AOF rewrite fork's copy-on-write needs the same again ---------
+MemoryMax=2G
+LimitNOFILE=65536
+TasksMax=128
+
+# --- hardening --------------------------------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

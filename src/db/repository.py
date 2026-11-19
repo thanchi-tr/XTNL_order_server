@@ -44,10 +44,13 @@ log = logging.getLogger(__name__)
 
 CLEAN_MARK_INTERVAL_MS: Final = 10_000
 
+#: origin / broker_time_ms (0015, design PR8): the path that produced the version and its broker time when that
+#: is a real broker time (never a watermark). Entity rows pass the orchestrator's labels (`version_labels`); cash
+#: flows and instruments pass NULL.
 SQL_EVENT_LOG: Final = (
     "INSERT INTO event_log (seq_id, entity_type, entity_key, adapter_id, account_id, action, version, checksum, "
-    "payload, epoch_revision) SELECT $2::bigint, $3::text, $4::text, $5::text, $6::text, $7::text, $8::text, "
-    f"$9::text, $10::text::jsonb, $1::bigint WHERE {FENCE}"
+    "payload, epoch_revision, origin, broker_time_ms) SELECT $2::bigint, $3::text, $4::text, $5::text, $6::text, "
+    f"$7::text, $8::text, $9::text, $10::text::jsonb, $1::bigint, $11::text, $12::bigint WHERE {FENCE}"
 )
 SQL_OUTBOX: Final = (
     "INSERT INTO outbox_events (seq_id, topic, entity_type, entity_key, payload) "
@@ -65,15 +68,18 @@ SQL_CASH_FLOW: Final = (
 )
 SQL_INSTRUMENT_UPSERT: Final = (
     "INSERT INTO instruments (adapter_id, symbol, base_ccy, quote_ccy, pnl_ccy, contract_size, unit_kind, "
-    "point_size, min_qty, swap_booked_to_balance, broker_symbol, version, seq_id, checksum, digest_hash) "
+    "point_size, min_qty, swap_booked_to_balance, broker_symbol, version, seq_id, checksum, digest_hash, "
+    "price_increment, min_stop_distance, asset_class) "
     "SELECT $2::text, $3::text, $4::text, $5::text, $6::text, $7::numeric, $8::text, $9::numeric, $10::numeric, "
-    f"$11::boolean, $12::text, $13::text, $14::bigint, $15::text, $16::text WHERE {FENCE} "
+    "$11::boolean, $12::text, $13::text, $14::bigint, $15::text, $16::text, $17::numeric, $18::numeric, $19::text "
+    f"WHERE {FENCE} "
     "ON CONFLICT (adapter_id, symbol) DO UPDATE SET base_ccy = EXCLUDED.base_ccy, quote_ccy = EXCLUDED.quote_ccy, "
     "pnl_ccy = EXCLUDED.pnl_ccy, contract_size = EXCLUDED.contract_size, unit_kind = EXCLUDED.unit_kind, "
     "point_size = EXCLUDED.point_size, min_qty = EXCLUDED.min_qty, "
     "swap_booked_to_balance = EXCLUDED.swap_booked_to_balance, broker_symbol = EXCLUDED.broker_symbol, "
-    "version = EXCLUDED.version, seq_id = EXCLUDED.seq_id, checksum = EXCLUDED.checksum, "
-    "digest_hash = EXCLUDED.digest_hash, committed_at_ms = now_ms() "
+    "price_increment = EXCLUDED.price_increment, min_stop_distance = EXCLUDED.min_stop_distance, "
+    "asset_class = EXCLUDED.asset_class, version = EXCLUDED.version, seq_id = EXCLUDED.seq_id, "
+    "checksum = EXCLUDED.checksum, digest_hash = EXCLUDED.digest_hash, committed_at_ms = now_ms() "
     'WHERE instruments.checksum <> EXCLUDED.checksum AND instruments.version COLLATE "C" < EXCLUDED.version COLLATE "C" '
     "RETURNING 1"
 )
@@ -168,6 +174,14 @@ class IllegalTransitionParked(Exception):
         self.new_status = new_status
 
 
+def version_labels(dto: StatefulDTO) -> tuple[str | None, int | None]:
+    """(`event_log.origin`, `event_log.broker_time_ms`) of a labelled version (design PR8, R11-M06): the broker
+    time only when `broker_time_source` is BROKER (a real broker record time, never a watermark or a local time);
+    NULL for a row the orchestrator did not label."""
+    broker_time = dto.broker_updated_at_ms if dto.broker_time_source == "BROKER" else None
+    return dto.origin, broker_time
+
+
 def illegal_transition(dto: StatefulDTO, stored_status: object) -> tuple[str, str] | None:
     """(stored, new) when moving the stored row to `dto` breaks SM1 / SM7, else None. An unknown stored status
     (an account, or a value this code does not know) is never a violation."""
@@ -216,9 +230,10 @@ class PgStateStore:
 
     @staticmethod
     async def _log(tx: FencedTx, entity_type: str, key: str, adapter_id: str, account_id: str | None,
-                   action: str, seq_id: int, version: str | None, checksum: str | None, payload: str) -> None:
+                   action: str, seq_id: int, version: str | None, checksum: str | None, payload: str, *,
+                   origin: str | None = None, broker_time_ms: int | None = None) -> None:
         await tx.write(SQL_EVENT_LOG, seq_id, entity_type, key, adapter_id, account_id, action, version, checksum,
-                       payload, must=True)
+                       payload, origin, broker_time_ms, must=True)
 
     async def commit_entity(self, dto: StatefulDTO) -> PgCommit:
         t = table_for(dto)
@@ -233,8 +248,9 @@ class PgStateStore:
             elif decision is Decision.APPLY:
                 if not inserted:
                     await tx.write(t.update_apply, *t.apply_params(dto, w), must=True)
+                origin, broker_time = version_labels(dto)
                 await self._log(tx, t.entity_type, w.key, dto.adapter_id, dto.account_id, "APPLIED", dto.seq_id,
-                                w.version, dto.checksum, w.payload)
+                                w.version, dto.checksum, w.payload, origin=origin, broker_time_ms=broker_time)
                 await tx.write(SQL_OUTBOX, dto.seq_id, t.topic, t.entity_type, w.key, w.payload, must=True)
                 if t is ACCOUNTS:
                     await tx.write(SQL_ACCOUNT_SNAPSHOT, dto.adapter_id, dto.account_id, dto.seq_id,
@@ -243,8 +259,10 @@ class PgStateStore:
             elif decision is Decision.NOOP_ADVANCE:
                 await tx.write(t.update_advance, *t.advance_params(dto, w), must=True)
             elif decision is Decision.DROP_STALE:
+                origin, broker_time = version_labels(dto)
                 await self._log(tx, t.entity_type, w.key, dto.adapter_id, dto.account_id, "DROPPED_STALE",
-                                dto.seq_id, w.version, dto.checksum, w.payload)
+                                dto.seq_id, w.version, dto.checksum, w.payload, origin=origin,
+                                broker_time_ms=broker_time)
         if illegal is not None:
             log.error("%s: illegal transition %s -> %s refused by the store and parked (%s)", dto.adapter_id,
                       illegal[0], illegal[1], w.key)
@@ -269,7 +287,8 @@ class PgStateStore:
         changed = await tx.write_returning(
             SQL_INSTRUMENT_UPSERT, spec.adapter_id, spec.symbol, spec.base_ccy, spec.quote_ccy, spec.pnl_ccy,
             spec.contract_size, spec.unit_kind, spec.point_size, spec.min_qty, spec.swap_booked_to_balance,
-            spec.broker_symbol, w.version, seq_id, w.checksum, w.digest_hash) is not None
+            spec.broker_symbol, w.version, seq_id, w.checksum, w.digest_hash, spec.price_increment,
+            spec.min_stop_distance, spec.asset_class) is not None
         if not changed:
             return None
         await PgStateStore._log(tx, "INSTRUMENT", w.key, spec.adapter_id, None, "APPLIED", seq_id, w.version,

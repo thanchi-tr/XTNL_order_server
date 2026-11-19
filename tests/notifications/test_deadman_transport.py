@@ -67,6 +67,15 @@ class Source:
     def degraded(self) -> list[str]:
         return []
 
+    def arm_oldest_undelivered_notification_ms(self) -> int | None:
+        return None
+
+    def arm_overdue_positions(self) -> int | None:
+        return None
+
+    def arm_failed(self) -> None:
+        return None
+
 
 TOKEN ="deadman-token-never-logged"
 URL = "https://deadman.example/ping/check-1234"

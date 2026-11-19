@@ -18,8 +18,11 @@ from src.adapters.stonex.mapping import (
     map_price,
     map_stop_limit_order,
     map_trade_history,
+    map_trade_order,
     parse_account_directory,
+    stop_limit_type,
 )
+from src.adapters.stonex.codes import StoneXOrderType
 from src.adapters.stonex.rest import StoneXRestClient
 from src.adapters.transport import ReadOnlyTransport
 from src.config import ExecutionLockedError
@@ -263,6 +266,52 @@ def test_stop_limit_order_mapping_child_and_entry() -> None:
     assert unknown.instrument_unknown and unknown.ordered_units is None and unknown.raw_qty == Decimal(25000)
 
 
+@pytest.mark.parametrize(("type_field", "kind"), [
+    ({"Type": "Stop"}, "STOP"), ({"Type": "Limit"}, "LIMIT"), ({"Type": 2}, "STOP"), ({"OrderTypeId": 3}, "LIMIT"),
+    ({"TypeId": 2}, "STOP"), ({"TypeId": "3"}, "LIMIT"), ({"Type": 1}, None), ({}, None),
+])
+def test_stop_limit_order_kind_comes_from_the_row_type(type_field: dict[str, object], kind: str | None) -> None:
+    """Design PR1: activeorders / order/{id} rows carry Type, the history TypeId (IN-1)."""
+    raw = {"OrderId": 778, "MarketId": int(EURUSD_ID), "Direction": "Sell", "Quantity": 25000,
+           "TriggerPrice": 1.08, "Status": 2, **type_field}
+    assert map_stop_limit_order(raw, account_id=CLIENT, lookup=lookup, parent_id="555").order_kind == kind
+
+
+def test_stop_and_limit_children_nested_in_a_position_are_typed_by_their_key() -> None:
+    raw = {"OrderId": 555, "MarketId": int(EURUSD_ID), "Direction": "Buy", "Quantity": 25000,
+           "StopOrder": {"OrderId": 556, "TriggerPrice": 1.08, "Type": "Limit"},      # the key wins over the child
+           "IfDone": [{"Limit": {"OrderId": 557, "TriggerPrice": 1.09}}]}
+    found = {c.raw["OrderId"]: c.order_type for c in attached_orders(raw)}
+    assert found == {556: StoneXOrderType.STOP, 557: StoneXOrderType.LIMIT}
+    kinds = {}
+    for child in attached_orders(raw):
+        kind = "STOP" if child.order_type == StoneXOrderType.STOP else "LIMIT"
+        dto = map_stop_limit_order(child.raw, account_id=CLIENT, lookup=lookup, parent_id=child.parent_id,
+                                   default_side="Sell", default_qty=child.parent_qty,
+                                   default_market_id=child.parent_market_id, order_kind=kind)
+        kinds[dto.broker_order_id] = dto.order_kind
+    assert kinds == {"556": "STOP", "557": "LIMIT"}
+    assert stop_limit_type(raw["StopOrder"]) == StoneXOrderType.LIMIT       # what the row alone would say
+
+
+def test_a_trade_order_has_no_order_kind() -> None:
+    raw = {"OrderId": 900, "MarketId": int(EURUSD_ID), "Direction": "Buy", "Quantity": 10000, "Status": 3,
+           "Type": 1, "Price": 1.0855}
+    dto = map_trade_order(raw, account_id=CLIENT, lookup=lookup, reduce_only=False, linked_position_id=None)
+    assert dto.order_kind is None
+
+
+def test_order_kind_changes_the_checksum_but_none_keeps_it() -> None:
+    raw = {"OrderId": 779, "MarketId": int(EURUSD_ID), "Direction": "Sell", "Quantity": 25000,
+           "TriggerPrice": 1.08, "Status": 2}
+    untyped = map_stop_limit_order(raw, account_id=CLIENT, lookup=lookup, parent_id="555")
+    typed = map_stop_limit_order(raw | {"Type": "Stop"}, account_id=CLIENT, lookup=lookup, parent_id="555")
+    assert untyped.order_kind is None and typed.order_kind == "STOP"
+    assert typed.checksum != untyped.checksum
+    assert untyped.checksum == map_stop_limit_order(raw | {"Type": "Trade"}, account_id=CLIENT, lookup=lookup,
+                                                    parent_id="555").checksum
+
+
 def test_trade_history_maps_closing_deals_only() -> None:
     rows = [
         {"OrderId": 1, "OpeningOrderIds": [], "RealisedPnl": None, "RealisedPnlCurrency": "AUD",
@@ -297,11 +346,11 @@ async def test_log_off_never_puts_the_session_token_in_the_url(
 def test_account_directory_never_treats_a_contract_id_as_a_trading_account() -> None:
     # Shape of the live v2 ClientAndTradingAccount answer (ids only): the client account row carries a
     # contractId, the trading account sits in the top-level tradingAccounts list.
-    live_shape = {"clientAccounts": [{"clientAccountId": 401648225, "contractId": 403323210,
+    live_shape = {"clientAccounts": [{"clientAccountId": 400000101, "contractId": 400000303,
                                       "clientAccountCurrency": "AUD"}],
-                  "tradingAccounts": [{"clientAccountId": 401648225, "tradingAccountId": 402107859,
+                  "tradingAccounts": [{"clientAccountId": 400000101, "tradingAccountId": 400000202,
                                        "tradingAccountStatus": "Open", "tradingAccountType": "CFD"}],
-                  "contracts": [{"contractId": 403323210}]}
+                  "contracts": [{"contractId": 400000303}]}
     d = parse_account_directory(live_shape)
-    assert d.trading_ids == (("402107859", "401648225"),)
-    assert d.currency_of("401648225") == "AUD"
+    assert d.trading_ids == (("400000202", "400000101"),)
+    assert d.currency_of("400000101") == "AUD"

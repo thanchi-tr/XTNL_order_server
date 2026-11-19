@@ -3,7 +3,9 @@
 Pure and synchronous: no I/O, no clock of its own (every call takes `now_ms`, the receiver's wall clock).
 
 `parse_beat` validates one POSTed payload against the engine's `src.runtime.deadman.DeadmanPayload` (every key
-present, values of the right type; a JSON null is a value, an absent key is a malformed beat).
+present, values of the right type; a JSON null is a value, an absent key is a malformed beat). The optional ARM
+fields (`OPTIONAL_FIELDS`, design PR4 / §B14, plan S08) may be absent: the engine leaves them out while the ARM is
+not running, so a beat without them (an older engine, or the ARM off) parses with them None.
 
 `Evaluator` keeps the receiver's view and returns the set of **active conditions** at any instant:
 
@@ -21,6 +23,14 @@ present, values of the right type; a JSON null is a value, an absent key is a ma
 | `sm5_unknown`                    | SM5 UNKNOWN for > 60 s                                                            |
 | `spill_nonempty`                 | spill file non-empty for > 60 s                                                   |
 | `circuit_open:<task>`            | the task is in the `degraded` list (its circuit is open)                          |
+| `arm_failed`                     | `arm_failed.count` > 0 (ARM scopes in FAILED, from engine memory; pages at once)  |
+| `arm_failed_unrecorded`          | `arm_failed.unrecorded` > 0 (FAILED episodes PostgreSQL has not recorded, held in |
+|                                  | that node's memory and spool only; pages at once). Latched when the leader       |
+|                                  | changes before the node reported them recorded: the episode may be lost with the |
+|                                  | old leader, so it stays active for `arm_unrecorded_latch_ms` (1 h) or until a    |
+|                                  | beat shows a FAILED scope again (S38c review)                                    |
+| `arm_overdue_positions`          | `arm_overdue_positions` > 0 (no final ARM decision for > 2 OPEN bars)             |
+| `arm_notification_undelivered`   | oldest undelivered ARM notice > 60 s                                              |
 
 "When those fields are missing" (operations.md §9) pages on the first beat that lacks them (IMPLEMENTATION_PLAN
 8.2; a key absent from the body is already a malformed beat, `payload_invalid`, at once). The engine starts
@@ -47,7 +57,12 @@ PAYLOAD_FIELDS: Final = (
     "oldest_unacked_feed_age_ms", "oldest_risksweep_pass_age_ms", "calendar_version",
     "oldest_undelivered_notification_age_ms", "sm8_state", "sm5_state", "spill_bytes", "degraded",
 )
+#: Keys of DeadmanPayload that may be absent (None): the ARM's fields, sent only while the ARM runs.
+OPTIONAL_FIELDS: Final = ("arm_oldest_undelivered_notification_age_ms", "arm_overdue_positions", "arm_failed")
 ADAPTER_FIELDS: Final = ("sm4_state", "market_open", "maintenance_until_ms")
+ARM_FAILED_FIELDS: Final = ("count", "global_failed")
+ARM_FAILED_OPTIONAL: Final = ("unrecorded",)
+"""`arm_failed` keys an older engine leaves out (S38c review): absent means 0."""
 _STR_OR_NULL: Final = ("epoch", "gate_state", "halt_level", "sm8_state", "sm5_state")
 _INT_OR_NULL: Final = ("last_committed_broker_event_age_ms", "oldest_unacked_feed_age_ms",
                        "oldest_risksweep_pass_age_ms", "calendar_version", "oldest_undelivered_notification_age_ms",
@@ -72,6 +87,8 @@ class Thresholds:
     notification_age_ms: int = 60_000
     sm8_sm5_ms: int = 60_000
     spill_ms: int = 60_000
+    arm_notification_age_ms: int = 60_000     # same bound as the Oversee alerts' notification_age_ms
+    arm_unrecorded_latch_ms: int = 3_600_000  # an unrecorded FAILED episode left behind by a leader change
 
 
 @dataclass(frozen=True)
@@ -79,6 +96,15 @@ class AdapterState:
     sm4_state: str | None
     market_open: bool | None
     maintenance_until_ms: int | None
+
+
+@dataclass(frozen=True)
+class ArmFailedState:
+    count: int
+    global_failed: bool
+    unrecorded: int = 0
+    """FAILED episodes PostgreSQL has not recorded (held in that node's memory and spool only); an older engine
+    leaves the key out (0)."""
 
 
 @dataclass(frozen=True)
@@ -98,6 +124,9 @@ class Beat:
     sm5_state: str | None
     spill_bytes: int | None
     degraded: tuple[str, ...]
+    arm_oldest_undelivered_notification_age_ms: int | None = None
+    arm_overdue_positions: int | None = None
+    arm_failed: ArmFailedState | None = None
 
 
 class BeatError(ValueError):
@@ -146,6 +175,29 @@ def _adapter(name: str, v: object) -> AdapterState:
     return AdapterState(sm4, mo, mu)
 
 
+def _opt_count(d: Mapping[str, Any], name: str) -> int | None:
+    """An optional non-negative integer: absent or null -> None."""
+    v = d.get(name)
+    if v is None:
+        return None
+    if not _is_int(v) or v < 0:
+        raise BeatError(f"{name} must be a non-negative integer or null")
+    return int(v)
+
+
+def _arm_failed(v: object) -> ArmFailedState | None:
+    if v is None:
+        return None
+    if not isinstance(v, dict) or any(f not in v for f in ARM_FAILED_FIELDS):
+        raise BeatError(f"arm_failed must be an object with {', '.join(ARM_FAILED_FIELDS)} or null")
+    count, glob, unrecorded = v["count"], v["global_failed"], v.get(ARM_FAILED_OPTIONAL[0], 0)
+    if not _is_int(count) or count < 0 or not isinstance(glob, bool):
+        raise BeatError("arm_failed.count must be a non-negative integer and arm_failed.global_failed a boolean")
+    if not _is_int(unrecorded) or unrecorded < 0:
+        raise BeatError("arm_failed.unrecorded must be a non-negative integer")
+    return ArmFailedState(int(count), glob, int(unrecorded))
+
+
 def parse_beat(body: bytes) -> Beat:
     """Decode and validate one heartbeat body (UTF-8 JSON object). Raises BeatError."""
     if len(body) > MAX_BODY_BYTES:
@@ -180,6 +232,9 @@ def parse_beat(body: bytes) -> Beat:
         oldest_undelivered_notification_age_ms=ints["oldest_undelivered_notification_age_ms"],
         sm8_state=texts["sm8_state"], sm5_state=texts["sm5_state"], spill_bytes=ints["spill_bytes"],
         degraded=tuple(str(t)[:100] for t in degraded),
+        arm_oldest_undelivered_notification_age_ms=_opt_count(d, "arm_oldest_undelivered_notification_age_ms"),
+        arm_overdue_positions=_opt_count(d, "arm_overdue_positions"),
+        arm_failed=_arm_failed(d.get("arm_failed")),
     )
 
 
@@ -204,6 +259,10 @@ class Evaluator:
     beats: int = 0
     rejected: int = 0
     _since: dict[str, int] = field(default_factory=dict)
+    _unrecorded_at: tuple[str, str | None] | None = None
+    """(node, epoch) of the last beat that reported unrecorded FAILED episodes (cleared once it reports none)."""
+    _lost: tuple[str, str | None, int] | None = None
+    """(node, epoch, receiver time) of unrecorded episodes left behind by a leader change (latched)."""
 
     # ------------------------------------------------------------------ input
     def accept(self, beat: Beat, now_ms: int) -> None:
@@ -218,12 +277,25 @@ class Evaluator:
         self.last_rx_ms = now_ms
         self.invalid = None
         self.beats += 1
+        self._track_unrecorded(beat, now_ms)
         held = {key for key, _ in self._durations(beat)}
         for key in list(self._since):
             if key not in held:
                 del self._since[key]
         for key in held:
             self._since.setdefault(key, now_ms)
+
+    def _track_unrecorded(self, beat: Beat, now_ms: int) -> None:
+        """S38c review (AWS leader change): unrecorded FAILED episodes live only in the reporting node's memory and
+        spool. A beat from another node or epoch while they were outstanding means the leader changed before they
+        were recorded: latch `arm_failed_unrecorded` (the new leader starts with no episode and fresh counters)."""
+        failed = beat.arm_failed
+        here = (beat.node, beat.epoch)
+        if self._unrecorded_at is not None and self._unrecorded_at != here:
+            self._lost = (self._unrecorded_at[0], self._unrecorded_at[1], now_ms)
+        self._unrecorded_at = here if failed is not None and failed.unrecorded > 0 else None
+        if self._lost is not None and failed is not None and failed.count > 0 and self._unrecorded_at is None:
+            self._lost = None           # a FAILED scope is open (and recorded) again: the `arm_failed` page covers it
 
     def reject(self, reason: str) -> None:
         """A malformed POST (the reason names fields only)."""
@@ -269,6 +341,8 @@ class Evaluator:
         b = self.last_beat
         if b is None:
             return out
+        if self._lost is not None and now_ms - self._lost[2] > t.arm_unrecorded_latch_ms:
+            self._lost = None
         for key, need in self._durations(b):
             since = self._since.get(key)
             if since is not None and now_ms - since >= need:
@@ -288,6 +362,40 @@ class Evaluator:
         for task in sorted(set(b.degraded)):
             key = f"circuit_open:{task}"
             out[key] = Condition(key, f"dead-man: task circuit open ({task})", f"degraded: {task}")
+        out.update(self._arm_conditions(b))
+        return out
+
+    def _arm_conditions(self, b: Beat) -> dict[str, Condition]:
+        """The optional ARM fields (PR4): a FAILED scope or an overdue position pages at once; an undelivered ARM
+        notice pages past its threshold. Absent fields (the ARM is not running) page nothing."""
+        out: dict[str, Condition] = {}
+        failed = b.arm_failed
+        if failed is not None and failed.count > 0:
+            scope = "global ARM scope included" if failed.global_failed else "no global scope"
+            out["arm_failed"] = Condition("arm_failed", f"dead-man: ARM FAILED ({failed.count} scopes)",
+                                          f"{failed.count} ARM scopes in FAILED, {scope} (runbook arm.md FAILED)")
+        if failed is not None and failed.unrecorded > 0:
+            out["arm_failed_unrecorded"] = Condition(
+                "arm_failed_unrecorded", f"dead-man: ARM FAILED not recorded ({failed.unrecorded} episodes)",
+                f"{failed.unrecorded} FAILED episodes held only on node {b.node} (PostgreSQL write failing); a leader "
+                "change now loses them (runbook arm.md FAILED)")
+        elif self._lost is not None:
+            node, epoch, _ = self._lost
+            out["arm_failed_unrecorded"] = Condition(
+                "arm_failed_unrecorded", "dead-man: ARM FAILED episode lost in a leader change",
+                f"node {node} epoch {epoch} held unrecorded FAILED episodes when the leader changed; the new leader "
+                "starts without them: check `arm failed show` and that node's spool (runbook arm.md FAILED)")
+        overdue = b.arm_overdue_positions
+        if overdue is not None and overdue > 0:
+            out["arm_overdue_positions"] = Condition(
+                "arm_overdue_positions", "dead-man: ARM positions overdue",
+                f"{overdue} positions with no final ARM decision for more than 2 OPEN bars")
+        age = b.arm_oldest_undelivered_notification_age_ms
+        if age is not None and age > self.thresholds.arm_notification_age_ms:
+            out["arm_notification_undelivered"] = Condition(
+                "arm_notification_undelivered",
+                f"dead-man: ARM notice undelivered > {self.thresholds.arm_notification_age_ms // 1000} s",
+                f"oldest undelivered ARM notice {age // 1000} s")
         return out
 
     def _describe(self, key: str, b: Beat, held_ms: int) -> Condition:

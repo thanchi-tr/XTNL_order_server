@@ -24,6 +24,7 @@ from typing import Any
 
 from src.adapters.base import (
     AccountStreamItem,
+    ActiveStopOrders,
     AuthFailedError,
     BrokerAdapter,
     BrokerError,
@@ -138,6 +139,8 @@ DEAL_LIST_MAX_ROWS = 1000
 MAX_WINDOW_SPLITS = 8
 HISTORY_MAX_WEEKS = 13               # fetch_history reads at most this many one-week windows back
 SESSION_ENDING = (StreamEventKind.DISCONNECTED, StreamEventKind.AUTH_LOST)
+#: Payload key the reader adds to a spot event: local receipt time in ms (design PR2; never a broker field).
+RECEIVED_KEY = "_xtnl_received_ms"
 
 
 def now_ms() -> int:
@@ -181,7 +184,8 @@ class PepperstoneAdapter(BrokerAdapter):
                                     lease_check=self._check_lease, wall_ms=wall_ms)
         # One request bucket per adapter, shared by every session it opens (operations.md §15).
         self._budget = rest_budget if rest_budget is not None else RestBudget(
-            ADAPTER_ID, rate_per_s=settings.rest_rate_per_s, burst=settings.rest_burst)
+            ADAPTER_ID, rate_per_s=settings.rest_rate_per_s, burst=settings.rest_burst,
+            bars_per_min=settings.rest_bars_per_min)
         self._allow_refresh = allow_token_refresh
         self._refresh_margin_ms = int(refresh_margin_s * 1000)
         self._queue_size = queue_size
@@ -216,6 +220,7 @@ class PepperstoneAdapter(BrokerAdapter):
         self._channels: dict[str, EventChannel] = {}
         self._wanted_spots: set[int] = set()
         self._subscribed_spots: set[int] = set()
+        self._price_drops: dict[int, int] = {}                # symbolId -> spot frames dropped (full channel)
         self._used_margin: dict[str, Decimal] = {}
         self._positions_last: dict[str, PositionDTO] = {}
         self._watermark_ms: int | None = None
@@ -238,6 +243,32 @@ class PepperstoneAdapter(BrokerAdapter):
     @property
     def currency(self) -> str | None:
         return self._currency
+
+    @property
+    def subscribed_price_markets(self) -> frozenset[str]:
+        """The canonical symbols whose spots are subscribed on the live session (design PR6): a symbol whose
+        single-symbol subscribe failed is not in it, so a whole-stream SUBSCRIBED opens no interval for it."""
+        out: set[str] = set()
+        for symbol_id in self._subscribed_spots:
+            info = self._lookup(symbol_id)
+            out.add(info.spec.symbol if info is not None else str(symbol_id))
+        return frozenset(out)
+
+    @property
+    def dropped_price_frames(self) -> dict[str, int]:
+        """Spot frames dropped for a full price channel, per canonical symbol (design PR6). Monotonic over the
+        adapter's life (counted only, never a gap). A symbol id without a known symbol is keyed by its id."""
+        out: dict[str, int] = {}
+        for symbol_id, count in sorted(self._price_drops.items()):
+            info = self._lookup(symbol_id)
+            key = info.spec.symbol if info is not None else str(symbol_id)
+            out[key] = out.get(key, 0) + count
+        return out
+
+    def _count_price_drop(self, frame: Frame) -> None:
+        symbol_id = to_int(frame.payload.get("symbolId"))
+        if symbol_id is not None:
+            self._price_drops[symbol_id] = self._price_drops.get(symbol_id, 0) + 1
 
     @property
     def rest_budget(self) -> RestBudget:
@@ -647,6 +678,12 @@ class PepperstoneAdapter(BrokerAdapter):
         return position_from_deals(deals, position_id, account_id=self.account_id, lookup=self._lookup,
                                    default_money_digits=self._money_digits, adapter_id=self.adapter_id)
 
+    async def fetch_active_stop_orders(self) -> ActiveStopOrders:
+        """Design PR9 on cTrader: the stop handle is the position's own ``stopLoss`` (POSITION_FIELD), and a working
+        SL/TP order is never emitted, so the one list read is the open positions from one reconcile request
+        (read-only, on the ProtoOA allow-list). An open stop / limit entry is not a handle and is not listed."""
+        return ActiveStopOrders(adapter_id=self.adapter_id, positions=tuple(await self.fetch_positions()))
+
     def _map_orders(self, rows: Iterable[JsonObj], source: Source, execution_type: int | None = None,
                     *, keep_live_protection: bool = False) -> list[OrderDTO]:
         out: list[OrderDTO] = []
@@ -975,7 +1012,9 @@ class PepperstoneAdapter(BrokerAdapter):
             # _wanted_spots is updated before the subscribe request is sent, so the snapshot spot that
             # follows the subscribe response is never dropped while the requester has not resumed yet.
             if to_int(payload.get("symbolId")) in self._wanted_spots:
-                self._offer(frame, "prices")
+                # receipt time, stamped by the socket reader (PR2)
+                stamped = dataclasses.replace(frame, payload={**payload, RECEIVED_KEY: self._wall_ms()})
+                self._offer(stamped, "prices")
         elif pt == PT_EXECUTION_EVENT:
             position = obj(payload, "position")
             if position:
@@ -1005,7 +1044,8 @@ class PepperstoneAdapter(BrokerAdapter):
     def _open_channel(self, name: str, stream: StreamName, *, drop_when_full: bool) -> EventChannel:
         """One consumer per stream: a new call replaces (ends) the previous consumer."""
         ch = EventChannel(name, stream, maxsize=self._queue_size, drop_when_full=drop_when_full,
-                          heartbeat_s=self._heartbeat_s, is_live=self._is_live, clock_ms=self._wall_ms)
+                          heartbeat_s=self._heartbeat_s, is_live=self._is_live, clock_ms=self._wall_ms,
+                          on_drop=self._count_price_drop if stream == "prices" else None)
         old = self._channels.get(name)
         self._channels[name] = ch
         if old is not None:
@@ -1206,7 +1246,15 @@ class PepperstoneAdapter(BrokerAdapter):
         try:
             ids = await self._symbol_ids_for(symbols)
             self._wanted_spots.update(ids)
-            await self._subscribe_spots(sorted(self._wanted_spots))
+            await self._subscribe_spots(sorted(ids))
+            kept = sorted(self._wanted_spots - set(ids))
+            if kept:
+                # Spots added earlier (ensure_ticks) but not asked for now, e.g. a tick-only symbol: subscribed again,
+                # but the broker refusing them is only logged, so they can never fail the stream asked for.
+                try:
+                    await self._subscribe_spots(kept)
+                except OpenApiError as exc:
+                    log.warning("ctrader: re-subscribing %d kept spot(s) failed: %s", len(kept), exc.error_code)
             ch.put_event(StreamEventKind.SUBSCRIBED, f"{len(self._subscribed_spots)} symbol(s)")
             while True:
                 msg = await ch.get()
@@ -1238,27 +1286,31 @@ class PepperstoneAdapter(BrokerAdapter):
         book[symbol_id] = (bid, ask)
         if bid is None or ask is None:
             return None
-        ts = broker_ms(payload, "timestamp") or self._wall_ms()   # prices are unversioned
+        received = to_int(payload.get(RECEIVED_KEY)) or self._wall_ms()
+        broker_ts = broker_ms(payload, "timestamp")   # prices are unversioned: receipt time when absent
         spec = info.spec
         spread = (ask - bid) / spec.point_size if spec.point_size > 0 else None
         return PriceDTO(adapter_id=self.adapter_id, symbol=spec.symbol, bid=bid, ask=ask, spread_pips=spread,
-                        timestamp_ms=ts, broker_market_id=spec.broker_symbol or None)
+                        timestamp_ms=broker_ts or received, broker_market_id=spec.broker_symbol or None,
+                        ts_source="BROKER" if broker_ts else "RECEIPT", received_ms=received)
 
-    async def _subscribe_spots(self, symbol_ids: Sequence[int]) -> None:
+    async def _subscribe_spots(self, symbol_ids: Sequence[int]) -> list[int]:
+        """Subscribe the ids not subscribed yet; returns those now subscribed."""
         new = [i for i in symbol_ids if i not in self._subscribed_spots]
         if not new:
-            return
+            return []
         try:
             await self._req(PT_SUBSCRIBE_SPOTS_REQ, {"symbolId": new, "subscribeToSpotTimestamp": True})
             self._subscribed_spots.update(new)
-            return
+            return new
         except OpenApiError as exc:
             if exc.error_code in ALREADY_DONE_CODES:
                 self._subscribed_spots.update(new)
-                return
+                return new
             if len(new) == 1:
                 raise
             log.warning("ctrader: batch spot subscribe failed (%s); subscribing one by one", exc.error_code)
+        done: list[int] = []
         for symbol_id in new:
             try:
                 await self._req(PT_SUBSCRIBE_SPOTS_REQ, {"symbolId": [symbol_id], "subscribeToSpotTimestamp": True})
@@ -1267,6 +1319,8 @@ class PepperstoneAdapter(BrokerAdapter):
                     log.warning("ctrader: spot subscribe for symbol %s failed: %s", symbol_id, exc.error_code)
                     continue
             self._subscribed_spots.add(symbol_id)
+            done.append(symbol_id)
+        return done
 
     async def _unsubscribe_spots(self, symbol_ids: Sequence[int]) -> None:
         if not self._is_live():
@@ -1287,9 +1341,15 @@ class PepperstoneAdapter(BrokerAdapter):
         task.add_done_callback(self._background.discard)
 
     async def ensure_ticks(self, symbols: Sequence[str]) -> None:
-        """Add symbols to the live spot subscription (read-only subscribe); idempotent."""
+        """Add symbols to the live spot subscription (read-only subscribe); idempotent. Each symbol newly
+        subscribed on the live price stream gets its own SUBSCRIBED event naming it (design PR6)."""
         self._require_authorized()
         ids = await self._symbol_ids_for(symbols)
         self._wanted_spots.update(ids)
         if self._channels.get("prices") is not None:
-            await self._subscribe_spots(ids)
+            for symbol_id in await self._subscribe_spots(ids):
+                ch = self._channels.get("prices")
+                info = self._lookup(symbol_id)
+                if ch is not None:
+                    ch.put_event(StreamEventKind.SUBSCRIBED, "spot subscribed",
+                                 market=info.spec.symbol if info is not None else str(symbol_id))

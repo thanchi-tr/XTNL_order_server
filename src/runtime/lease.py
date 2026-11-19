@@ -13,13 +13,28 @@
 * Deadlines: LEADER_INIT must reach LEADER within 120 s and DRAINING must finish within 10 s; on expiry
   the keeper revokes the lease and exits (`init_failed` / `abdicate`), independently of the event loop.
 * Ordering checked at construction: watchdog 3 s < fence 12 s < TTL 15 s.
+* **Suspend** (round 14, plan S38g): the keeper's own thread never sleeps more than 0.25 s, so a gap of more than
+  `SUSPEND_GAP_S` (5 s) between two of its iterations means the process did not run (a Windows sleep keeps
+  `time.monotonic()` counting, so on wake the last keepalive looks 12 s old). Such a gap alone cannot tell an OS
+  suspend from a stalled process (a GIL hog, a VM pause, swap thrashing, a wall-clock step), so the keeper confirms
+  it with `suspend_clock` (round 14 review): a pair of clocks of which one counts the time the machine slept and the
+  other leaves it out (`system_suspend_clock`: Windows `GetTickCount64` and `QueryUnbiasedInterruptTime`, Linux
+  `CLOCK_BOOTTIME` and `CLOCK_MONOTONIC`). Only when the first moved more than `SUSPEND_GAP_S` further than the second
+  between two iterations is a fence in that iteration a **sleep fence**: its reason says so and
+  `on_suspended_fence(slept_s)` runs first (bound by `build_engine` to `src/runtime/sleeplog.py::SleepFenceLog.record`,
+  a node-local file), so the restart that follows is known for what it is (left out of the ARM's unclean-restart
+  count). Any other long gap is a stall: the fence names it (`process stalled N s`) and is an ordinary fence, so a
+  loop of stalls still reaches the FAILED restart budget. With no suspend clock (none passed, an unknown platform, a
+  failed read) every fence is ordinary. The fence itself is unchanged (still at once, still the same exit code).
 
 `tick()` performs one keeper iteration and is what the thread loops over; tests drive it directly
 with a fake monotonic clock and a fake EtcdClient.
 """
 from __future__ import annotations
 
+import ctypes
 import logging
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -35,6 +50,44 @@ log = logging.getLogger(__name__)
 DeadlineReason = Literal["init_failed", "abdicate"]
 ETCD_ELECTION_WORST_S: Final = 2 * 2.5
 ENDPOINT_FAILOVER_S: Final = 2.0
+SUSPEND_GAP_S: Final = 5.0
+"""A gap between two keeper iterations above this means the process did not run; a suspend only when the suspend
+clock confirms it (round 14)."""
+
+SuspendClock = Callable[[], tuple[float, float]]
+"""Seconds on (a clock that keeps counting while the machine sleeps, a clock that stops while it sleeps)."""
+
+
+def system_suspend_clock() -> SuspendClock | None:
+    """The platform's suspend clock pair (module docstring), or None when the platform has none or it cannot be
+    read now (every fence is then ordinary)."""
+    read: SuspendClock
+    if sys.platform == "win32":
+        try:
+            kernel32 = ctypes.windll.kernel32
+            ticks = kernel32.GetTickCount64
+            ticks.restype = ctypes.c_ulonglong
+            unbiased = kernel32.QueryUnbiasedInterruptTime
+        except (AttributeError, OSError):
+            return None
+
+        def read() -> tuple[float, float]:
+            awake = ctypes.c_ulonglong(0)
+            if not unbiased(ctypes.byref(awake)):
+                raise OSError("QueryUnbiasedInterruptTime failed")
+            return int(ticks()) / 1000.0, awake.value / 1e7        # ms counting sleep, 100 ns units leaving it out
+    else:
+        boottime = getattr(time, "CLOCK_BOOTTIME", None)
+        if boottime is None:
+            return None
+
+        def read() -> tuple[float, float]:
+            return time.clock_gettime(boottime), time.clock_gettime(time.CLOCK_MONOTONIC)
+    try:
+        read()
+    except Exception:
+        return None
+    return read
 
 
 @dataclass(frozen=True)
@@ -73,10 +126,20 @@ class _Held:
 class LeaseKeeper:
     def __init__(self, etcd: EtcdClient, *, timings: LeaseTimings | None = None,
                  clock: Callable[[], float] = time.monotonic, fence: ExitFn = hard_exit,
-                 leader_key: str = LEADER_KEY) -> None:
+                 leader_key: str = LEADER_KEY, wall: Callable[[], float] = time.time,
+                 on_suspended_fence: Callable[[float], None] | None = None,
+                 suspend_clock: SuspendClock | None = None) -> None:
         self._etcd = etcd
         self.timings = timings or LeaseTimings()
         self._clock = clock
+        self._wall = wall
+        self.on_suspended_fence = on_suspended_fence
+        self._suspend_clock = suspend_clock
+        self._last_iter: tuple[float, float] | None = None
+        self._last_suspend: tuple[float, float] | None = None
+        self._gap_s = 0.0
+        self._slept_s = 0.0
+        self.suspended_fences = 0
         self._fence_fn = fence
         self._key = leader_key
         self._lock = threading.Lock()
@@ -186,18 +249,51 @@ class LeaseKeeper:
 
     # --- the keeper iteration ----------------------------------------------------------------------
     def _fence(self, reason: str) -> None:
+        slept = self._slept_s
+        suspended = slept > SUSPEND_GAP_S
+        if suspended:
+            reason = f"{reason} (process suspended {slept:.0f} s)"
+        elif self._gap_s > SUSPEND_GAP_S:
+            reason = f"{reason} (process stalled {self._gap_s:.0f} s)"
         with self._lock:
             if self._fenced is not None:
                 return
             self._fenced = reason
+        if suspended:
+            self.suspended_fences += 1
+            hook = self.on_suspended_fence
+            if hook is not None:
+                try:
+                    hook(slept)                 # best effort, synchronous: the fence follows at once
+                except Exception:
+                    log.exception("sleep fence not recorded")
         log.critical("FENCE: %s", reason)
         self._fence_fn(reason)
+
+    def _note_iteration(self, now: float) -> None:
+        """The gap since the previous iteration (monotonic and wall: the process did not run) and the part of it
+        the machine slept (the suspend clock's sleeping minus its non-sleeping gap; 0 without a readable clock)."""
+        wall = self._wall()
+        last, self._last_iter = self._last_iter, (now, wall)
+        self._gap_s = 0.0 if last is None else max(now - last[0], wall - last[1], 0.0)
+        reading: tuple[float, float] | None = None
+        if self._suspend_clock is not None:
+            try:
+                reading = self._suspend_clock()
+            except Exception:
+                reading = None
+        before, self._last_suspend = self._last_suspend, reading
+        if before is None or reading is None:
+            self._slept_s = 0.0
+        else:
+            self._slept_s = max((reading[0] - before[0]) - (reading[1] - before[1]), 0.0)
 
     def tick(self) -> None:
         """One iteration: deadlines, fence, renewal."""
         if self._fenced is not None:
             return
         now = self._clock()
+        self._note_iteration(now)
         with self._lock:
             held, deadline = self._held, self._deadline
         if deadline is not None and now >= deadline[0]:

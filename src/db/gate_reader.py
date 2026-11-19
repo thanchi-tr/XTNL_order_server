@@ -7,6 +7,12 @@ this node's epoch and lease validity (lease keeper), the takeover settle window,
 
 Reconciled-in-this-epoch: every stream_health row of the adapter must carry `reconciled_epoch` = this
 node's epoch; `reconciled_at_ms` is the oldest of them (the account is reconciled only once all are).
+
+K6 (§8): "the adapter" is the **account's own** adapter, resolved in the same round trip with `adapter_of`
+(account_state, else its positions / orders, else its halt_breaches rows), never the adapter the action names.
+The stream_health rows, the latest open and the catch-up verdict are read for that adapter; an account that
+resolves to none reads no stream rows and is denied (`account_adapter_unknown`), and an action naming another
+adapter is denied (`adapter_mismatch`).
 """
 from __future__ import annotations
 
@@ -19,12 +25,14 @@ import redis.asyncio as aioredis
 from src.cache.live_reader import RunIdReader, info_run_id, read_gate_keys
 from src.db.epoch import EngineDb
 from src.db.pg import Row
+from src.db.sweep_writer import adapter_of
 from src.oversee.gate import Action, GateContext
 from src.oversee.sweep import AccountView
 from src.oversee.types import HaltLevel
 
 SQL_GATE_PG: Final = (
-    "SELECT (SELECT epoch FROM engine_epoch WHERE id = 1), (SELECT max(id) FROM halt_events)"
+    "SELECT (SELECT epoch FROM engine_epoch WHERE id = 1), (SELECT max(id) FROM halt_events), "
+    f"{adapter_of('$1')}"
 )
 SQL_GATE_STREAMS: Final = (
     "SELECT stream, conn_lost_at, reconciled_at, reconciled_epoch FROM stream_health WHERE adapter_id = $1"
@@ -76,8 +84,9 @@ class TieredGateContextReader:
 
     async def read(self, action: Action) -> GateContext:
         async with self._db.source.acquire() as conn:
-            pg = await conn.fetchrow(SQL_GATE_PG)
-            streams = await conn.fetch(SQL_GATE_STREAMS, action.adapter_id)
+            pg = await conn.fetchrow(SQL_GATE_PG, action.account_id)
+            account_adapter = None if pg is None or pg[2] is None else str(pg[2])
+            streams = [] if account_adapter is None else await conn.fetch(SQL_GATE_STREAMS, account_adapter)
         keys = await read_gate_keys(self._redis, self._run_id)
         node_epoch = self._in.node_epoch()
         open_health, reconciled_at, reconciled_epoch = reconcile_state(streams, node_epoch)
@@ -92,11 +101,13 @@ class TieredGateContextReader:
             lease_valid=self._in.lease_valid(), halt_state=halt,
             max_halt_event_id=None if pg is None or pg[1] is None else int(pg[1]),
             settle_until_ms=self._in.settle_until_ms(), reconciled_at_ms=reconciled_at,
-            reconciled_epoch=reconciled_epoch, latest_open_ms=self._in.latest_open_ms(action.adapter_id),
+            reconciled_epoch=reconciled_epoch,
+            latest_open_ms=None if account_adapter is None else self._in.latest_open_ms(account_adapter),
             open_stream_health=open_health,
             stale_mark_symbols=frozenset(s for _, s in view.stale_symbols) if view else frozenset(),
             has_unknown_result=view.has_unknown if view else True,
             last_pass_ms=view.last_pass_ms if view else None,
             sweep_interval_ms=self._in.sweep_interval_ms,
-            catchup_verified=self._in.catchup_verified(action.adapter_id),
+            catchup_verified=account_adapter is not None and self._in.catchup_verified(account_adapter),
+            account_adapter_id=account_adapter,
         )

@@ -16,6 +16,8 @@ import pytest
 
 from src.db.pg import pool_kwargs
 from src.integrity.worker import DEFAULT_MAX_TXN_MS
+from src.notifications.settings import ARM_PREFIX, CHANNEL_VARS, OVERSEE_PREFIX
+from src.runtime.leader_init import ABORT_CANCEL_S
 from src.runtime.lease import ENDPOINT_FAILOVER_S, LeaseTimings
 from src.runtime.supervisor import LoopWatchdog
 
@@ -34,6 +36,22 @@ SECRET_HINT = re.compile(r"(PASS|PASSWORD|SECRET|TOKEN|APP_KEY|ACCESS_KEY)")
 # Names that match SECRET_HINT but hold no secret: the secrets-source selector, the secret's name and
 # region, and the KMS key id (4.7). Their example values are real-shaped placeholders, not CHANGE_ME.
 NOT_SECRET = {"XTNL_SECRETS_SOURCE", "XTNL_SECRETS_ID", "XTNL_SECRETS_REGION", "XTNL_TOKEN_KMS_KEY_ID"}
+# Read by the code but set only in the Windows User environment on the PC (deploy/local/new-api-credentials.ps1,
+# deploy/local/new-md-credentials.ps1; the secrets source on AWS): the example documents them in a comment and must
+# never assign them. The market-data / ARM secrets are design §C2's list (plan S36).
+USER_ENVIRONMENT_ONLY = {"XTNL_API_SECRET", "XTNL_API_DSN",
+                         "XTNL_MD_REDIS_URL", "XTNL_MD_REDIS_READER_URL", "XTNL_MD_HMAC_KEY", "XTNL_MD_HMAC_KEY_PREV",
+                         "XTNL_ARM_CONFIG_DSN",
+                         "XTNL_ARM_SMTP_USERNAME", "XTNL_ARM_SMTP_PASSWORD", "XTNL_ARM_SES_ACCESS_KEY_ID",
+                         "XTNL_ARM_SES_SECRET_ACCESS_KEY", "XTNL_ARM_SES_SESSION_TOKEN", "XTNL_ARM_PUSH_TOKEN",
+                         "XTNL_ARM_PUSH_USER"}
+# Module-level `*_VAR` / `*_ENV` constants naming an environment variable: the pure settings parsers
+# (src/marketdata/config.py, src/riskmgr/config.py, src/armconfig/client.py) take the environment from their caller
+# and never touch os.environ themselves, so such a module is scanned too.
+#: The ARM channel credentials (design PR4, §C2): the secret Oversee channel names under the prefix XTNL_ARM_.
+ARM_CHANNEL_SECRETS = {ARM_PREFIX + v.removeprefix(OVERSEE_PREFIX) for v in CHANNEL_VARS
+                       if SECRET_HINT.search(v) or v.endswith(("_USERNAME", "_USER"))}
+_ENV_CONST = re.compile(r"^[A-Z][A-Z0-9_]*_(?:VAR|ENV)\s*(?::[^=\n]*)?=\s*\"[A-Z]", re.M)
 
 
 # ---------------------------------------------------------------------------------------------- helpers
@@ -138,13 +156,14 @@ OWN_ENV_EXAMPLE = {"src/deadman_receiver/": DEPLOY / "env" / "deadman-receiver.e
 def env_vars_read_by_code(root: Path = SRC) -> dict[str, str]:
     """Every environment variable name the modules under `root` read, found by AST: `<x>.get("NAME")`,
     `getenv("NAME")`, `<x>["NAME"]`, `*_VAR = "NAME"` constants and string tuples, in modules that touch
-    os.environ / getenv. Modules under `OWN_ENV_EXAMPLE` prefixes are left out when scanning all of src/."""
+    os.environ / getenv or define such a `*_VAR` constant (the pure parsers whose caller passes the environment in).
+    Modules under `OWN_ENV_EXAMPLE` prefixes are left out when scanning all of src/."""
     found: dict[str, str] = {}
     for path in sorted(root.rglob("*.py")):
         if root == SRC and any(path.relative_to(ROOT).as_posix().startswith(p) for p in OWN_ENV_EXAMPLE):
             continue
         text = path.read_text(encoding="utf-8")
-        if "environ" not in text and "getenv" not in text:
+        if "environ" not in text and "getenv" not in text and not _ENV_CONST.search(text):
             continue
         rel = path.relative_to(ROOT).as_posix()
         for node in ast.walk(ast.parse(text, filename=rel)):
@@ -154,6 +173,8 @@ def env_vars_read_by_code(root: Path = SRC) -> dict[str, str]:
                 name = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else ""
                 if name in ("get", "getenv", "pop", "setdefault"):
                     candidates.append(node.args[0])
+                elif name in ("env_flag", "tolerant_flag") and len(node.args) >= 2:   # src/config.py (environ, "NAME")
+                    candidates.append(node.args[1])
             elif isinstance(node, ast.Subscript):
                 candidates.append(node.slice)
             elif isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -197,6 +218,10 @@ def test_engine_unit_timing_matches_the_code() -> None:
     assert watchdog < timings.fence_after_s < timings.ttl_s
     stop = seconds(svc["TimeoutStopSec"])
     assert stop > timings.draining_deadline_s, "TimeoutStopSec must cover DRAINING (10 s)"
+    # K15: a stop during the LEADER_INIT step-1 COMMIT (statement_timeout 0) waits for it; a sync-standby stall
+    # bounds that at ~20 s (operations.md §3), then the step unwind and DRAINING must still fit before SIGKILL.
+    sync_standby_stall_s = 20.0
+    assert stop > sync_standby_stall_s + ABORT_CANCEL_S + timings.draining_deadline_s,         "TimeoutStopSec must cover a step-1 commit stall + the step unwind + DRAINING"
     assert seconds(svc["TimeoutStartSec"]) > 0
 
 
@@ -349,10 +374,16 @@ def test_every_env_var_the_code_reads_is_documented() -> None:
     missing = {name: where for name, where in read.items() if not re.search(rf"\b{name}\b", text)}
     assert not missing, f"engine.env.example lacks: {missing}"
     _, assigned = env_example()
-    for name in read.keys() - SYSTEM_PROVIDED:
+    for name in read.keys() - SYSTEM_PROVIDED - USER_ENVIRONMENT_ONLY:
         if name.startswith("STONE_X_BASE") or name == "STONE_X_STREAM_URL":
             continue   # optional overrides, documented as comments
         assert name in assigned, f"{name} must be an assignment, not only a comment"
+    for name in USER_ENVIRONMENT_ONLY:
+        # the ARM channel credentials are read under a prefix (NotificationSettings.from_env(env, prefix=ARM_PREFIX))
+        assert name in read or name in ARM_CHANNEL_SECRETS, f"{name} is not read by the code (typo?)"
+        assert name not in assigned, f"{name}: Windows User environment only, never assigned"
+        m = re.search(rf"^#.*\b{name}\b.*\n#.*$", text, re.M)
+        assert m is not None and "Windows User" in m.group(0), name
     for name in SYSTEM_PROVIDED & read.keys():
         assert name not in assigned, f"{name} is set by systemd"
 
@@ -428,7 +459,8 @@ RUNBOOK_FILES = ("install-node.md", "failover-and-switchover.md", "safe-hold.md"
                  "dlq-quarantine.md", "auth-failed-rearm.md", "deadman-alert.md",
                  "disaster-restore-melbourne.md", "live-readonly-smoke-test.md", "halt-clear.md",
                  "ruleset-change.md", "partition-archive.md", "off-node-alerts.md", "broker-maintenance.md",
-                 "downtime-catchup.md", "pinescript-export.md")
+                 "downtime-catchup.md", "pinescript-export.md", "single-pc-autostart.md", "order-server-api.md",
+                 "marketdata.md", "arm.md")
 
 
 def test_runbook_files_lists_every_runbook_on_disk() -> None:

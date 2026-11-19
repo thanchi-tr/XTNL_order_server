@@ -38,13 +38,13 @@ DEFAULT_FRESH_MS: Final = 30_000
 
 SQL_ORDERS: Final = (
     "SELECT adapter_id, broker_order_id, client_order_id, account_id, symbol, side, status, ordered_units, "
-    "remaining_units, entry_price, stop_loss, take_profit, is_reduce_only, linked_position_id, seq_id, "
+    "remaining_units, entry_price, stop_loss, take_profit, is_reduce_only, linked_position_id, order_kind, seq_id, "
     "committed_at_ms FROM orders_state "
     "ORDER BY (status IN ('PENDING', 'WORKING', 'PARTIALLY_FILLED')) DESC, committed_at_ms DESC LIMIT 500"
 )
 ORDER_COLS: Final = ("adapter_id", "broker_order_id", "client_order_id", "account_id", "symbol", "side", "status",
                      "ordered_units", "remaining_units", "entry_price", "stop_loss", "take_profit", "is_reduce_only",
-                     "linked_position_id", "seq_id", "committed_at_ms")
+                     "linked_position_id", "order_kind", "seq_id", "committed_at_ms")
 SQL_POSITIONS: Final = (
     "SELECT adapter_id, position_id, account_id, symbol, side, units, entry_price, stop_loss, take_profit, status, "
     "accrued_swap, commission, seq_id, committed_at_ms FROM positions_state "
@@ -144,6 +144,11 @@ class DashboardViews:
         # (library use, tests): only the PostgreSQL leader term decides.
         self.heartbeats = heartbeats
         self._outbox = PgOutboxStore(EngineDb(source, lambda: _READ_EPOCH))   # escalated_since() only (a read)
+
+    def replace_redis(self, clients: Mapping[str, aioredis.Redis]) -> dict[str, aioredis.Redis]:
+        """K10: use rebuilt Redis clients (rotated credentials); returns the replaced ones for the caller to close."""
+        old, self._redis = self._redis, dict(clients)
+        return old
 
     async def _fetch(self, sql: str, *args: object) -> list[Any]:
         async with self._source.acquire() as conn:

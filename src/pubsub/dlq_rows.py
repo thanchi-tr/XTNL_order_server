@@ -13,7 +13,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Final
 
-from src.dto import AccountDTO, CashFlowDTO, OrderDTO, PositionDTO
+from src.dto import AccountDTO, CashFlowDTO, OrderDTO, PositionDTO, encoded
 from src.ports import DlqEventType, DlqRow
 
 Parkable = OrderDTO | PositionDTO | AccountDTO | CashFlowDTO
@@ -46,8 +46,9 @@ def _plain(value: Any) -> Any:
 
 
 def dto_json(dto: Any) -> str:
-    """Deterministic JSON of every dataclass field (version fields and checksum included)."""
-    payload = {f.name: _plain(getattr(dto, f.name)) for f in fields(dto)}
+    """Deterministic JSON of every dataclass field (version fields and checksum included), except a None field
+    of OMITTED_WHEN_NONE, so the payload_hash of a row without the ARM prerequisite fields is unchanged."""
+    payload = {f.name: _plain(v) for f in fields(dto) if encoded(f.name, v := getattr(dto, f.name))}
     payload["_type"] = type(dto).__name__
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 

@@ -266,7 +266,7 @@ async def test_sod_row_written_on_first_pass_after_roll() -> None:
     env2 = Env(sod=None)
     await env2.at(roll + 31_000)
     assert next(iter(env2.db.t.sod_marks.values())).partial_session
-    assert "sod_partial_session" in [p.code for p in env2.pages]
+    assert [r.title.split()[0] for r in env2.db.t.outbox].count("sod_partial_session") == 1
 
 
 async def test_previous_day_state_resolves_at_roll() -> None:
@@ -516,3 +516,58 @@ async def test_repeating_condition_pages_are_latched() -> None:
     sweep._check_pass_time(T0 + 3000, T0 + 3200)          # a fast pass ends the condition
     sweep._check_pass_time(T0 + 4000, T0 + 6000)
     assert [p.code for p in env2.pages] == ["slow_pass", "slow_pass"]
+
+
+async def test_k13_partial_session_alert_is_an_outbox_row_of_the_sod_write() -> None:
+    """K13 (oversee-rules.md §2 Day roll, §10): the sod_partial_session alert is an outbox row in the same
+    AccountWrite as the sod_marks row, keyed (account, trading_day): a failed or CasConflict-retried pass writes
+    neither, the committed pass writes both, nothing goes through the direct pager (no in-memory memo), and a row
+    rebuilt later carries the same episode key, so the relay's notification_dedupe sends it once."""
+    from datetime import datetime
+
+    from src.notifications.relay import OutboxRelay
+    from src.oversee.dayroll import NEW_YORK
+    from src.oversee.memory import InMemoryOverseeDb
+    from src.oversee.notify import RecordingChannel
+    from src.oversee.sweep import SOD_PARTIAL_SESSION, AccountWrite, CasConflict
+    roll = int(datetime(2026, 11, 11, 17, tzinfo=NEW_YORK).timestamp() * 1000)
+    env = Env(sod=None)
+    real = env.db.write_account
+    fails: list[BaseException] = [RuntimeError("write failed"), CasConflict("moved"), CasConflict("moved")]
+    batches: list[AccountWrite] = []
+
+    async def flaky(batch: AccountWrite) -> None:
+        batches.append(batch)
+        if fails:
+            raise fails.pop(0)
+        await real(batch)
+
+    def sod_rows() -> list[Any]:
+        return [r for r in env.db.t.outbox if r.episode is not None and r.episode[0] == SOD_PARTIAL_SESSION]
+
+    env.db.write_account = flaky        # type: ignore[method-assign]
+    await env.at(roll + 31_000)         # write fails: no row, no alert
+    await env.at(roll + 32_000)         # CasConflict twice: the pass fails again, still nothing
+    assert not env.db.t.sod_marks and not sod_rows()
+    # every attempted batch carried the alert beside its sod_mark: they commit together or not at all
+    assert all(b.sod_mark is not None and sum(1 for r in b.outbox if r.episode and r.episode[0] == SOD_PARTIAL_SESSION)
+               == 1 for b in batches)
+    await env.at(roll + 33_000)         # written: the row and its one alert
+    sod = next(iter(env.db.t.sod_marks.values()))
+    assert sod.partial_session and len(sod_rows()) == 1
+    row = sod_rows()[0]
+    day = sod.trading_day.isoformat()
+    assert row.kind == "episode" and row.severity == "high" and row.account_id == ACCT
+    assert row.episode == (SOD_PARTIAL_SESSION, "account", f"{ACCT}:{day}", 0, int(Level.SOFT_HALT))
+    assert "sod_partial_session" not in [p.code for p in env.pages]      # not the direct, at-most-once pager
+    await env.at(roll + 34_000)         # the committed row is not rebuilt: no second alert
+    assert len(sod_rows()) == 1
+    env.db.t.sod_marks.clear()          # the row vanishes from the snapshot: rebuilt with the same episode key
+    await env.at(roll + 35_000)
+    assert len(sod_rows()) == 2 and len({r.episode for r in sod_rows()}) == 1
+    # the relay's episode dedupe (notification_dedupe) delivers the (account, trading_day) alert once
+    assert isinstance(env.db, InMemoryOverseeDb)
+    email = RecordingChannel("email")
+    relay = OutboxRelay(env.db, env.db, [email, RecordingChannel("mobile_push")], lease_valid=lambda: True)
+    await relay.tick()
+    assert [r.title.split()[0] for r in email.sent].count(SOD_PARTIAL_SESSION) == 1

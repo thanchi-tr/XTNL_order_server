@@ -17,6 +17,7 @@ from src.adapters.stonex.codes import (
     canonical_status,
     is_tradeable,
     opposite,
+    order_kind_of,
     parse_order_type,
     parse_side,
     parse_status,
@@ -31,7 +32,17 @@ from src.adapters.stonex.wire import (
     to_decimal,
     to_id,
 )
-from src.dto import AccountDTO, AccountLive, CashFlowDTO, InstrumentSpec, OrderDTO, OrderStatus, PositionDTO, PriceDTO
+from src.dto import (
+    AccountDTO,
+    AccountLive,
+    CashFlowDTO,
+    InstrumentSpec,
+    OrderDTO,
+    OrderKind,
+    OrderStatus,
+    PositionDTO,
+    PriceDTO,
+)
 
 SpecLookup = Callable[[str | None], InstrumentSpec | None]
 
@@ -92,7 +103,7 @@ def parse_account_directory(body: JsonObj) -> AccountDirectory:
 
     note(to_id(get_ci(root, "ClientAccountId")), None, get_ci(root, "ClientAccountCurrency", "CurrencyIsoCode"))
     # Only a real tradingAccountId names a trading account. A client account row also carries `contractId`
-    # (a legal contract id, e.g. 403323210 on the live account); v1 order/* reads answer 401 for it.
+    # (a legal contract id, e.g. 400000303 on the live account); v1 order/* reads answer 401 for it.
     for row in get_list(root, "ClientAccounts"):
         note(to_id(get_ci(row, "ClientAccountId")), to_id(get_ci(row, "TradingAccountId")),
              get_ci(row, "ClientAccountCurrency", "Currency", "CurrencyIsoCode"))
@@ -110,7 +121,11 @@ def parse_account_directory(body: JsonObj) -> AccountDirectory:
 def map_margin(raw: Mapping[str, Any], *, account_id: str, currency_fallback: str | None,
                source: str, received_ms: int, adapter_id: str = ADAPTER_ID) -> tuple[AccountDTO, AccountLive] | None:
     """clientAccountMargin (REST) or a CLIENTACCOUNTMARGIN frame -> (AccountDTO, AccountLive).
-    ACCOUNT is in the local clock domain: broker_updated_at_ms stays 0; AccountLive uses receipt time."""
+    ACCOUNT is in the local clock domain: broker_updated_at_ms stays 0; AccountLive uses receipt time.
+    ``realised_pnl_today`` stays None (K9, accepted deviation in adapter-isolation.md §2): neither
+    CLIENTACCOUNTMARGIN / clientAccountMargin nor TRADEMARGIN carries a realised-P&L field, an unknown Lightstreamer
+    field name would fail the whole subscription, and a figure summed from the trade history would be wrong
+    whenever StoneX omits RealisedPnl on a closing trade. Realised P&L reaches the ledger as TRADE_PNL cash flows."""
     cash = to_decimal(get_ci(raw, "Cash"))
     ccy = get_ci(raw, "CurrencyIsoCode", "CurrencyISO") or currency_fallback
     if cash is None or not isinstance(ccy, str) or not ccy:
@@ -137,15 +152,18 @@ PRICE_FIELDS: tuple[str, ...] = ("MarketId", "TickDateRaw", "Bid", "Offer", "Sta
 def map_price(frame: Mapping[str, str | None], spec: InstrumentSpec, received_ms: int,
               adapter_id: str = ADAPTER_ID) -> PriceDTO | None:
     """PRICES frame -> PriceDTO. TickDateRaw units vary (s / ms / us): detected by magnitude.
-    A missing tick time falls back to receipt time (prices are unversioned)."""
+    A missing tick time falls back to receipt time (prices are unversioned). ``received_ms`` is the local receipt
+    time stamped on the Lightstreamer thread (design PR2); ``ts_source`` says which of the two ``timestamp_ms`` is:
+    BROKER (TickDateRaw) or RECEIPT (the fallback)."""
     bid, ask = to_decimal(frame.get("Bid")), to_decimal(frame.get("Offer"))
     if bid is None or ask is None or bid <= 0 or ask <= 0:
         return None
-    ts = parse_broker_time_ms(frame.get("TickDateRaw")) or received_ms
+    broker_ts = parse_broker_time_ms(frame.get("TickDateRaw"))
     spread = (ask - bid) / spec.point_size if spec.point_size > 0 else None
     return PriceDTO(adapter_id=adapter_id, symbol=spec.symbol, bid=bid, ask=ask, spread_pips=spread,
-                    timestamp_ms=ts, broker_market_id=spec.broker_symbol or None,
-                    tradeable=is_tradeable(frame.get("StatusSummary")))
+                    timestamp_ms=broker_ts or received_ms, broker_market_id=spec.broker_symbol or None,
+                    tradeable=is_tradeable(frame.get("StatusSummary")),
+                    ts_source="BROKER" if broker_ts else "RECEIPT", received_ms=received_ms)
 
 
 # --- REST positions / orders ------------------------------------------------------------------
@@ -182,9 +200,12 @@ def map_open_position(raw: JsonObj, *, account_id: str, lookup: SpecLookup,
 def map_stop_limit_order(raw: JsonObj, *, account_id: str, lookup: SpecLookup, parent_id: str | None,
                          default_side: str | None = None, default_qty: Decimal | None = None,
                          default_market_id: str | None = None, strict_status: bool = False,
-                         adapter_id: str = ADAPTER_ID) -> OrderDTO:
+                         order_kind: OrderKind | None = None, adapter_id: str = ADAPTER_ID) -> OrderDTO:
     """ApiActiveStopLimitOrderDTO (or a position's StopOrder / LimitOrder) -> OrderDTO.
     A child (parent_id set) is reduce-only with linked_position_id = the parent OrderId.
+    ``order_kind`` (design PR1) is the caller's typing when it knows better than the row (a child nested in a
+    position or entry is typed by its key, ``attached_orders``); else it comes from the row's own type
+    (``stop_limit_type``: 2 -> STOP, 3 -> LIMIT, anything else -> None).
     On the active list (or nested in a position) a missing Status means WORKING. With ``strict_status`` (a
     by-id read, which also returns orders that are no longer active) a missing or unrecognised Status is
     unmappable: the adapter never invents a status (IMPLEMENTATION_PLAN 8.1)."""
@@ -210,13 +231,15 @@ def map_stop_limit_order(raw: JsonObj, *, account_id: str, lookup: SpecLookup, p
         instrument_unknown=u.instrument_unknown, raw_qty=u.raw_qty,
         is_reduce_only=parent_id is not None, linked_position_id=parent_id,
         broker_updated_at_ms=_rest_ts(raw), source="REST",
+        order_kind=order_kind if order_kind is not None else order_kind_of(stop_limit_type(raw)),
     )
 
 
 def map_trade_order(raw: JsonObj, *, account_id: str, lookup: SpecLookup, reduce_only: bool,
                     linked_position_id: str | None, adapter_id: str = ADAPTER_ID) -> OrderDTO:
     """GET order/{id} TradeOrder -> OrderDTO (Open -> FILLED, remaining 0). A TradeOrder without OrderId,
-    Direction or a recognised Status is unmappable (never None, which would read as "the broker has none")."""
+    Direction or a recognised Status is unmappable (never None, which would read as "the broker has none").
+    A trade order has no stop / limit kind: ``order_kind`` stays None (design PR1)."""
     order_id = to_id(get_ci(raw, "OrderId"))
     side = parse_side(get_ci(raw, "Direction"))
     raw_status = get_ci(raw, "Status")
@@ -244,7 +267,8 @@ def map_trade_order(raw: JsonObj, *, account_id: str, lookup: SpecLookup, reduce
 
 @dataclass(frozen=True)
 class AttachedOrder:
-    """A StopOrder / LimitOrder object nested in an open position or an if-done entry."""
+    """A StopOrder / LimitOrder object nested in an open position or an if-done entry. ``order_type`` comes from
+    the key it is nested under (StopOrder / Stop -> STOP, LimitOrder / Limit -> LIMIT), never from the child."""
 
     raw: JsonObj
     parent_id: str
@@ -279,7 +303,9 @@ def parent_of(raw: JsonObj) -> str | None:
 
 
 def stop_limit_type(raw: JsonObj) -> StoneXOrderType | None:
-    return parse_order_type(get_ci(raw, "Type", "OrderTypeId"))
+    """The row's own order type: ``Type`` (active orders, ``order/{id}``), ``OrderTypeId``, or ``TypeId`` (the
+    stop / limit order history, IN-1)."""
+    return parse_order_type(get_ci(raw, "Type", "OrderTypeId", "TypeId"))
 
 
 def child_side(parent_side: str | None) -> str | None:

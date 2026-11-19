@@ -16,7 +16,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from datetime import date
@@ -116,6 +117,7 @@ class LazyPgSource:
                                     "connect_timeout_s": connect_timeout_s}
         self._factory = factory
         self._source: AsyncpgSource | None = None
+        self._closing: AsyncpgSource | None = None
         self._lock = asyncio.Lock()
         self.closed = False
 
@@ -130,8 +132,20 @@ class LazyPgSource:
         if self.closed:
             raise ConnectionError(f"pool {self.application_name} is closed")
         async with self._lock:
+            if self.closed:                      # closed while this call waited for the lock
+                raise ConnectionError(f"pool {self.application_name} is closed")
             if self._source is None:
-                self._source = await self._factory(self._dsn, **self._kw)
+                src = await self._factory(self._dsn, **self._kw)
+                if self.closed:
+                    # `close()` / `terminate()` ran while the factory was still connecting (connect_timeout 3 s
+                    # outlasts drain_aclose_s): they could not reach this pool, so drop it here, or an older-epoch
+                    # pool would stay open on a node that has left LEADER (RT-M6).
+                    try:
+                        src.terminate()
+                    except Exception as exc:
+                        log.warning("terminating pool %s failed: %r", self.application_name, exc)
+                    raise ConnectionError(f"pool {self.application_name} is closed")
+                self._source = src
             return self._source
 
     @asynccontextmanager
@@ -147,10 +161,29 @@ class LazyPgSource:
         self.closed = True
         src, self._source = self._source, None
         if src is not None:
+            self._closing = src                  # still reachable by terminate() while the close runs
             try:
                 await asyncio.wait_for(src.close(), 5.0)
             except Exception as exc:
                 log.warning("closing pool %s failed: %r", self.application_name, exc)
+            self._closing = None
+
+    def terminate(self) -> None:
+        """Drop the pool's connections at once (no graceful close, never awaits), also while a `close()` is still
+        running or after it was cancelled: what DRAINING calls on a pool still open after `drain_aclose_s`
+        (design RT-M6). Idempotent; later acquires fail as after `close()`."""
+        self.closed = True
+        for src in {id(s): s for s in (self._source, self._closing) if s is not None}.values():
+            try:
+                src.terminate()
+            except Exception as exc:
+                log.warning("terminating pool %s failed: %r", self.application_name, exc)
+        self._source = None
+        self._closing = None
+
+
+def _now_ms() -> int:
+    return time.time_ns() // 1_000_000
 
 
 class GuardedEngineDb(EngineDb):
@@ -158,9 +191,13 @@ class GuardedEngineDb(EngineDb):
     (the runtime hard-exits) before the exception propagates."""
 
     def __init__(self, source: ConnectionSource, epoch: Callable[[], Epoch],
-                 on_fence_lost: Callable[[BaseException], None]) -> None:
+                 on_fence_lost: Callable[[BaseException], None], *,
+                 clock_ms: Callable[[], int] = _now_ms) -> None:
         super().__init__(source, epoch)
         self._on_fence_lost = on_fence_lost
+        self._clock_ms = clock_ms
+        #: Wall time of the last transaction that committed (S31: the ARM's "engine PostgreSQL down", R11-M11).
+        self.last_commit_ms: int | None = None
 
     @asynccontextmanager
     async def _guarded(self, token: int | None) -> AsyncIterator[FencedTx]:
@@ -170,6 +207,7 @@ class GuardedEngineDb(EngineDb):
         except EpochMismatch as exc:
             self._on_fence_lost(exc)
             raise
+        self.last_commit_ms = self._clock_ms()
 
     def transaction(self, token: int | None = None) -> AbstractAsyncContextManager[FencedTx]:
         return self._guarded(token)
@@ -231,9 +269,10 @@ class PgOperatorRequests:
     def __init__(self, db: EngineDb) -> None:
         self._db = db
 
-    async def pending(self, epoch_token: int) -> Sequence[OperatorRequest]:
+    async def pending(self, epoch_token: int, kinds: Collection[str],
+                      exclude: Collection[int] = ()) -> Sequence[OperatorRequest]:
         async with self._db.source.acquire() as conn:
-            rows = await conn.fetch(SQL_OPERATOR_REQUESTS_PENDING, epoch_token)
+            rows = await conn.fetch(SQL_OPERATOR_REQUESTS_PENDING, epoch_token, sorted(kinds), sorted(exclude))
         return [OperatorRequest(int(r[0]), str(r[1]), str(r[2]), str(r[3]), r[4] if len(r) > 4 else None)
                 for r in rows]
 
@@ -364,6 +403,9 @@ class PgLeaderPorts(LeaderPorts):
     auth_rearms: AuthRearmReader | None = None
     market_sessions: MarketSessionStore | None = None
     catchup: CatchupStore | None = None      # downtime catch-up (migration 0012; src/runtime/catchup.py)
+    # S32: the term pool's fenced EngineDb, shared by the optional services' engine-pool stores (the ARM relay, the
+    # FAILED clear statement and the open-episode reads, design §B3 "on the engine (owner) pool"). None: in-memory.
+    engine_db: EngineDb | None = None
 
 
 def pg_leader_ports(epoch: Epoch, *, control: ConnectionSource, dsn: str, node_id: str, redis: aioredis.Redis,
@@ -389,6 +431,7 @@ def pg_leader_ports(epoch: Epoch, *, control: ConnectionSource, dsn: str, node_i
         sweep_writer=PgSweepWriter(db), halt_store=PgHaltStore(db), outbox=PgOutboxStore(db),
         dedupe=PgDedupeStore(db), feed_quarantine=PgQuarantineSink(db), integrity_db=PgIntegrityDb(term),
         dlq_store=PgDlqStore(db), schedule=PgScheduleLoader(term), gate_reader=gate_reader, sod=PgSodLedger(term),
-        close=term.close, rulesets=PgRulesetStore(db, node_id), live_samples=PgLiveSampleStore(db),
+        close=term.close, terminate=term.terminate, rulesets=PgRulesetStore(db, node_id), live_samples=PgLiveSampleStore(db),
         lifecycle=PgPartitionMaintenance(db, exporter=PartitionExporter.from_env(db, node_id)), operator_requests=PgOperatorRequests(db), auth_rearms=PgAuthRearms(term),
-        market_sessions=PgMarketSessionStore(db), catchup=PgCatchupStore(db))
+        market_sessions=PgMarketSessionStore(db), catchup=PgCatchupStore(db),
+        last_fenced_commit_ms=lambda: db.last_commit_ms, engine_db=db)

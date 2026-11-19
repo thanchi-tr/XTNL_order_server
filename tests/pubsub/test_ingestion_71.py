@@ -4,6 +4,7 @@ IllegalTransitionParked to `illegal_transition`, and a refused status never kept
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -107,6 +108,30 @@ async def test_a_reader_without_account_states_still_seeds_orders(tmp_path: Path
     env = make(tmp_path, clock, adapter=ad, local_state=OrdersOnly())
     await env.orch.run_snapshot("mock")
     assert env.orch.runtime("mock").broker_seq == {"mock:O1": 5}
+
+
+async def test_after_a_restart_an_order_without_a_kind_inherits_the_stored_kind(tmp_path: Path,
+                                                                                clock: ManualClock) -> None:
+    """S04 (design PR1): the stored STOP child's kind is seeded before the first pass, so a REST / stream row that
+    states no type keeps STOP (never flips to None after a restart), and its checksum is the STOP one."""
+    stored = replace(order("O1", t=1), order_kind="STOP")
+    env = make(tmp_path, clock, local_state=StoredReader(orders=[stored]))
+    env.adapter.orders_by_id["O1"] = order("O1", t=2, stop="1.0")       # by-id answer without a type
+    subscribe_all(env)
+    await env.orch.run_snapshot("mock")
+    [o] = env.orders()
+    assert o.order_kind == "STOP" and o.stop_loss is not None
+    assert o.checksum == replace(order("O1", t=2, stop="1.0"), order_kind="STOP").checksum
+    assert env.orch.runtime("mock").order_kind == {"mock:O1": "STOP"}
+    env.item("orders", order("O1", t=3, stop="1.0"))                    # a stream row without a type
+    [s] = env.orders()
+    assert s.order_kind == "STOP" and s.origin == "stream"
+
+
+async def test_a_stored_order_without_a_kind_seeds_nothing(tmp_path: Path, clock: ManualClock) -> None:
+    env = make(tmp_path, clock, local_state=StoredReader(orders=[order("O1", t=1)]))
+    await env.orch.run_snapshot("mock")
+    assert env.orch.runtime("mock").order_kind == {}
 
 
 async def test_a_row_without_broker_seq_and_nothing_to_inherit_opens_the_gap(tmp_path: Path,

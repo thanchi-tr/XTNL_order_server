@@ -13,7 +13,21 @@ New node, rebuilt node after `patronictl reinit` / instance replacement, or aler
 * chrony using Amazon Time Sync (`server 169.254.169.123 prefer iburst`), `chrony-wait.service` enabled,
   `makestep` disabled after boot (never stepped).
 * Security groups: 2379/2380 between the three nodes only; 5432/8008 between A and B; 5432 and 6380 (the
-  dashboard's Redis TLS proxy) from `VPN_CIDR` (Melbourne) to A and B; no inbound internet.
+  dashboard's Redis TLS proxy) from `VPN_CIDR` (Melbourne) to A and B; 6382 (the redis-md TLS proxy section) from
+  `VPN_CIDR` to A and B **only once redis-md is enabled** (`marketdata.md` "Enable" step 0); no inbound internet.
+* **Redis 7.4** (engine nodes; the witness needs none) from `packages.redis.io`, pinned, **not** Ubuntu 24.04's own
+  `redis-server` package (7.0.x). Redis 7.2 or newer is required: the optional `redis-md` store's ACL grants
+  `+waitaof` and `+client|setinfo`, which Redis 7.0 rejects, so `xtnl-redis-md` would fail at every start. Install it
+  before step 3 (the release notes name the pinned 7.4 build; `apt-cache madison redis-server` lists the builds):
+
+  ```
+  curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+  echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb noble main"        | sudo tee /etc/apt/sources.list.d/redis.list
+  REDIS_PKG_VERSION=6:7.4.<patch>-1rl1~noble1        # the pinned 7.4 build of this release
+  sudo apt-get update && sudo apt-get install -y redis-server=$REDIS_PKG_VERSION redis-tools=$REDIS_PKG_VERSION
+  sudo apt-mark hold redis-server redis-tools        # no unattended upgrade past the pin
+  redis-server --version                             # must print v=7.4.x (7.2 or newer); stop here otherwise
+  ```
 * Witness: etcd data on its own gp3 volume mounted at `/var/lib/etcd` (operations.md §1; its disk alarms watch
   `/` and `/var/lib/etcd`).
 * Secrets in AWS Secrets Manager; certificates from the internal CA (etcd, Patroni, PostgreSQL).
@@ -55,10 +69,25 @@ sudo install -m 0640 -o root -g postgres /dev/null /etc/pgbackrest/conf.d/xtnl-c
 sudo systemctl enable --now etcd patroni redis-server
 sudo -u postgres pgbackrest --stanza=xtnl check     # the first member only after `stanza-create` (pgbackrest.conf)
 
+# 3b. certificate expiry / readability (K5, operations.md s13): the engine's exporter reads every certificate this
+#     node serves or presents at the path its service loads (engine.env XTNL_METRICS_CERTS: etcd-a / pg-a on node A,
+#     etcd-b / pg-b on node B). Certificates are public: 0644, directories traversable; private keys stay 0600 and
+#     owned by their service. Re-apply after every renewal (or have the renewal job install with these modes).
+ETCD_NAME=etcd-a PG_MEMBER_NAME=pg-a                 # node B: etcd-b, pg-b
+sudo chmod 0755 /etc/etcd/pki /etc/patroni/pki
+sudo chmod 0644 /etc/etcd/pki/ca.crt /etc/etcd/pki/$ETCD_NAME.crt /etc/etcd/pki/$ETCD_NAME-peer.crt      /etc/patroni/pki/ca.crt /etc/patroni/pki/$PG_MEMBER_NAME.crt /etc/patroni/pki/$PG_MEMBER_NAME-pg.crt      /etc/patroni/pki/$PG_MEMBER_NAME-etcd-client.crt
+sudo chmod 0600 /etc/etcd/pki/*.key /etc/patroni/pki/*.key
+for f in $(sudo sed -n 's/^XTNL_METRICS_CERTS=//p' /etc/xtnl/engine.env | tr ',' '
+' | cut -d= -f2); do
+  sudo -u xtnl test -r "$f" || echo "NOT READABLE by xtnl: $f"     # must print nothing (after step 7 too)
+done
+
 # 4. units
 sudo install -m 0644 deploy/systemd/xtnl-engine.service deploy/systemd/xtnl-migrate.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl start xtnl-migrate.service            # operator job; idempotent; only before a switchover
+# it applies only up to XTNL_MIGRATIONS_ACCEPTED_UPTO (default 14, /etc/xtnl/engine.env); later ones are held back and
+# named in one journal line (plan S38f, design §0b); raise it to 20 only once 0015-0020 are reviewed
 sudo systemctl enable --now xtnl-engine.service
 
 # 5. scheduled jobs (operations.md s1, s8): PITR guard, daily pgBackRest backup (primary only), rolling etcd defrag
@@ -88,14 +117,22 @@ sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-c
 #    /etc/redis/redis.conf (step 3) from Secrets Manager. Server certificate from the internal CA with this node's
 #    VPC address as an IP SAN; client-ca.crt = the CA that issues the dashboard's client certificate.
 sudo apt-get install -y stunnel4
-sudo install -d -m 0700 /etc/xtnl/redis-tls-proxy
-sudo install -m 0600 <server certificate> /etc/xtnl/redis-tls-proxy/tls.crt
+#    The two certificates are 0644 (public; the exporter watches them, XTNL_METRICS_CERTS, K5); the key stays 0600.
+sudo install -d -m 0755 /etc/xtnl/redis-tls-proxy
+sudo install -m 0644 <server certificate> /etc/xtnl/redis-tls-proxy/tls.crt
 sudo install -m 0600 <its private key> /etc/xtnl/redis-tls-proxy/tls.key
-sudo install -m 0600 <internal CA certificate> /etc/xtnl/redis-tls-proxy/client-ca.crt
+sudo install -m 0644 <internal CA certificate> /etc/xtnl/redis-tls-proxy/client-ca.crt
 NODE_IP=<this node's VPC ip> envsubst '${NODE_IP}' < deploy/redis/redis-tls-proxy.conf \
      | sudo tee /etc/xtnl/redis-tls-proxy.conf >/dev/null
 sudo install -m 0644 deploy/systemd/xtnl-redis-tls-proxy.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now xtnl-redis-tls-proxy
+
+# 7b. optional market-data store redis-md (design §A2): INSTALL ONLY, do not enable. It is enabled together with
+#     XTNL_MD_ENABLED=1 by marketdata.md "Enable"; until then the engine never connects to it. The proxy's second
+#     section (${NODE_IP}:6382 -> 127.0.0.1:6381) is already in the file rendered above.
+sudo install -m 0644 deploy/redis/redis-md.conf /etc/xtnl/redis-md.conf
+sudo install -m 0644 deploy/systemd/xtnl-redis-md.service /etc/systemd/system/
+sudo systemctl daemon-reload                    # no enable / start here
 
 # 8. declared broker maintenance windows: the same file on BOTH engine nodes (broker-maintenance.md)
 sudo install -m 0640 -o root -g xtnl /dev/null /etc/xtnl/maintenance.json     # empty = no window declared
@@ -187,10 +224,12 @@ reaches PostgreSQL as `xtnl_dashboard` (above) and each node's Redis through tha
 the ACL user `xtnl_dashboard`, both over the VPN.
 
 ```
-sudo install -d -m 0750 -o root -g xtnl /etc/xtnl /etc/xtnl/dashboard
+# 0751: other users may traverse but not list, so the dead-man receiver (a DynamicUser) can read the public
+# Redis client certificate for its expiry check (K5, XTNL_RECEIVER_CERTS); keys, tokens and env stay 0640.
+sudo install -d -m 0751 -o root -g xtnl /etc/xtnl /etc/xtnl/dashboard
 sudo install -m 0640 -o root -g xtnl /dev/null /etc/xtnl/dashboard.env   # from deploy/env/dashboard.env.example
 sudo install -m 0640 -o root -g xtnl <internal CA certificate> /etc/xtnl/dashboard/ca.crt
-sudo install -m 0640 -o root -g xtnl <client certificate issued by the CA> /etc/xtnl/dashboard/redis-client.crt
+sudo install -m 0644 -o root -g xtnl <client certificate issued by the CA> /etc/xtnl/dashboard/redis-client.crt
 sudo install -m 0640 -o root -g xtnl <its private key> /etc/xtnl/dashboard/redis-client.key
 # Leader heartbeat listener (https :8444): a server certificate issued by the internal CA, valid for the name in
 # the engine's XTNL_HEARTBEAT_COPY_URL, and the settings file (token = the engine's XTNL_HEARTBEAT_COPY_TOKEN).

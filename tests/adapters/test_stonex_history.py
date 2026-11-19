@@ -402,3 +402,25 @@ async def test_an_opening_trade_keeps_its_execution_time_after_its_position_clos
     assert orders["9003"].broker_updated_at_ms == T0 + 300_000
     assert {p.position_id: p.broker_updated_at_ms for p in h.positions} == {"9002": T0 + 300_000}
     await adapter.close()
+
+
+async def test_stop_limit_history_type_id_rows_give_stop_and_limit_kinds(fake_broker: FakeStoneX) -> None:
+    """IN-1: order/stoplimitorderhistory rows carry TypeId (not Type), remapped like StatusId, so every version of a
+    history stop / limit order (its placement and its end) has its kind; a trade-history FILLED row has none."""
+    def row(order_id: int, type_id: object, status: int, ts: int) -> dict[str, Any]:
+        return {"OrderId": order_id, "MarketId": int(EURUSD_ID), "Direction": "Sell", "OriginalQuantity": 5000,
+                "TriggerPrice": 1.079, "TradingAccountId": int(TRADING), "StatusId": status, "TypeId": type_id,
+                "CreatedDateTimeUtc": wcf(ts - 60_000), "LastChangedDateTimeUtc": wcf(ts)}
+
+    fake_broker.stop_limit_history = [row(9200, 2, 4, T0 + 600_000), row(9201, "3", 4, T0 + 700_000),
+                                      row(9202, 1, 4, T0 + 800_000)]
+    fake_broker.history = [trade(9300, T0 + 900_000)]
+    fake_broker.positions = [open_position(9300, T0 + 900_000)]
+    adapter = await connected(fake_broker, stop_limit_history=True)
+    h = await adapter.fetch_history(T0, UNTIL)
+    kinds = {(o.broker_order_id, o.status): o.order_kind for o in h.orders}
+    assert kinds == {("9200", OrderStatus.WORKING): "STOP", ("9200", OrderStatus.CANCELLED): "STOP",
+                     ("9201", OrderStatus.WORKING): "LIMIT", ("9201", OrderStatus.CANCELLED): "LIMIT",
+                     ("9202", OrderStatus.WORKING): None, ("9202", OrderStatus.CANCELLED): None,
+                     ("9300", OrderStatus.FILLED): None}
+    await adapter.close()

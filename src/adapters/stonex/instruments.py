@@ -99,7 +99,17 @@ def spec_from_market_info(info: JsonObj, adapter_id: str = ADAPTER_ID) -> Instru
         min_qty=min_qty,
         swap_booked_to_balance=True,   # to confirm: StoneX books financing to cash
         broker_symbol=market_id,
+        price_increment=price_increment(decimals),
     )
+
+
+def price_increment(decimals: int | None) -> Decimal | None:
+    """The quote's smallest step, 10^-PriceDecimalPlaces (design PR7; to confirm by the PR3 probe). None when the
+    market states no decimal places: ``point_size`` (a pip, or the name's "per" size) is never a fallback.
+    ``asset_class`` stays None: no StoneX field read here states it (an ARM position is then UNSUPPORTED)."""
+    if decimals is None or decimals < 0:
+        return None
+    return Decimal(1).scaleb(-decimals)
 
 
 def unknown_symbol(market_id: str | None) -> str:

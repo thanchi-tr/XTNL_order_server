@@ -26,6 +26,33 @@
     ruleset add <file.json>                --operator A --reason "..." [--approver B]   (stored inactive)
     ruleset activate <version>             --operator A --approver B --reason "..."
     audit tail [--limit N] [--command C]
+    arm config show [--pending]            (read-only; --pending reads the Supabase document: row diff, validation,
+                                           admission, the nodes' registries; not audited)
+    arm config accept <hash>               --operator A --reason "..." [--approver B]
+    arm pause [--drain-notices] | arm resume | arm notify-test   --operator A --reason "..." [--approver B]
+    arm failed show [--all] [--limit N]
+    arm failed clear <SCOPE_KIND:scope_id> --operator A --reason "..." [--approver B] [--wait S]
+    arm disarm | rearm <adapter:position>  --operator A --reason "..." [--approver B] [--wait S]
+    arm repin <adapter:position> [--strategy CODE --strategy-version N]   (actor args, [--wait S])
+    md backfill <series> --from-ms N --to-ms N | md rebuild <indicator_id> | md writer-reset | md rehash
+                                           --operator A --reason "..." [--approver B] [--wait S]
+                                           (ARM / market-data requests: refused without a leader arm_status
+                                           heartbeat younger than 60 s or with 20 pending; reported applied,
+                                           pending, moot or refused; src/ops/arm.py)
+    arm show [<adapter:position>] [--all] [--limit N]
+    arm decisions [<adapter:position>] [--from-ms N] [--to-ms N] [--limit N]
+    arm config resolve --position <adapter:position>
+    arm replay [<adapter:position>] [--from-ms N] [--to-ms N] [--limit N] [--rerun]
+               [--request-backfill --operator A --reason "..." [--wait S]]
+                                           (--rerun, S39b: re-run the pipeline for each past bar, read-only, no
+                                           notice: MATCH, DIFF or UNVERIFIABLE)
+    arm registry check --against-db        (exit 3 when a pinned / referenced version is not in this registry)
+    arm gates                              (offline, S38e: exit 3 while XTNL_ARM_ENABLED=1 would leave the ARM
+                                           idle on open go-live gates; XTNL_ARM_GOLIVE_ACCEPT)
+    md show | md bars <series> [--newest N] | md indicators [--indicator ID]
+                                           (read-only views, src/ops/arm_view.py and src/ops/md_view.py: ids,
+                                           codes, counts and times, never a price; redis-md is read as md_reader
+                                           through XTNL_MD_REDIS_READER_URL, the keyring for hash checks)
     pinescript [--days 7] [--symbol S] [--adapter A] [--out var/pinescript]
                                            (read-only: one TradingView Pine Script v6 file per symbol drawing
                                            the order life cycles from event_log; no amounts; not audited)
@@ -38,7 +65,8 @@ recorded in operator_audit.db_user), etcd from XTNL_ETCD_ENDPOINTS. Nothing here
 secret is ever printed: the DSN appears only redacted, and errors print their type, not their text.
 
 Exit codes: 0 ok / applied / no-op, 1 error (unreachable, unknown COMMIT outcome), 2 usage,
-3 refused (audited), 4 applied but the etcd SAFE_HOLD mirror was not written.
+3 refused (audited; for an ARM / market-data request also when the leader answered it refused), 4 applied but the
+etcd SAFE_HOLD mirror was not written.
 """
 from __future__ import annotations
 
@@ -58,7 +86,10 @@ from src.db.epoch import CommitUnknownError
 from src.db.pg import AsyncpgConnection, PgConnection, init_connection, sqlstate
 from src.db.settings import StorageSettings, redact
 
+from src.ops.arm import ArmContext, gates_report
+from src.ops.arm_view import ArmViews
 from src.ops.etcd import OpsEtcd, endpoints_from_env, make_etcd
+from src.ops.md_acl import read_env_file
 from src.ops.model import Actor, OpsRefused, OpsUsageError, Report, iso_ms
 from src.ops.rulesets import MAX_DOCUMENT_BYTES, check_document, summary
 from src.ops.service import OpsService
@@ -75,6 +106,7 @@ EXIT_REFUSED: Final = 3
 EXIT_DEGRADED: Final = 4
 
 PINE_OUT_DIR: Final = "var/pinescript"
+ARM_WAIT_S: Final = 5.0
 
 Closer = Callable[[], Awaitable[None]]
 Connect = Callable[[str], Awaitable[tuple[PgConnection, Closer]]]
@@ -113,6 +145,108 @@ def _event_id(text: str) -> int | None:
         return int(text)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("expected an integer halt_events id or 'none'") from exc
+
+
+def _wait_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--wait", type=float, default=ARM_WAIT_S,
+                   help=f"seconds to wait for the leader's answer (0-60, default {ARM_WAIT_S:g}; then `pending`)")
+
+
+def _arm_parsers(groups: Any) -> None:
+    """`arm ...` and `md ...` (src/ops/arm.py, plan S34)."""
+    arm = groups.add_parser("arm", help="automated risk manager: configuration, controls, FAILED, requests "
+                            "(advice only; never sends orders)").add_subparsers(dest="cmd", required=True)
+    cfg = arm.add_parser("config", help="ARM configuration (Supabase document, local accept)").add_subparsers(
+        dest="sub", required=True)
+    a = cfg.add_parser("show", help="the accepted / installed document; --pending reads Supabase and shows the diff")
+    a.add_argument("--pending", action="store_true",
+                   help="read the pending document (XTNL_ARM_CONFIG_DSN): row diff, validation, admission, registry")
+    a = cfg.add_parser("accept", help="accept the pending document whose hash `config show --pending` printed")
+    a.add_argument("doc_hash")
+    _actor_args(a)
+    a = cfg.add_parser("resolve", help="the assignment in force for a position at its arming and now (read-only)")
+    a.add_argument("--position", required=True, help="adapter_id:position_id")
+    a = arm.add_parser("show", help="ARM positions: state, pins, cursor (read-only; no level)")
+    a.add_argument("target", nargs="?", default=None, help="adapter_id:position_id (default: every live position)")
+    a.add_argument("--all", action="store_true", help="include CLOSED / DISARMED positions")
+    a.add_argument("--limit", type=int, default=50)
+    for name, text in (("decisions", "stored decisions, newest first (read-only; no level or R value)"),
+                       ("replay", "re-verify stored decisions against redis-md as of their decision time")):
+        a = arm.add_parser(name, help=text)
+        a.add_argument("target", nargs="?", default=None, help="adapter_id:position_id (default: every position)")
+        a.add_argument("--from-ms", type=int, default=None, help="first bar end (epoch ms)")
+        a.add_argument("--to-ms", type=int, default=None, help="last bar end (epoch ms)")
+        a.add_argument("--limit", type=int, default=50)
+    a.add_argument("--rerun", action="store_true",
+                   help="re-run the real pipeline for each past bar (read-only, no notice): MATCH, DIFF, UNVERIFIABLE")
+    a.add_argument("--request-backfill", action="store_true",
+                   help="file one audited md_backfill per series with bars_missing (needs --operator, --reason)")
+    a.add_argument("--operator", default=None)
+    a.add_argument("--reason", default=None)
+    a.add_argument("--approver", default=None)
+    _wait_arg(a)
+    a = arm.add_parser("gates", help="go-live gates: refused (exit 3) while XTNL_ARM_ENABLED=1 would leave the ARM "
+                                     "idle (offline; XTNL_ARM_GOLIVE_ACCEPT)")
+    a.add_argument("--env-file", default=None,
+                   help="read XTNL_ARM_GOLIVE_ACCEPT from the engine's env file (e.g. /etc/xtnl/engine.env) instead "
+                        "of this shell's environment")
+    reg = arm.add_parser("registry", help="the strategy / guard / indicator registry").add_subparsers(
+        dest="sub", required=True)
+    a = reg.add_parser("check", help="refuse (exit 3) when a version the database references is not in this "
+                                     "node's registry")
+    a.add_argument("--against-db", action="store_true", required=True,
+                   help="check the pins, decisions and installed document stored in PostgreSQL")
+    a = arm.add_parser("pause", help="no ARM decision until `arm resume` (FAILED pings still go out)")
+    a.add_argument("--drain-notices", action="store_true",
+                   help="also finish queued, unsent ARM notices as suppressed (never a FAILED ping)")
+    _actor_args(a)
+    _actor_args(arm.add_parser("resume", help="end the operator pause (never clears FAILED)"))
+    _actor_args(arm.add_parser("notify-test", help="record a test-notice request time (no ARM test-notice "
+                                                   "sender is wired yet)"))
+    failed = arm.add_parser("failed", help="FAILED scopes (arm_failures)").add_subparsers(dest="sub", required=True)
+    a = failed.add_parser("show", help="open FAILED episodes, counters and the last probe")
+    a.add_argument("--all", action="store_true", help="include cleared episodes")
+    a.add_argument("--limit", type=int, default=20)
+    a = failed.add_parser("clear", help="file arm_clear_failed: the leader probes the recorded cause, then clears")
+    a.add_argument("scope", help="SCOPE_KIND:scope_id as `arm failed show` prints it")
+    _actor_args(a)
+    _wait_arg(a)
+    for name, text in (("disarm", "stop managing the position (arm_disarm)"),
+                       ("rearm", "re-arm a SUSPENDED position, cursor as at arming (arm_rearm)")):
+        a = arm.add_parser(name, help=text)
+        a.add_argument("target", help="adapter_id:position_id")
+        _actor_args(a)
+        _wait_arg(a)
+    a = arm.add_parser("repin", help="move the position to a new strategy version, migrate_state (arm_repin)")
+    a.add_argument("target", help="adapter_id:position_id")
+    a.add_argument("--strategy", default=None, help="strategy code (default: the assignment in force)")
+    a.add_argument("--strategy-version", type=int, default=None)
+    _actor_args(a)
+    _wait_arg(a)
+
+    md = groups.add_parser("md", help="market-data repairs (redis-md; applied during FAILED too)").add_subparsers(
+        dest="cmd", required=True)
+    md.add_parser("show", help="md generation, SM12 / D6 states and counters per series, FAULTED indicators")
+    a = md.add_parser("bars", help="counts, quality, revisions and quarantined buckets of one series (no values)")
+    a.add_argument("series", help="adapter:symbol:spec:SIDE:SOURCE")
+    a.add_argument("--newest", type=int, default=16, help="newest buckets listed (1-200)")
+    a = md.add_parser("indicators", help="registered indicators: warm, lineage, FAULTED (no values)")
+    a.add_argument("--indicator", default=None, help="only this indicator id")
+    a = md.add_parser("backfill", help="re-fetch a bar range of one series (md_backfill)")
+    a.add_argument("series", help="adapter:symbol:spec:SIDE:SOURCE")
+    a.add_argument("--from-ms", type=int, required=True, help="first bucket start (epoch ms, on the series' grid)")
+    a.add_argument("--to-ms", type=int, required=True, help="last bucket start (epoch ms)")
+    _actor_args(a)
+    _wait_arg(a)
+    a = md.add_parser("rebuild", help="rebuild one indicator (md_rebuild)")
+    a.add_argument("indicator_id", help="16 hex characters")
+    _actor_args(a)
+    _wait_arg(a)
+    for name, text in (("writer-reset", "reset md-writer's circuit and re-run the bootstrap (md_writer_reset)"),
+                       ("rehash", "rewrite stored members under the current HMAC key id (md_rehash)")):
+        a = md.add_parser(name, help=text)
+        _actor_args(a)
+        _wait_arg(a)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -230,6 +364,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--limit", type=int, default=20)
     a.add_argument("--command", default=None)
 
+    _arm_parsers(groups)
+
     a = groups.add_parser("pinescript", help="read-only: TradingView Pine Script v6 of the order life cycles "
                           "(one .pine file per symbol, no amounts)")
     a.set_defaults(cmd="export")
@@ -258,7 +394,67 @@ def _limit(n: int) -> int:
     return n
 
 
+async def dispatch_arm(svc: OpsService, ns: argparse.Namespace) -> Report:
+    """`arm ...` / `md ...` (src/ops/arm.py; the S35 views src/ops/arm_view.py)."""
+    arm = svc.arm
+    key = (ns.group, ns.cmd, getattr(ns, "sub", None))
+    views = ArmViews(arm)
+    if key == ("arm", "show", None):
+        return await views.show(ns.target, include_ended=ns.all, limit=ns.limit)
+    if key == ("arm", "decisions", None):
+        return await views.decisions(ns.target, from_ms=ns.from_ms, to_ms=ns.to_ms, limit=ns.limit)
+    if key == ("arm", "config", "resolve"):
+        return await views.config_resolve(ns.position)
+    if key == ("arm", "replay", None):
+        actor = None
+        if ns.request_backfill:
+            if ns.operator is None or ns.reason is None:
+                raise OpsUsageError("--request-backfill needs --operator and --reason (the md_backfill requests "
+                                    "are audited)")
+            actor = _actor(ns)
+        return await views.replay(ns.target, from_ms=ns.from_ms, to_ms=ns.to_ms, limit=ns.limit,
+                                  request_backfill=ns.request_backfill, actor=actor, wait_s=ns.wait,
+                                  rerun=ns.rerun)
+    if key == ("arm", "registry", "check"):
+        return await views.registry_check()
+    if key in (("md", "show", None), ("md", "bars", None), ("md", "indicators", None)):
+        return await views.md(ns.cmd, series=getattr(ns, "series", None), newest=getattr(ns, "newest", 16),
+                              indicator_id=getattr(ns, "indicator", None))
+    if key == ("arm", "config", "show"):
+        return await arm.config_show(pending=ns.pending)
+    if key == ("arm", "config", "accept"):
+        return await arm.config_accept(ns.doc_hash, _actor(ns))
+    if key == ("arm", "pause", None):
+        return await arm.pause(_actor(ns), drain_notices=ns.drain_notices)
+    if key == ("arm", "resume", None):
+        return await arm.resume(_actor(ns))
+    if key == ("arm", "notify-test", None):
+        return await arm.notify_test(_actor(ns))
+    if key == ("arm", "failed", "show"):
+        return await arm.failed_show(include_cleared=ns.all, limit=_limit(ns.limit))
+    if key == ("arm", "failed", "clear"):
+        return await arm.failed_clear(ns.scope, _actor(ns), wait_s=ns.wait)
+    if key == ("arm", "disarm", None):
+        return await arm.disarm(ns.target, _actor(ns), wait_s=ns.wait)
+    if key == ("arm", "rearm", None):
+        return await arm.rearm(ns.target, _actor(ns), wait_s=ns.wait)
+    if key == ("arm", "repin", None):
+        return await arm.repin(ns.target, _actor(ns), strategy_code=ns.strategy,
+                               strategy_version=ns.strategy_version, wait_s=ns.wait)
+    if key == ("md", "backfill", None):
+        return await arm.md_backfill(ns.series, ns.from_ms, ns.to_ms, _actor(ns), wait_s=ns.wait)
+    if key == ("md", "rebuild", None):
+        return await arm.md_rebuild(ns.indicator_id, _actor(ns), wait_s=ns.wait)
+    if key == ("md", "writer-reset", None):
+        return await arm.md_writer_reset(_actor(ns), wait_s=ns.wait)
+    if key == ("md", "rehash", None):
+        return await arm.md_rehash(_actor(ns), wait_s=ns.wait)
+    raise OpsUsageError(f"unknown command {ns.group} {ns.cmd}")
+
+
 async def dispatch(svc: OpsService, ns: argparse.Namespace) -> Report:
+    if ns.group in ("arm", "md"):
+        return await dispatch_arm(svc, ns)
     key = (ns.group, ns.cmd)
     if key == ("safe-hold", "status"):
         return await svc.safe_hold_status()
@@ -441,14 +637,14 @@ def exit_code(rep: Report) -> int:
 
 
 async def _run(ns: argparse.Namespace, dsn: str, connect: Connect, etcd: OpsEtcd | None, out: TextIO,
-               err: TextIO) -> int:
+               err: TextIO, arm: ArmContext | None = None) -> int:
     try:
         conn, close = await connect(dsn)
     except Exception as exc:
         err.write(f"error: PostgreSQL unreachable at {redact(dsn)} ({type(exc).__name__})\n")
         return EXIT_ERROR
     try:
-        rep = await dispatch(OpsService(conn, etcd), ns)
+        rep = await dispatch(OpsService(conn, etcd, arm=arm), ns)
     except OpsUsageError as exc:
         err.write(f"usage: {exc}\n")
         return EXIT_USAGE
@@ -498,7 +694,7 @@ async def _run_pinescript(ns: argparse.Namespace, dsn: str, connect: Connect, ou
 
 def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None = None,
          connect: Connect | None = None, etcd_factory: EtcdFactory | None = None,
-         out: TextIO | None = None, err: TextIO | None = None) -> int:
+         out: TextIO | None = None, err: TextIO | None = None, arm_context: ArmContext | None = None) -> int:
     out = out if out is not None else sys.stdout
     err = err if err is not None else sys.stderr
     try:
@@ -517,6 +713,18 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
         render(rep, out)
         return exit_code(rep)
     env = environ if environ is not None else os.environ
+    if (ns.group, ns.cmd) == ("arm", "gates"):    # offline (S38e): the go-live verdict on the engine's settings
+        if ns.env_file is not None:
+            try:
+                file_env = read_env_file(Path(ns.env_file))
+            except (OSError, UnicodeDecodeError) as exc:
+                err.write(f"usage: the env file could not be read ({type(exc).__name__})\n")
+                return EXIT_USAGE
+            rep = gates_report(file_env, f"env_file:{ns.env_file}")
+        else:
+            rep = gates_report(env)
+        render(rep, out)
+        return exit_code(rep)
     if (ns.group, ns.cmd) == ("maintenance", "check"):
         path = ns.file or str(maintenance_source_from_env(env).path)
         rep = check_maintenance_file(path, int(time.time() * 1000))
@@ -534,7 +742,8 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
         return asyncio.run(_run_pinescript(ns, settings.dsn, connect or connect_asyncpg, out, err))
     etcd =(etcd_factory or make_etcd)(endpoints_from_env(env))
     try:
-        return asyncio.run(_run(ns, settings.dsn, connect or connect_asyncpg, etcd, out, err))
+        arm = arm_context if arm_context is not None else ArmContext.from_env(env)
+        return asyncio.run(_run(ns, settings.dsn, connect or connect_asyncpg, etcd, out, err, arm))
     finally:
         if etcd is not None:
             try:

@@ -18,7 +18,7 @@ from src.db import halt_store as H
 from src.db import notify_store as N
 from src.db import quarantine as Q
 from src.db import sweep_writer as W
-from src.db.fence import SQL_CHECK_EPOCH
+from src.db.fence import SQL_CHECK_EPOCH, SQL_RELEASE_SAVEPOINT, SQL_ROLLBACK_TO_SAVEPOINT, SQL_SAVEPOINT
 from src.db.rows import BREACH_COLS
 
 COLS = [c.strip() for c in BREACH_COLS.split(",")]
@@ -47,9 +47,12 @@ class PgEmulator:
         self.down = False
         self.sql: list[str] = []
         self._saved: Tables | None = None
+        self._savepoints: list[Tables] = []
         h: dict[str, Callable[[tuple[Any, ...]], Any]] = {
             E.SQL_BEGIN_RC: self._begin, E.SQL_COMMIT: self._commit, E.SQL_ROLLBACK: self._rollback,
             E.SQL_COMMIT_TIMEOUT_OFF: lambda a: "SET", H.SQL_HALT_LOCK: lambda a: (None,),
+            SQL_SAVEPOINT: self._savepoint, SQL_RELEASE_SAVEPOINT: self._release,
+            SQL_ROLLBACK_TO_SAVEPOINT: self._rollback_to,
             SQL_CHECK_EPOCH: lambda a: (self.epoch,),
             W.SQL_BREACH_INSERT: self._breach_insert, W.SQL_BREACH_CAS: self._breach_cas,
             W.SQL_BREACH_UPSERT: self._breach_upsert, W.SQL_STOP_WATCH_SET: self._sw_set,
@@ -57,6 +60,8 @@ class PgEmulator:
             W.SQL_QUARANTINE_SET: self._q_set, W.SQL_QUARANTINE_RELEASE: self._q_release,
             N.SQL_OUTBOX_INSERT: self._outbox_insert, N.SQL_OUTBOX_PENDING: self._outbox_pending,
             N.SQL_OUTBOX_MARK: self._outbox_mark, N.SQL_DEDUPE_GET: self._dedupe_get,
+            N.SQL_OUTBOX_DUE: self._outbox_due, N.SQL_OUTBOX_OLDEST_UNSENT: self._outbox_oldest,
+            N.SQL_OUTBOX_FINISH: self._outbox_finish,
             N.SQL_DEDUPE_ALL: lambda a: [(k, v) for k, v in self.t.dedupe.items()],
             N.SQL_DEDUPE_RECORD: self._dedupe_record,
             H.SQL_LATEST_EVENT: lambda a: self.t.halt_events[-1] if self.t.halt_events else None,
@@ -105,13 +110,28 @@ class PgEmulator:
 
     def _commit(self, a: tuple[Any, ...]) -> str:
         self._saved = None
+        self._savepoints.clear()
         return "COMMIT"
 
     def _rollback(self, a: tuple[Any, ...]) -> str:
         if self._saved is not None:
             self.t = self._saved
         self._saved = None
+        self._savepoints.clear()
         return "ROLLBACK"
+
+    def _savepoint(self, a: tuple[Any, ...]) -> str:
+        assert self._saved is not None, "SAVEPOINT outside a transaction"
+        self._savepoints.append(copy.deepcopy(self.t))
+        return "SAVEPOINT"
+
+    def _rollback_to(self, a: tuple[Any, ...]) -> str:
+        self.t = copy.deepcopy(self._savepoints[-1])   # the savepoint itself stays (PostgreSQL semantics)
+        return "ROLLBACK"
+
+    def _release(self, a: tuple[Any, ...]) -> str:
+        self._savepoints.pop()
+        return "RELEASE"
 
     def _fenced(self, a: tuple[Any, ...]) -> bool:
         return bool(a) and a[0] == self.epoch
@@ -222,16 +242,43 @@ class PgEmulator:
             return 0
         n = 0
         for created, dkey, bypass, sev, title, body, kind, acct in zip(*a[1:9]):
-            self.t.outbox.append({"outbox_id": len(self.t.outbox) + 1, "created": created, "episode": dkey,
-                                  "bypass": bypass, "severity": sev, "title": title, "body": body, "kind": kind,
-                                  "account_id": acct, "sent_at": None, "delivered": None})
+            channels = ["email", "mobile_push"] if sev in ("HIGH", "CRITICAL", "SOFT", "HARD") else ["email"]
+            self.add_outbox_row(created=created, episode=dkey, bypass=bypass, severity=sev, title=title, body=body,
+                                kind=kind, account_id=acct, channels=channels)
             n += 1
         return n
 
+    def add_outbox_row(self, *, kind: str, channels: list[str], created: int = 1, severity: str = "INFO",
+                       title: str = "t", body: str = "b", episode: Any = None, bypass: bool = False,
+                       account_id: Any = None, next_attempt: int | None = None) -> int:
+        """Append one outbox row as any writer would (the ARM relay's own store from S29 writes kind 'arm' rows;
+        `SQL_OUTBOX_INSERT` never does). Returns its outbox_id."""
+        oid = len(self.t.outbox) + 1
+        self.t.outbox.append({"outbox_id": oid, "created": created, "episode": episode, "bypass": bypass,
+                              "severity": severity, "title": title, "body": body, "kind": kind,
+                              "account_id": account_id, "sent_at": None, "delivered": None,
+                              "channels": list(channels), "attempts": 0,
+                              "next_attempt": created if next_attempt is None else next_attempt})
+        return oid
+
+    def _oversee_unsent(self) -> list[dict[str, Any]]:
+        """`sent_at_ms IS NULL AND kind <> 'arm'` (the Oversee relay never reads an ARM notice)."""
+        return [r for r in self.t.outbox if r["sent_at"] is None and r["kind"] != "arm"]
+
+    @staticmethod
+    def _outbox_cols(r: dict[str, Any]) -> tuple[Any, ...]:
+        return (r["outbox_id"], r["kind"], r["severity"], r["title"], r["body"], r["created"], r["episode"],
+                r["account_id"])
+
     def _outbox_pending(self, a: tuple[Any, ...]) -> list[tuple[Any, ...]]:
-        rows = [r for r in self.t.outbox if r["sent_at"] is None][:a[0]]
-        return [(r["outbox_id"], r["kind"], r["severity"], r["title"], r["body"], r["created"], r["episode"],
-                 r["account_id"]) for r in rows]
+        return [self._outbox_cols(r) for r in self._oversee_unsent()[:a[0]]]
+
+    def _outbox_due(self, a: tuple[Any, ...]) -> list[tuple[Any, ...]]:
+        rows = [r for r in self._oversee_unsent() if r["next_attempt"] <= a[0]][:a[1]]
+        return [(*self._outbox_cols(r), r["channels"], r["attempts"]) for r in rows]
+
+    def _outbox_oldest(self, a: tuple[Any, ...]) -> tuple[Any, ...]:
+        return (min((r["created"] for r in self._oversee_unsent()), default=None),)
 
     def _outbox_mark(self, a: tuple[Any, ...]) -> int:
         if not self._fenced(a):
@@ -239,6 +286,17 @@ class PgEmulator:
         for r in self.t.outbox:
             if r["outbox_id"] == a[1]:
                 r["sent_at"], r["delivered"] = a[2], a[3]
+                return 1
+        return 0
+
+    def _outbox_finish(self, a: tuple[Any, ...]) -> int:
+        """SQL_OUTBOX_FINISH: fenced, only while unsent."""
+        if not self._fenced(a):
+            return 0
+        for r in self.t.outbox:
+            if r["outbox_id"] == a[1] and r["sent_at"] is None:
+                r["sent_at"], r["delivered"] = a[2], a[3]
+                r["attempts"] += 1
                 return 1
         return 0
 

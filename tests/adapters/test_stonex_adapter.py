@@ -313,6 +313,7 @@ async def test_price_stream_resolves_symbols_and_drops_on_overflow(
     assert sub.fields == ["MarketId", "TickDateRaw", "Bid", "Offer", "StatusSummary"]
     assert sub.mode == "MERGE"     # live StoneX feeds PRICES only to MERGE subscriptions (DISTINCT gets nothing)
     assert "/TradingAPI/market/search" in fake_broker.paths()
+    assert adapter.subscribed_price_markets == frozenset({"EURUSD"})   # NOPE did not resolve: no market (PR6)
 
     tick = {"MarketId": EURUSD_ID, "TickDateRaw": str(T0), "Bid": "1.08600", "Offer": "1.08610",
             "StatusSummary": "0"}
@@ -592,4 +593,32 @@ async def test_empty_price_stream_reports_subscribed_and_later_symbols_still_att
     await adapter.ensure_ticks(["EURUSD"])
     assert fake_stream.find("PRICES", f"ID.{EURUSD_ID}").active
     await gen.aclose()
+    await adapter.close()
+
+
+async def test_open_orders_and_by_id_reads_carry_the_order_kind(fake_broker: FakeStoneX) -> None:
+    """Design PR1 producers: an active row is typed by its own Type, a child nested in a position or an IfDone
+    entry by its key (StopOrder / Stop -> STOP, LimitOrder / Limit -> LIMIT), a by-id StopLimitOrder by its Type and
+    a TradeOrder never."""
+    fake_broker.positions = [position_row() | {"LimitOrder": {"OrderId": 557, "TriggerPrice": 1.09}}]
+    fake_broker.actives = [
+        {"OrderId": 600, "ParentOrderId": None, "MarketId": int(USDJPY_ID), "Direction": "Buy", "Quantity": 5000,
+         "TriggerPrice": 150.25, "TradingAccountId": int(TRADING), "Type": "Limit", "Status": 2,
+         "IfDone": [{"Stop": {"OrderId": 601, "TriggerPrice": 149.5}}]},
+        {"OrderId": 610, "ParentOrderId": None, "MarketId": int(EURUSD_ID), "Direction": "Sell", "Quantity": 5000,
+         "TriggerPrice": 1.07, "TradingAccountId": int(TRADING), "Type": "Stop", "Status": 2},
+    ]
+    fake_broker.orders["610"] = {"StopLimitOrder": fake_broker.actives[1], "TradeOrder": None}
+    fake_broker.orders["555"] = {"StopLimitOrder": None, "TradeOrder": {
+        "OrderId": 555, "MarketId": int(EURUSD_ID), "Direction": "Buy", "Quantity": 25000, "Price": 1.0855,
+        "Status": 3, "Type": 1, "TradingAccountId": int(TRADING), "LastChangedDateTimeUTC": wcf(T0)}}
+    adapter = make_adapter(fake_broker)
+    await adapter.connect()
+    await adapter.fetch_positions()
+    kinds = {o.broker_order_id: o.order_kind for o in await adapter.fetch_open_orders()}
+    assert kinds == {"556": "STOP", "557": "LIMIT", "600": "LIMIT", "601": "STOP", "610": "STOP"}
+    by_id = await adapter.fetch_order_status("610")
+    assert by_id is not None and by_id.order_kind == "STOP"
+    trade = await adapter.fetch_order_status("555")
+    assert trade is not None and trade.order_kind is None
     await adapter.close()

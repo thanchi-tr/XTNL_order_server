@@ -1,4 +1,5 @@
-"""Sanity checks on 0001_init.sql (no server needed)."""
+"""Sanity checks on the migrations (no server needed): 0001_init.sql, and every file for the column checks (ST-5:
+a column added by a later ALTER TABLE counts, a dropped one does not)."""
 from __future__ import annotations
 
 import re
@@ -6,6 +7,7 @@ import re
 from src.db import MIGRATIONS_DIR
 
 SQL = (MIGRATIONS_DIR / "0001_init.sql").read_text(encoding="utf-8")
+ALL_SQL = {p.name: p.read_text(encoding="utf-8") for p in sorted(MIGRATIONS_DIR.glob("*.sql"))}
 
 REQUIRED = {
     "engine_epoch", "leader_terms", "cluster_state", "orders_state", "positions_state", "account_state",
@@ -26,14 +28,42 @@ def _body(table: str) -> str:
     return m.group(1)
 
 
+def _code(sql: str) -> str:
+    return re.sub(r"--[^\n]*", "", sql)
+
+
+def _columns(table: str) -> set[str]:
+    """The table's columns after every migration in order: its CREATE TABLE body, plus ALTER TABLE ... ADD COLUMN,
+    minus ALTER TABLE ... DROP COLUMN (guarded DO blocks included)."""
+    cols: set[str] = set()
+    for sql in ALL_SQL.values():
+        code = _code(sql)
+        m = re.search(rf"CREATE TABLE IF NOT EXISTS {table}\s*\((.*?)\n\)", code, re.S)
+        if m:
+            for line in m.group(1).splitlines():
+                c = re.match(r"\s+(\w+)\s+\w", line)
+                if c and c.group(1).upper() not in ("PRIMARY", "UNIQUE", "CHECK", "CONSTRAINT", "FOREIGN"):
+                    cols.add(c.group(1))
+        for stmt in re.findall(rf"ALTER TABLE (?:IF EXISTS )?(?:ONLY )?{table}\s(.*?);", code, re.S):
+            cols |= set(re.findall(r"ADD COLUMN (?:IF NOT EXISTS )?(\w+)", stmt))
+            cols -= set(re.findall(r"DROP COLUMN (?:IF EXISTS )?(\w+)", stmt))
+    return cols
+
+
+def _col_list(cols: str) -> list[str]:
+    return [c.strip() for c in cols.split(",")]
+
+
 def test_every_required_table_exists() -> None:
     assert REQUIRED <= _tables(), REQUIRED - _tables()
 
 
 def test_idempotent_ddl() -> None:
-    assert not re.search(r"CREATE TABLE (?!IF NOT EXISTS)", SQL)
-    assert not re.search(r"CREATE (UNIQUE )?INDEX (?!IF NOT EXISTS)", SQL)
-    assert not re.search(r"CREATE FUNCTION", SQL)  # always CREATE OR REPLACE
+    for name, sql in ALL_SQL.items():
+        code = _code(sql)
+        assert not re.search(r"CREATE TABLE (?!IF NOT EXISTS)", code), name
+        assert not re.search(r"CREATE (UNIQUE )?INDEX (?!(CONCURRENTLY )?IF NOT EXISTS)", code), name
+        assert not re.search(r"CREATE FUNCTION", code), name  # always CREATE OR REPLACE
 
 
 def test_partitioning() -> None:
@@ -68,17 +98,44 @@ def test_key_columns_and_types() -> None:
                     "digest_hash"):
             assert re.search(rf"^\s+{col}\s", b, re.M), (t, col)
         assert "version               char(56)" in b or "version                    char(56)" in b
-    # money is NUMERIC, never floating point
-    code = re.sub(r"--[^\n]*", "", SQL)
-    assert not re.search(r"\b(real|double precision|float\d?)\b", code, re.I)
+    # money is NUMERIC, never floating point (every migration)
+    for name, sql in ALL_SQL.items():
+        assert not re.search(r"\b(real|double precision|float\d?)\b", _code(sql), re.I), name
 
 
 def test_entity_sql_columns_exist_in_schema() -> None:
     from src.db.entity_sql import ACCOUNTS, ORDERS, POSITIONS
     for t in (ORDERS, POSITIONS, ACCOUNTS):
-        body = _body(t.table)
+        cols = _columns(t.table)
         for col in t.all_cols:
-            assert re.search(rf"^\s+{col}\s", body, re.M), (t.table, col)
+            assert col in cols, (t.table, col)
+
+
+def test_row_decoder_columns_exist_in_schema() -> None:
+    from src.db import rows as R
+    for table, cols in (("orders_state", R.ORDER_COLS), ("positions_state", R.POSITION_COLS),
+                        ("account_state", R.ACCOUNT_COLS), ("instruments", R.INSTRUMENT_COLS),
+                        ("sod_marks", R.SOD_COLS)):
+        have = _columns(table)
+        for col in _col_list(cols):
+            assert col in have, (table, col)
+
+
+def test_store_insert_columns_exist_in_schema() -> None:
+    from src.db import repository as R
+    for sql in (R.SQL_EVENT_LOG, R.SQL_INSTRUMENT_UPSERT):
+        m = re.match(r"INSERT INTO (\w+) \((.*?)\)", sql, re.S)
+        assert m, sql
+        have = _columns(m.group(1))
+        for col in _col_list(m.group(2)):
+            assert col in have, (m.group(1), col)
+
+
+def test_column_scan_follows_later_migrations() -> None:
+    assert "balance_changed_at_ms" in _columns("account_state")      # 0005, inside a guarded DO block
+    assert {"order_kind"} <= _columns("orders_state")                # 0015
+    assert {"origin", "broker_time_ms"} <= _columns("event_log")     # 0015
+    assert "position_marks" not in _columns("sod_marks")             # created by 0001, dropped by 0015
 
 
 SQL2 = (MIGRATIONS_DIR / "0002_lockfree_fencing.sql").read_text(encoding="utf-8")

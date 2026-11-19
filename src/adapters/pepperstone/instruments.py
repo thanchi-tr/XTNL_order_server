@@ -95,6 +95,9 @@ def spec_from_symbol(light: JsonObj | None, full: JsonObj, assets: Mapping[int, 
         # with the closing deal (closePositionDetail), so they are not yet in the balance (to confirm).
         swap_booked_to_balance=False,
         broker_symbol=str(symbol_id),
+        # PR7: the quote's smallest step from the symbol's digits; pipPosition (point_size) is never a fallback.
+        # asset_class stays None: no field read here states it.
+        price_increment=Decimal(1).scaleb(-digits),
     )
     return SymbolInfo(symbol_id=symbol_id, spec=spec, digits=digits)
 

@@ -32,7 +32,7 @@ def acct_row() -> tuple[Any, ...]:
 
 def order_row(status: str = "WORKING") -> tuple[Any, ...]:
     return (None, "B1", "ACC", "stonex", "EURUSD", "BUY", status, Decimal("1.1"), Decimal("1.09"), None,
-            Decimal(1000), Decimal(1000), False, None, False, None, 1_000, None, "STREAM", 3, 30)
+            Decimal(1000), Decimal(1000), False, None, False, None, 1_000, None, "STREAM", 3, 30, None)
 
 
 def position_row() -> tuple[Any, ...]:
@@ -42,7 +42,7 @@ def position_row() -> tuple[Any, ...]:
 
 def instrument_row(symbol: str = "EURUSD") -> tuple[Any, ...]:
     return ("stonex", symbol, symbol[:3], symbol[3:], symbol[3:], Decimal(1), "UNITS", Decimal("0.0001"),
-            Decimal(1), True, "400616150")
+            Decimal(1), True, "400616150", None, None, None)
 
 
 def breach_row(subject_id: str = "stonex:B1", resolved: int | None = None) -> tuple[Any, ...]:

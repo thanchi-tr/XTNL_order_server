@@ -40,6 +40,10 @@ class FakeEtcd:
         self.revision += 1
         return self.revision
 
+    def get_prefix(self, prefix: str, *, timeout_s: float) -> list[KeyValue]:
+        self._check()
+        return [KeyValue(k, v, 1, 1, 0) for k, v in sorted(self.kv.items()) if k.startswith(prefix)]
+
     def header(self, *, timeout_s: float) -> tuple[str, int]:
         self._check()
         return self.cluster_id, self.revision

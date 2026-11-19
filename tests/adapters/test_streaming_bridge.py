@@ -23,15 +23,18 @@ class RecordingSink:
         self.frames: list[dict[str, str | None]] = []
         self.events: list[tuple[StreamEventKind, str]] = []
         self.lost: list[int] = []
+        self.markets: list[str | None] = []      # the market of each event / lost-update call, in order
 
     def on_frame(self, values: dict[str, str | None]) -> None:
         self.frames.append(values)
 
-    def on_event(self, kind: StreamEventKind, detail: str) -> None:
+    def on_event(self, kind: StreamEventKind, detail: str, market: str | None = None) -> None:
         self.events.append((kind, detail))
+        self.markets.append(market)
 
-    def on_lost(self, count: int) -> None:
+    def on_lost(self, count: int, market: str | None = None) -> None:
         self.lost.append(count)
+        self.markets.append(market)
 
 
 def public(cls: type) -> set[str]:

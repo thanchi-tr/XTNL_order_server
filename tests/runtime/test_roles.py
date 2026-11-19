@@ -123,6 +123,16 @@ def test_safe_hold_due_on_abnormal_ends() -> None:
     assert safe_hold_due(old, NOW, None) is None
 
 
+def test_stale_terms_closed_at_start_up_are_no_flap() -> None:
+    """2026-11-18 single PC: terms left open by kills hours or days ago are all closed `lost` by the next
+    LEADER_INIT at the same instant; counting them by that closing time made a false SAFE_HOLD."""
+    stale = [term(i, started=NOW - (i + 1) * 3_600_000, ended=NOW, reason="lost") for i in range(4)]
+    assert safe_hold_due(stale, NOW, None) is None
+    loop = [term(10 + i, started=NOW - (i + 1) * 120_000, ended=NOW - i * 120_000, reason="lost")
+            for i in range(3)]          # a real restart loop: each term starts and dies within minutes
+    assert safe_hold_due(stale + loop, NOW, None) == "3 abnormal term ends within 15 min"
+
+
 def test_safe_hold_due_on_epoch_change_rate() -> None:
     six = [term(i, started=NOW - i * 60_000, ended=NOW, reason="switchover") for i in range(6)]
     assert safe_hold_due(six, NOW, None) is None

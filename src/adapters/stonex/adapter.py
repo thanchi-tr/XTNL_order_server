@@ -13,14 +13,18 @@ frames wait (in order) until it finishes, while every other frame keeps flowing.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import math
 import re
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from decimal import Decimal
 
 from src.adapters.base import (
     AccountStreamItem,
+    ActiveStopOrders,
     BrokerAdapter,
     BrokerError,
     BrokerHistory,
@@ -43,7 +47,8 @@ from src.adapters.base import (
 )
 from src.adapters.ratelimit import RestBudget, RestPriority, rest_priority
 from src.adapters.sessions import canonical
-from src.adapters.stonex.codes import parse_side
+from src.adapters.stonex.bars import RANGE_CAP, decode_bar_history, interval_for
+from src.adapters.stonex.codes import StoneXOrderType, order_kind_of, parse_side
 from src.adapters.stonex.history import (
     map_stop_limit_history,
     map_trade_history_window,
@@ -69,18 +74,31 @@ from src.adapters.stonex.mapping import (
     parse_account_directory,
 )
 from src.adapters.stonex.orders import ORDER_FIELDS, OrderItem, OrderStreamMapper
-from src.adapters.stonex.rest import OrderNotAccessibleError, StoneXRestClient
+from src.adapters.stonex.rest import OrderNotAccessibleError, StoneXRestClient, rest_get_only
 from src.adapters.stonex.streaming import (
+    MARKET_KEY,
+    RECEIVED_KEY,
     BoundSink,
     Frame,
     FrameChannel,
     LightstreamerTransport,
+    MarketDropCounter,
     StreamTransport,
     now_ms,
 )
-from src.adapters.stonex.wire import JsonObj, get_ci, get_obj, to_id
+from src.adapters.stonex.wire import JsonObj, get_ci, get_obj, to_decimal, to_id
 from src.config import StoneXSettings
-from src.dto import AccountDTO, AccountLive, CashFlowDTO, InstrumentSpec, OrderDTO, PositionDTO
+from src.dto import (
+    AccountDTO,
+    AccountLive,
+    BarSide,
+    CashFlowDTO,
+    InstrumentSpec,
+    OrderDTO,
+    PositionDTO,
+    PriceBarsResponse,
+    bar_request_problem,
+)
 
 log = logging.getLogger(__name__)
 
@@ -141,13 +159,15 @@ class StoneXAdapter(BrokerAdapter):
         if rest_budget is None and rest is not None and rest.budget is not None:
             rest_budget = rest.budget
         self._budget = rest_budget if rest_budget is not None else RestBudget(
-            ADAPTER_ID, rate_per_s=settings.rest_rate_per_s, burst=settings.rest_burst)
+            ADAPTER_ID, rate_per_s=settings.rest_rate_per_s, burst=settings.rest_burst,
+            bars_per_min=settings.rest_bars_per_min)
         self._rest = rest if rest is not None else StoneXRestClient.create(settings, budget=self._budget)
         self._rest.budget = self._budget      # one bucket per adapter, across re-created REST clients
         self._rest_closed = False
         self._parent_lookup_timeout_s = parent_lookup_timeout_s
         self._logon_ms: int | None = None
-        self._transport_factory = stream_transport_factory or (lambda: LightstreamerTransport(settings.stream_url))
+        self._transport_factory = stream_transport_factory or (lambda: LightstreamerTransport(
+            settings.stream_url, price_unfiltered=settings.price_unfiltered))
         self._pre_connect_check = pre_connect_check
         self._queue_size = queue_size
         self._heartbeat_s = heartbeat_s
@@ -177,6 +197,8 @@ class StoneXAdapter(BrokerAdapter):
         # (channel, subscriptions, transport the subscriptions live on)
         self._price_state: tuple[FrameChannel, dict[str, object], StreamTransport] | None = None
         self._wanted_markets: set[str] = set()
+        #: Price frames dropped for a full channel plus lost updates, per StoneX MarketId (PR6, IN-13).
+        self._price_drops = MarketDropCounter()
 
     # --- introspection (not part of BrokerAdapter) ---------------------------------------------
     @property
@@ -190,6 +212,32 @@ class StoneXAdapter(BrokerAdapter):
 
     def instrument_for_market(self, market_id: str) -> InstrumentSpec | None:
         return self._by_market.get(market_id)
+
+    @property
+    def subscribed_price_markets(self) -> frozenset[str]:
+        """The canonical symbols the current price stream has a market subscription for (design PR6; a symbol
+        `_markets_for` could not resolve is not in it). Each market acks with its own SUBSCRIBED; a whole-stream
+        SUBSCRIBED is only sent for an empty subscription, so it opens no market interval."""
+        state = self._price_state
+        if state is None:
+            return frozenset()
+        out: set[str] = set()
+        for market_id in state[1]:
+            spec = self._by_market.get(market_id)
+            out.add(spec.symbol if spec is not None else market_id)
+        return frozenset(out)
+
+    @property
+    def dropped_price_frames(self) -> dict[str, int]:
+        """Price frames that never reached the consumer, per canonical symbol: dropped for a full channel plus the
+        updates Lightstreamer reports lost (design PR6, IN-13). Monotonic over the adapter's life (metrics, never a
+        gap: a lost price update is only counted). A market without a known instrument is keyed by its MarketId."""
+        out: dict[str, int] = {}
+        for market_id, count in self._price_drops.snapshot().items():
+            spec = self._by_market.get(market_id)
+            key = spec.symbol if spec is not None else market_id
+            out[key] = out.get(key, 0) + count
+        return out
 
     @property
     def rest_budget(self) -> RestBudget:
@@ -463,6 +511,41 @@ class StoneXAdapter(BrokerAdapter):
         await self._ensure_markets(to_id(get_ci(r, "MarketId")) for _, r in [*positions, *actives])
         return self._map_open_orders(positions, actives)
 
+    async def fetch_active_stop_orders(self) -> ActiveStopOrders:
+        """Design PR9 (R11-M20): one list read per trading account, ``GET order/activestoplimitorders`` (inside
+        ``rest_get_only``, on top of ``ReadOnlyTransport``'s deny-list), never one call per handle. Mapped like the
+        active rows of ``fetch_open_orders`` (typed STOP / LIMIT, if-done children linked); a row that cannot be
+        mapped counts in ``unmapped_rows``. Children attached to an open position but absent from the active list
+        are not listed (they are no handle this read can prove); nothing absent is ever closed. A market the map
+        does not know yet is loaded as in ``fetch_open_orders`` (the read-only ``market/information`` lookup,
+        rate-limited, at reconcile class)."""
+        directory = self._require_directory()
+        actives: list[tuple[str, JsonObj]] = []
+        with rest_get_only():
+            for trading_id, client in directory.trading_ids:
+                actives.extend((client, r) for r in await self._rest.active_stop_limit_orders(trading_id))
+        await self._ensure_markets(to_id(get_ci(r, "MarketId")) for _, r in actives)
+        return ActiveStopOrders(adapter_id=self.adapter_id, orders=tuple(self._map_open_orders([], actives)))
+
+    async def fetch_attached_stop_ids(self) -> list[tuple[str, str]]:
+        """PR9 evidence for ``probe_bars --check-stops`` (plan S39 review): ``(child order id, position id)`` for every
+        StopOrder child attached to an ``order/openpositions`` row, read on its own (GET only, ``rest_get_only``, on
+        top of ``ReadOnlyTransport``'s deny-list), so the check can compare a source independent of
+        ``activestoplimitorders`` with that list (``fetch_open_orders`` merges the two). Ids only: no level, no
+        quantity. Nothing is mapped, learned or closed."""
+        directory = self._require_directory()
+        rows: list[JsonObj] = []
+        with rest_get_only():
+            for trading_id, _client in directory.trading_ids:
+                rows.extend(await self._rest.open_positions(trading_id))
+        out: list[tuple[str, str]] = []
+        for row in rows:
+            for child in attached_orders(row):
+                child_id = to_id(get_ci(child.raw, "OrderId"))
+                if child_id is not None and child.order_type is StoneXOrderType.STOP:
+                    out.append((child_id, child.parent_id))
+        return out
+
     def _map_open_orders(self, positions: Sequence[tuple[str, JsonObj]],
                          actives: Sequence[tuple[str, JsonObj]]) -> list[OrderDTO]:
         nested = [(client, child) for client, row in [*positions, *actives] for child in attached_orders(row)]
@@ -494,7 +577,8 @@ class StoneXAdapter(BrokerAdapter):
             try:
                 dto = map_stop_limit_order(child.raw, account_id=client, lookup=self._lookup,
                                            parent_id=child.parent_id, default_side=child_side(child.parent_side),
-                                           default_qty=child.parent_qty, default_market_id=child.parent_market_id)
+                                           default_qty=child.parent_qty, default_market_id=child.parent_market_id,
+                                           order_kind=order_kind_of(child.order_type))
             except UnmappableError as exc:
                 self._unmapped("orders", f"attached order skipped: {exc}")
                 continue
@@ -815,10 +899,13 @@ class StoneXAdapter(BrokerAdapter):
             log.exception("stonex: Lightstreamer disconnect failed")
 
     def _open_channel(self, stream: StreamName, *, drop_when_full: bool) -> FrameChannel:
-        """One consumer per stream: a new call replaces (ends) the previous consumer."""
+        """One consumer per stream: a new call replaces (ends) the previous consumer. The price channel stamps
+        each frame's receipt time on the Lightstreamer thread and counts its drops per market (PR2, PR6)."""
+        prices = stream == "prices"
         ch = FrameChannel(stream, asyncio.get_running_loop(), maxsize=self._queue_size,
                           drop_when_full=drop_when_full, heartbeat_s=self._heartbeat_s,
-                          is_connected=self._is_connected, clock_ms=self._wall_ms)
+                          is_connected=self._is_connected, clock_ms=self._wall_ms, stamp_receipt=prices,
+                          drops=self._price_drops if prices else None)
         with self._channels_lock:
             old = self._channels.get(stream)
             self._channels[stream] = ch
@@ -896,11 +983,16 @@ class StoneXAdapter(BrokerAdapter):
             if frames is not None:
                 frames.append(item)          # behind the frames already waiting for the parent read
                 return out
-            if ((self._mapper.needs_parent_lookup(item) or self._mapper.needs_side_lookup(item))
-                    and len(holding.held) < MAX_DEFERRED_ORDERS):
-                self._mapper.mark_looked_up(item.order_id)
+            relation = self._mapper.needs_parent_lookup(item) or self._mapper.needs_side_lookup(item)
+            entry = self._mapper.needs_entry_lookup(item)     # K8: a first fill's entry price comes from REST
+            if (relation or entry) and len(holding.held) < MAX_DEFERRED_ORDERS:
+                if relation:
+                    self._mapper.mark_looked_up(item.order_id)
+                if entry:
+                    self._mapper.mark_entry_looked_up(item.order_id)
                 holding.held[item.order_id] = [item]
-                task = asyncio.get_running_loop().create_task(self._lookup_parent(item.order_id, holding.ch))
+                task = asyncio.get_running_loop().create_task(
+                    self._lookup_parent(item.order_id, holding.ch, relation=relation, entry=entry))
                 holding.lookups.add(task)
                 task.add_done_callback(holding.lookups.discard)
                 return out
@@ -917,29 +1009,62 @@ class StoneXAdapter(BrokerAdapter):
                 out.append(StreamEvent(StreamEventKind.GAP, "orders", f"unmappable: {exc}", self._wall_ms()))
         return out
 
-    async def _lookup_parent(self, order_id: str, ch: FrameChannel) -> None:
-        """Background: GET order/{id}/activestoplimitorder for the if-done parent (and the side), then, when the
-        side is still unknown, GET order/{id} and order/{id}/openposition; then release the order's held frames.
-        A failure or timeout releases them too (mapped by the stream heuristic; no side -> unmappable -> gap)."""
+    async def _lookup_parent(self, order_id: str, ch: FrameChannel, *, relation: bool = True,
+                             entry: bool = False) -> None:
+        """Background: with ``relation``, GET order/{id}/activestoplimitorder for the if-done parent (and the side),
+        then, when the side is still unknown, GET order/{id} and order/{id}/openposition. With ``entry`` (K8: the
+        order's first fill emits PositionDTO(OPEN)), the entry price from GET order/{id}/openposition, else the
+        TradeOrder of GET order/{id} (each body read at most once). A failed body read (403 / 80001, another
+        BrokerError, a timeout) counts as "no body" and the next source is tried; only an expired session stops.
+        Then release the order's held frames. A failure of the activestoplimitorder read releases them too (mapped
+        by the stream heuristic: the stream price stands in for the entry; no side -> unmappable -> gap)."""
+        timeout = self._parent_lookup_timeout_s
+        bodies: dict[str, JsonObj | None] = {}
+
+        async def read(kind: str) -> JsonObj | None:
+            if kind not in bodies:
+                call = self._rest.order if kind == "order" else self._rest.order_open_position
+                try:
+                    bodies[kind] = await asyncio.wait_for(call(order_id), timeout)
+                except SessionExpiredError:
+                    raise
+                except (BrokerError, asyncio.TimeoutError) as exc:   # incl. OrderNotAccessibleError (closed)
+                    log.info("stonex: %s read for order %s gave no body: %s", kind, order_id,
+                             str(exc) or type(exc).__name__)
+                    bodies[kind] = None
+            return bodies[kind]
+
         try:
             with rest_priority(RestPriority.RECONCILE):
-                active = await asyncio.wait_for(self._rest.order_active_stop_limit(order_id),
-                                                self._parent_lookup_timeout_s)
-                if active is not None:
-                    self._mapper.learn_parent(order_id, parent_of(active))
-                    self._mapper.learn_side(order_id, parse_side(get_ci(active, "Direction")))
-                if not self._mapper.side_known(order_id):
-                    body = await asyncio.wait_for(self._rest.order(order_id), self._parent_lookup_timeout_s)
-                    for key in ("TradeOrder", "StopLimitOrder"):
-                        row = get_obj(body, key) if body is not None else None
+                if relation:
+                    active = await asyncio.wait_for(self._rest.order_active_stop_limit(order_id), timeout)
+                    if active is not None:
+                        self._mapper.learn_parent(order_id, parent_of(active))
+                        self._mapper.learn_side(order_id, parse_side(get_ci(active, "Direction")))
+                    if not self._mapper.side_known(order_id):
+                        body = await read("order")
+                        for key in ("TradeOrder", "StopLimitOrder"):
+                            row = get_obj(body, key) if body is not None else None
+                            if row is not None:
+                                self._mapper.learn_side(order_id, parse_side(get_ci(row, "Direction")))
+                    if not self._mapper.side_known(order_id):
+                        body = await read("position")
+                        row = get_obj(body, "OpenPosition") if body is not None else None
                         if row is not None:
                             self._mapper.learn_side(order_id, parse_side(get_ci(row, "Direction")))
-                if not self._mapper.side_known(order_id):
-                    body = await asyncio.wait_for(self._rest.order_open_position(order_id),
-                                                  self._parent_lookup_timeout_s)
+                if entry and self._mapper.parent_of(order_id) is None:
+                    body = await read("position")    # None when closed already (live 403 / 80001) or failed
                     row = get_obj(body, "OpenPosition") if body is not None else None
+                    price = _entry_price(row, "Price", "OpenPrice") if row is not None else None
                     if row is not None:
                         self._mapper.learn_side(order_id, parse_side(get_ci(row, "Direction")))
+                    if price is None:
+                        body = await read("order")
+                        trade = get_obj(body, "TradeOrder") if body is not None else None
+                        if trade is not None:
+                            price = _entry_price(trade, "Price", "ExecutionPrice", "OpenPrice")
+                            self._mapper.learn_side(order_id, parse_side(get_ci(trade, "Direction")))
+                    self._mapper.learn_entry(order_id, price)
         except SessionExpiredError as exc:
             ch.put_event(StreamEventKind.AUTH_LOST, str(exc))
         except Exception as exc:  # noqa: BLE001 - BrokerError, timeout, a malformed id: map by the heuristic
@@ -1014,10 +1139,10 @@ class StoneXAdapter(BrokerAdapter):
                 if msg is None:
                     return
                 if isinstance(msg, StreamEvent):
-                    yield msg
+                    yield self._market_event(msg)
                     continue
-                spec = self._by_market.get(str(msg.get("_market")))
-                price = map_price(msg, spec, self._wall_ms(), self.adapter_id) if spec else None
+                spec = self._by_market.get(str(msg.get(MARKET_KEY)))
+                price = map_price(msg, spec, self._receipt_ms(msg), self.adapter_id) if spec else None
                 if price is not None:
                     yield price
         finally:
@@ -1025,13 +1150,29 @@ class StoneXAdapter(BrokerAdapter):
                 self._price_state = None
             self._release_channel(ch, transport, list(subs.values()))
 
+    def _receipt_ms(self, frame: Frame) -> int:
+        """The receipt time the price channel stamped on the Lightstreamer thread (PR2); now when absent."""
+        try:
+            return int(frame.get(RECEIVED_KEY) or "")
+        except ValueError:
+            return self._wall_ms()
+
+    def _market_event(self, event: StreamEvent) -> StreamEvent:
+        """A per-market price subscription event names its canonical symbol (PR6); a MarketId without a known
+        instrument keeps the raw MarketId (as ``dropped_price_frames`` does), so it is never read as a whole-stream
+        event (``market=None``)."""
+        if event.market is None:
+            return event
+        spec = self._by_market.get(event.market)
+        return event if spec is None else dataclasses.replace(event, market=spec.symbol)
+
     def _subscribe_price(self, transport: StreamTransport, ch: FrameChannel, subs: dict[str, object],
                          market_id: str) -> None:
         self._wanted_markets.add(market_id)
         if market_id in subs:
             return
         subs[market_id] = transport.subscribe("PRICES", [f"ID.{market_id}"], PRICE_FIELDS,
-                                              BoundSink(ch, "_market", market_id, check_field="MarketId"),
+                                              BoundSink(ch, MARKET_KEY, market_id, check_field="MarketId"),
                                               mode="MERGE")
 
     async def ensure_ticks(self, symbols: Sequence[str]) -> None:
@@ -1045,6 +1186,60 @@ class StoneXAdapter(BrokerAdapter):
             else:
                 self._wanted_markets.add(market_id)
 
+    # --- broker price bars (design PR3; enabled in S39 after the PR3 probe) ---------------------------
+    @property
+    def price_bars_supported(self) -> bool:
+        """StoneX serves 1m / 5m / 15m / 1h bars, bid and ask (``bars.INTERVALS``; 1m and 15m measured by PR3)."""
+        return True
+
+    async def fetch_price_bars(self, symbol: str, side: BarSide, timeframe_s: int, *, count: int | None = None,
+                               from_ms: int | None = None, to_ms: int | None = None) -> PriceBarsResponse:
+        """The broker's own bars of one series (``BrokerAdapter.fetch_price_bars``; ``md-bars`` and the PR3 probe):
+        ``GET market/{id}/barhistory`` (count form) or ``barhistorybetween`` (range form), confirmed by the PR3
+        probe (2026-11-17), GET only (``rest_get_only``) through this adapter's ``ReadOnlyTransport`` and REST budget
+        at the caller's priority (``md-bars`` reads at ``BARS``). ``bucket_start_ms`` is ``BarDate``, the bucket
+        start (PR3). StoneX bars name no side: ``BrokerBar.side`` stays None and the side is the request's
+        (``PriceBarsResponse.side``, which the §A4 side check compares). A timeframe without a StoneX interval is
+        answered "not supported" for that series. A range answer with ``RANGE_CAP`` bars or more is reported
+        truncated (the cap is unconfirmed: PR3 saw no range answer truncated; counted before the range filter); so is a
+        count answer with fewer complete bars than ``count`` (the forming bar is extra). The range form asks for whole
+        seconds (``from_ms`` floored, ``to_ms`` ceiled) and answers only the bars whose bucket starts inside
+        ``[from_ms, to_ms]``."""
+        problem = bar_request_problem(side, timeframe_s, count, from_ms, to_ms)
+        if problem is not None:
+            raise ValueError(f"fetch_price_bars: {problem}")
+        self._require_directory()
+        sym = canonical(symbol)
+        interval = interval_for(timeframe_s)
+        if interval is None:
+            return PriceBarsResponse.unsupported(self.adapter_id, sym, side, timeframe_s, count=count,
+                                                 from_ms=from_ms, to_ms=to_ms,
+                                                 note=f"no StoneX bar interval for {timeframe_s} s")
+        market_id = await self._market_for_symbol(sym)
+        if market_id is None:
+            raise BrokerError(f"stonex: no market found for {sym} (no bars)")
+        with rest_get_only():
+            if count is not None:
+                body = await self._rest.price_bar_history(market_id, interval[0], interval[1], count, side)
+            else:
+                assert from_ms is not None and to_ms is not None
+                body = await self._rest.price_bar_history_between(
+                    market_id, interval[0], interval[1], from_ms // 1000, math.ceil(to_ms / 1000), side)
+        received = self._wall_ms()
+        bars, names = decode_bar_history(body)
+        complete = sum(1 for b in bars if not b.partial)
+        if count is None:
+            # The range GET is in whole seconds (from floored, to ceiled), so a bucket starting in the widened part
+            # can come back: keep only what was asked for (`[from_ms, to_ms]`, §A4 check 2), so a healthy series
+            # never fails GRID_RANGE for it; the forming bar, when in range, is left to `is_forming` (S39 review).
+            assert from_ms is not None and to_ms is not None
+            bars = [b for b in bars if from_ms <= b.bucket_start_ms <= to_ms]
+        return PriceBarsResponse(adapter_id=self.adapter_id, symbol=sym, side=side, timeframe_s=timeframe_s,
+                                 bars=tuple(bars),
+                                 truncated=complete >= RANGE_CAP if count is None else complete < count,
+                                 received_ms=received, count=count, from_ms=from_ms, to_ms=to_ms,
+                                 field_names=names)
+
 
 class _Holding:
     """The ORDERS consumer's held frames (per order id) and its background parent reads."""
@@ -1055,6 +1250,15 @@ class _Holding:
         self.ch = ch
         self.held = held
         self.lookups = lookups
+
+
+def _entry_price(row: JsonObj, *names: str) -> Decimal | None:
+    """A REST entry price (K8): the first of ``names`` that is a positive decimal, else None."""
+    for name in names:
+        value = to_decimal(get_ci(row, name))
+        if value is not None and value > 0:
+            return value
+    return None
 
 
 def _names_none(body: JsonObj, *keys: str) -> bool:

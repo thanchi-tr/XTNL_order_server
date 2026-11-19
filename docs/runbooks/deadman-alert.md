@@ -100,6 +100,17 @@ that token would stay accepted.
 With `XTNL_SECRETS_SOURCE=env` (the env file) the same three steps apply, each receiver step followed by
 `systemctl restart xtnl-deadman-receiver` (a restart forgets the overlap, so use `_NEXT`, never the short order).
 
+### Dashboard heartbeat copy token (`XTNL_HEARTBEAT_COPY_TOKEN`, K10)
+
+The same three steps, with the dashboard's `/etc/xtnl/dashboard/heartbeat.json` in place of the receiver secret
+(re-read every 30 s, no restart): 1. add `"token_next": "<new>"` (the dashboard journal shows
+`dashboard heartbeat tokens rotated: current + next`); 2. set the engine secret's `XTNL_HEARTBEAT_COPY_TOKEN=<new>`
+(the engine re-reads it within 5 min, at once after a 401; the journal shows `authenticated with the next
+token`); 3. set `"token": "<new>"` and remove `"token_next"`: the old token stays accepted for `token_overlap_s`.
+A renewed `heartbeat.crt` / `.key` is loaded in place within 30 s. The dashboard's PostgreSQL / Redis passwords
+rotate without a restart when it reads them from Secrets Manager (`dashboard.env.example`, `XTNL_SECRETS_SOURCE`).
+The receiver's paging channel credentials follow its secret the same way (re-read every minute).
+
 ## Expected outcome
 
 Heartbeats every 15 s with all ages under threshold; the page auto-resolves.

@@ -9,6 +9,10 @@
   processing, page critical, report `degraded: <task>`. The circuit half-opens for one retry every
   10 min and closes after a clean run; an audited operator `reset_task()` closes it at once.
 * Only leadership-critical tasks (the ingestion orchestrator, the lease-keeper link) hard-exit instead.
+* A half-open retry that dies keeps the circuit open and calls the task's `on_circuit_reopen(name)` (counted in
+  `reopen_count`, per incident: reset when the circuit closes), so an owner can budget repeated failures (design
+  RT-M3); `has(name)` lets optional services
+  add tasks idempotently (RT-M2).
 * LoopWatchdog: a 1 s event-loop heartbeat that measures loop lag (alert at 100 ms) and feeds systemd
   `WATCHDOG=1` only while the lease (if held) is valid, so systemd's SIGKILL covers loop lag and
   lease expiry (§3).
@@ -99,6 +103,9 @@ class TaskSpec:
     backoff_base_s: float = 1.0
     backoff_max_s: float = 60.0
     on_quarantine: Callable[[], None] | None = None
+    # Called with the task name when a half-open retry dies and the circuit stays open (RT-M3); an error in it is
+    # logged and never changes the supervision.
+    on_circuit_reopen: Callable[[str], None] | None = None
 
 
 @dataclass
@@ -114,6 +121,7 @@ class _Runtime:
     next_half_open: float | None = None
     half_open: bool = False
     restarts: int = 0
+    reopens: int = 0
     last_error: str | None = None
 
 
@@ -238,6 +246,12 @@ class TaskSupervisor:
         if rt.half_open:
             rt.half_open = False
             rt.next_half_open = now + spec.half_open_after_s
+            rt.reopens += 1
+            if spec.on_circuit_reopen is not None:
+                try:
+                    spec.on_circuit_reopen(spec.name)
+                except Exception:
+                    log.exception("circuit-reopen hook of %s failed", spec.name)
             self._pager.page("critical", f"task {spec.name} circuit still open", f"half-open retry died: {why}")
             return
         if len(rt.deaths) > spec.max_deaths:
@@ -262,6 +276,7 @@ class TaskSupervisor:
         rt.half_open = False
         rt.deaths.clear()
         rt.consecutive = 0
+        rt.reopens = 0                     # reopen_count is per incident: a closed circuit starts a fresh one
 
     # --- operator / queries ------------------------------------------------------------------------
     def reset_task(self, name: str, operator: str) -> None:
@@ -282,6 +297,18 @@ class TaskSupervisor:
         if rt is None or rt.circuit_open_since is None:
             return None
         return self._clock() - rt.circuit_open_since
+
+    def has(self, name: str) -> bool:
+        """True when a task of that name is registered (running, waiting to restart or with its circuit open)."""
+        return name in self._rt
+
+    def reopen_count(self, name: str) -> int:
+        """Half-open retries of the task that died (each kept its circuit open) since its circuit last opened: the
+        count of the current incident, reset to 0 whenever the circuit closes (a clean half-open run or an audited
+        operator `reset_task`), so a budget built on it never counts failures from before an operator reset.
+        0 for an unknown name."""
+        rt = self._rt.get(name)
+        return 0 if rt is None else rt.reopens
 
     def running(self, name: str) -> bool:
         rt = self._rt[name]

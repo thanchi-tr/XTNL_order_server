@@ -3,6 +3,7 @@ waits on REST, and the credential age. No network I/O: sockets are created but n
 from __future__ import annotations
 
 import asyncio
+import logging
 import socket
 import struct
 import sys
@@ -15,13 +16,21 @@ import pytest
 
 from src.adapters.base import StreamEvent, StreamEventKind, TransientBrokerError
 from src.adapters.mock import MockBrokerAdapter
+from src.adapters.pepperstone.session import OpenApiSession, SessionClosedError
 from src.adapters.pepperstone.tokens import InMemoryTokenStore, TokenManager, TokenPair
 from src.adapters.ratelimit import (
     RestBudget,
     RestPriority,
+    clear_rest_sent_ms,
     current_rest_priority,
+    default_bars_per_min,
+    effective_bars_per_min,
+    mark_rest_sent,
+    max_bars_per_min,
     parse_retry_after,
+    rest_last_sent_ms,
     rest_priority,
+    rest_sent_ms,
 )
 from src.adapters.sockets import (
     TCP_USER_TIMEOUT_MS,
@@ -45,6 +54,7 @@ from src.config import (
 from src.dto import AccountDTO, OrderDTO
 
 from .conftest import EURUSD_ID, TRADING, FakeStoneX, FakeStreamTransport, make_adapter, make_settings, wait_until, wcf
+from .pepperstone.conftest import ACCOUNT as CT_ACCOUNT
 from .pepperstone.conftest import EURUSD as CT_EURUSD
 from .pepperstone.conftest import FakeCTrader, fake  # noqa: F401 - the cTrader fixture
 from .pepperstone.conftest import make_adapter as make_ctrader
@@ -194,7 +204,7 @@ async def test_waiters_are_served_by_priority_not_arrival() -> None:
     tasks.append(asyncio.create_task(call(RestPriority.RECONCILE)))
     await asyncio.wait_for(asyncio.gather(*tasks), 2)
     assert served == ["reconcile", "cash_flows", "dlq", "poll"]
-    assert budget.stats().requests == {"reconcile": 2, "cash_flows": 1, "dlq": 1, "poll": 1}
+    assert budget.stats().requests == {"reconcile": 2, "cash_flows": 1, "bars": 0, "dlq": 1, "poll": 1}
 
 
 async def test_background_classes_leave_a_reserve_for_reconcile() -> None:
@@ -520,3 +530,509 @@ async def test_mock_adapter_records_priorities_and_uses_an_attached_bucket() -> 
                                ("fetch_positions", RestPriority.RECONCILE)]
     assert mock.rest_budget is budget and budget.stats().requests["poll"] == 1
     assert MockBrokerAdapter().rest_budget is None
+
+
+# --- S06 / design PR11: RestPriority.BARS, the BARS cap, the send-time stamp, outcome counters -------------
+class _Clock:
+    """A settable monotonic clock (seconds) for the cap window."""
+
+    def __init__(self, t: float = 1000.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def test_bars_sits_between_cash_flows_and_dlq_and_the_other_classes_are_unchanged() -> None:
+    assert [p.label for p in sorted(RestPriority)] == ["reconcile", "cash_flows", "bars", "dlq", "poll"]
+    budget = RestBudget("x", rate_per_s=5.0, burst=10)
+    # The reserves seen by the four existing classes are what they were before BARS existed.
+    assert [budget.floor(p) for p in (RestPriority.RECONCILE, RestPriority.CASH_FLOWS, RestPriority.DLQ,
+                                      RestPriority.POLL)] == [0.0, 1.0, 2.5, 5.0]
+    assert budget.floor(RestPriority.BARS) == 1.5
+    assert (budget._max_wait[RestPriority.BARS], budget._max_wait[RestPriority.DLQ],
+            budget._max_wait[RestPriority.POLL]) == (15.0, 15.0, 10.0)
+
+
+async def test_waiters_with_bars_are_served_by_priority() -> None:
+    budget = RestBudget("x", rate_per_s=50.0, burst=1)
+    await budget.acquire()                               # bucket empty
+    served: list[str] = []
+
+    async def call(p: RestPriority) -> None:
+        with rest_priority(p):
+            await budget.acquire()
+        served.append(p.label)
+
+    tasks = []
+    for p in (RestPriority.POLL, RestPriority.DLQ, RestPriority.BARS, RestPriority.CASH_FLOWS,
+              RestPriority.RECONCILE):
+        tasks.append(asyncio.create_task(call(p)))
+        await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.gather(*tasks), 3)
+    assert served == ["reconcile", "cash_flows", "bars", "dlq", "poll"]
+    assert budget.stats().requests["bars"] == 1
+
+
+async def test_bars_reserve_sits_between_cash_flows_and_dlq() -> None:
+    budget = RestBudget("x", rate_per_s=2.5, burst=20, bars_per_min=60,
+                        max_wait_s={p: 0.03 for p in RestPriority})
+    for _ in range(17):                                  # 20 - 17 = 3 left: BARS keeps 3 (15 %) back
+        await budget.acquire(RestPriority.BARS)
+    with pytest.raises(TransientBrokerError, match="bars"):
+        await budget.acquire(RestPriority.BARS)
+    with pytest.raises(TransientBrokerError, match="dlq"):
+        await budget.acquire(RestPriority.DLQ)           # DLQ keeps 5 (25 %) back
+    await budget.acquire(RestPriority.CASH_FLOWS)        # CASH_FLOWS keeps only 2 (10 %) back
+
+
+async def test_the_bars_cap_refuses_at_once_and_frees_after_a_minute() -> None:
+    clock = _Clock()
+    budget = RestBudget("x", rate_per_s=1000.0, burst=100, bars_per_min=2, monotonic=clock)
+    await budget.acquire(RestPriority.BARS)
+    clock.t += 30
+    await budget.acquire(RestPriority.BARS)
+    with pytest.raises(TransientBrokerError, match="BARS cap"):
+        await asyncio.wait_for(budget.acquire(RestPriority.BARS), 0.5)    # refused at once, never queued
+    st = budget.stats()
+    assert (st.bars_per_min, st.bars_in_window, st.bars_capped, st.refused, st.waiting) == (2, 2, 1, 1, 0)
+    for p in (RestPriority.RECONCILE, RestPriority.CASH_FLOWS, RestPriority.DLQ, RestPriority.POLL):
+        await budget.acquire(p)                          # the cap binds BARS only
+    clock.t += 30.5                                      # the first BARS call left the window
+    await budget.acquire(RestPriority.BARS)
+    st = budget.stats()
+    assert st.bars_in_window == 2 and st.requests["bars"] == 3 and st.bars_capped == 1
+
+
+async def test_a_bars_call_that_never_got_a_token_gives_its_place_back() -> None:
+    budget = RestBudget("x", rate_per_s=0.001, burst=1, bars_per_min=1,
+                        max_wait_s={p: 0.03 for p in RestPriority})
+    await budget.acquire(RestPriority.RECONCILE)         # bucket empty
+    with pytest.raises(TransientBrokerError, match="budget exhausted"):
+        await budget.acquire(RestPriority.BARS)
+    assert budget.stats().bars_in_window == 0 and budget.stats().bars_capped == 0
+    budget2 = RestBudget("y", rate_per_s=0.001, burst=1, bars_per_min=1)
+    await budget2.acquire(RestPriority.RECONCILE)
+    waiter = asyncio.create_task(budget2.acquire(RestPriority.BARS))
+    await asyncio.sleep(0.005)
+    assert budget2.stats().bars_in_window == 1           # a waiting BARS call holds its place
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert budget2.stats().bars_in_window == 0
+
+
+def test_the_default_bars_cap_is_a_quarter_of_the_rate() -> None:
+    assert default_bars_per_min(5.0) == 75 and default_bars_per_min(20.0) == 300
+    assert default_bars_per_min(0.01) == 1
+    assert RestBudget("x", rate_per_s=5.0, burst=10).bars_per_min == 75
+    with pytest.raises(ValueError):
+        RestBudget("x", rate_per_s=5.0, burst=10, bars_per_min=0)
+    assert StoneXAdapter(make_settings()).rest_budget.bars_per_min == default_bars_per_min(STONEX_REST_RATE_PER_S)
+
+
+def test_the_bars_cap_setting_is_read_tolerantly(caplog: pytest.LogCaptureFixture) -> None:
+    env = {"STONE_X_USERNAME": "u", "STONE_X_PASS": "p", "STONE_X_APP_KEY": "k"}
+    assert StoneXSettings.from_env(env).rest_bars_per_min is None
+    s = StoneXSettings.from_env(env | {"STONE_X_REST_BARS_PER_MIN": "12"})
+    assert s.rest_bars_per_min == 12 and StoneXAdapter(s).rest_budget.bars_per_min == 12
+    with caplog.at_level(logging.WARNING):
+        for bad in ("many", "0", "-3", "1.5"):
+            assert StoneXSettings.from_env(env | {"STONE_X_REST_BARS_PER_MIN": bad}).rest_bars_per_min is None
+    assert "STONE_X_REST_BARS_PER_MIN" in caplog.text and "many" not in caplog.text
+    ct = {"CTRADER_CLIENT_ID": "c", "CTRADER_CLIENT_SECRET": "s", "CTRADER_ACCESS_TOKEN": "a",
+          "CTRADER_REFRESH_TOKEN": "r", "CTRADER_ACCOUNT_ID": "9"}
+    assert PepperstoneSettings.from_env(ct | {"CTRADER_REST_BARS_PER_MIN": "40"}).rest_bars_per_min == 40
+    assert PepperstoneSettings.from_env(ct | {"CTRADER_REST_BARS_PER_MIN": "x"}).rest_bars_per_min is None
+
+
+async def test_the_send_stamp_is_set_after_the_token_wait() -> None:
+    wall = [T0]
+    budget = RestBudget("x", rate_per_s=40.0, burst=1, wall_ms=lambda: wall[0])
+    clear_rest_sent_ms()
+    assert rest_sent_ms() is None
+    await budget.acquire()
+    assert rest_sent_ms() == T0
+    clear_rest_sent_ms()
+
+    async def advance() -> None:
+        await asyncio.sleep(0.005)
+        wall[0] = T0 + 5_000                             # time passes while the caller waits for a token
+
+    mover = asyncio.create_task(advance())
+    with rest_priority(RestPriority.BARS):
+        await budget.acquire()                           # waits ~25 ms for the refill
+    await mover
+    assert rest_sent_ms() == T0 + 5_000                  # the send time, never the queue time
+    clear_rest_sent_ms()
+    budget.spend()
+    assert rest_sent_ms() == T0 + 5_000
+
+
+async def test_a_refused_call_sets_no_stamp() -> None:
+    budget = RestBudget("x", rate_per_s=1000.0, burst=10, bars_per_min=1, wall_ms=lambda: T0)
+    await budget.acquire(RestPriority.BARS)
+    clear_rest_sent_ms()
+    with pytest.raises(TransientBrokerError):
+        await budget.acquire(RestPriority.BARS)
+    assert rest_sent_ms() is None
+    mark_rest_sent(T0 + 1)
+    assert rest_sent_ms() == T0 + 1
+
+
+async def test_stonex_calls_by_priority_stamp_the_send_and_report_outcomes(fake_broker: FakeStoneX) -> None:
+    wall = [T0]
+    budget = RestBudget("stonex", rate_per_s=1000.0, burst=1000, wall_ms=lambda: wall[0])
+    adapter = make_adapter(fake_broker, rest_budget=budget)
+    await adapter.connect()
+    wall[0] = T0 + 7_000
+    clear_rest_sent_ms()
+    with rest_priority(RestPriority.BARS):
+        await adapter.fetch_positions()
+    assert rest_sent_ms() == T0 + 7_000                  # reaches the caller through the adapter's awaits
+    with rest_priority(RestPriority.DLQ):
+        await adapter.fetch_order_status("999")
+    st = budget.stats()
+    assert st.requests["bars"] >= 1 and st.requests["dlq"] == 1
+    assert st.outcomes["bars"].ok >= 1 and st.outcomes["bars"].last_success_ms == T0 + 7_000
+    assert st.outcomes["dlq"].ok == 1 and st.outcomes["dlq"].consecutive_failures == 0
+    # A server error at BARS is a failure there only: other priorities still answer, so no outage.
+    fake_broker.one_shot["/TradingAPI/order/openpositions"] = httpx.Response(503, json={})
+    with rest_priority(RestPriority.BARS), pytest.raises(TransientBrokerError):
+        await adapter.fetch_positions()
+    st = budget.stats()
+    assert st.outcomes["bars"].consecutive_failures == 1 and st.failing_at_every_priority(wall[0]) is False
+    # A throttle answer is counted apart: never a failure, so self-inflicted throttling is no outage.
+    reconcile_before = budget.stats().outcomes["reconcile"]
+    fake_broker.one_shot["/TradingAPI/order/openpositions"] = httpx.Response(
+        429, headers={"Retry-After": "0.01"}, json={})
+    with pytest.raises(TransientBrokerError, match="throttled"):
+        await adapter.fetch_positions()
+    rec = budget.stats().outcomes["reconcile"]
+    assert (rec.throttled, rec.last_throttled_ms, rec.consecutive_failures, rec.failed) == (
+        1, T0 + 7_000, 0, reconcile_before.failed)
+    await adapter.close()
+
+
+async def test_stonex_network_errors_at_every_priority_read_as_an_outage(fake_broker: FakeStoneX) -> None:
+    down = [False]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if down[0]:
+            raise httpx.ConnectTimeout("down", request=request)
+        return fake_broker.handler(request)
+
+    budget = RestBudget("stonex", rate_per_s=1000.0, burst=1000, wall_ms=lambda: T0)
+    rest = StoneXRestClient.create(make_settings(), http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    adapter = StoneXAdapter(make_settings(), rest=rest, rest_budget=budget, heartbeat_s=60.0)
+    await adapter.connect()
+    with rest_priority(RestPriority.POLL):
+        await adapter.fetch_account_snapshot()
+    assert budget.stats().failing_at_every_priority(T0) is False
+    down[0] = True
+    for p in (RestPriority.RECONCILE, RestPriority.BARS, RestPriority.POLL):
+        with rest_priority(p), pytest.raises(TransientBrokerError):
+            await adapter.fetch_positions()
+    st = budget.stats()
+    assert st.failing_at_every_priority(T0) is True
+    assert st.outcomes["poll"].last_success_ms is not None and st.outcomes["poll"].consecutive_failures == 1
+    assert not st.outcomes["cash_flows"].seen           # a class never used does not hold the verdict back
+    down[0] = False
+    with rest_priority(RestPriority.POLL):
+        await adapter.fetch_account_snapshot()           # one priority answers again: no longer an outage
+    assert budget.stats().failing_at_every_priority(T0) is False
+    await adapter.close()
+
+
+def test_failures_only_at_bars_are_never_an_outage() -> None:
+    budget = RestBudget("x", rate_per_s=5.0, burst=10, wall_ms=lambda: T0)
+    assert budget.stats().failing_at_every_priority(T0) is None     # nothing seen yet: unknown
+    for _ in range(3):
+        budget.note_result(RestPriority.BARS, False)
+    assert budget.stats().failing_at_every_priority(T0) is None     # BARS alone never decides an outage
+    budget.note_result(RestPriority.DLQ, True)
+    assert budget.stats().failing_at_every_priority(T0) is False
+    budget.note_result(RestPriority.DLQ, False)
+    st = budget.stats()
+    assert st.failing_at_every_priority(T0) is True
+    assert (st.outcomes["bars"].failed, st.outcomes["bars"].consecutive_failures, st.outcomes["dlq"].ok) == (3, 3, 1)
+    with rest_priority(RestPriority.BARS):
+        budget.note_result(None, True)                              # None: the caller's priority
+    assert budget.stats().outcomes["bars"].consecutive_failures == 0
+    assert budget.stats().failing_at_every_priority(T0) is False
+
+
+def test_an_old_success_never_masks_a_bars_outage_now() -> None:
+    """Stale case (a): the RECONCILE success at connect, an hour old, must not keep the verdict False while only
+    BARS is being called and failing: with no recent non-BARS outcome the verdict is unknown (None), so bar-read
+    failures are never counted toward FAILED on the strength of an old answer (design §B14, R11-M10)."""
+    wall = [T0]
+    budget = RestBudget("x", rate_per_s=5.0, burst=10, wall_ms=lambda: wall[0])
+    budget.note_result(RestPriority.RECONCILE, True)
+    wall[0] = T0 + 3_600_000
+    for _ in range(5):
+        budget.note_result(RestPriority.BARS, False)
+    st = budget.stats()
+    assert st.failing_at_every_priority(wall[0]) is None
+    assert st.failing_at_every_priority(wall[0], within_ms=4_000_000) is False     # a wide window sees it again
+
+
+def test_an_old_failure_never_turns_a_bars_failure_into_an_outage() -> None:
+    """Stale case (b): one RECONCILE timeout an hour ago plus a broken bar endpoint now is no broker outage
+    (no false broker_unavailable page): the old failure is outside the window, so the verdict is unknown."""
+    wall = [T0]
+    budget = RestBudget("x", rate_per_s=5.0, burst=10, wall_ms=lambda: wall[0])
+    budget.note_result(RestPriority.RECONCILE, False)
+    wall[0] = T0 + 3_600_000
+    budget.note_result(RestPriority.BARS, False)
+    st = budget.stats()
+    assert st.failing_at_every_priority(wall[0]) is None
+    # A recent non-BARS failure with BARS failing too is an outage; a recent non-BARS answer is not.
+    budget.note_result(RestPriority.DLQ, False)
+    assert budget.stats().failing_at_every_priority(wall[0]) is True
+    wall[0] += 1_000
+    budget.note_result(RestPriority.POLL, True)
+    assert budget.stats().failing_at_every_priority(wall[0]) is False
+    # Once the failures age out of the window, only the POLL answer is left: no outage.
+    assert budget.stats().failing_at_every_priority(wall[0] + 59_500) is False
+    assert budget.stats().failing_at_every_priority(wall[0] + 61_000) is None
+
+
+def test_a_throttle_never_reads_as_an_outage() -> None:
+    """Throttles are counted apart: a throttle that empties the bucket for every priority (BARS overuse) leaves
+    each priority's success / failure record, and so the verdict, untouched."""
+    budget = RestBudget("x", rate_per_s=5.0, burst=10, wall_ms=lambda: T0)
+    budget.note_result(RestPriority.RECONCILE, True)
+    for p in RestPriority:
+        budget.note_throttled(p)
+    budget.throttled(0.01)
+    st = budget.stats()
+    assert st.failing_at_every_priority(T0) is False
+    assert all(o.throttled == 1 and o.consecutive_failures == 0 and o.failed == 0 for o in st.outcomes.values())
+    assert st.outcomes["dlq"].newest_ms is None and st.outcomes["reconcile"].newest_ms == T0
+
+
+async def test_the_stamp_keeps_the_earliest_send_and_the_newest_apart() -> None:
+    wall = [1_000]
+    budget = RestBudget("x", rate_per_s=1000.0, burst=10, wall_ms=lambda: wall[0])
+    clear_rest_sent_ms()
+    await budget.acquire()
+    wall[0] = 11_000
+    budget.spend()
+    assert (rest_sent_ms(), rest_last_sent_ms()) == (1_000, 11_000)   # the read age counts from the first send
+    mark_rest_sent(500)                                                # an earlier stamp moves the first back
+    assert (rest_sent_ms(), rest_last_sent_ms()) == (500, 500)
+    clear_rest_sent_ms()
+    assert rest_sent_ms() is None and rest_last_sent_ms() is None
+    await budget.acquire(stamp=False)
+    budget.spend(stamp=False)
+    assert rest_sent_ms() is None                                      # the REST layer stamps the send itself
+
+
+async def test_a_multi_request_open_orders_read_is_stamped_at_its_first_send(fake_broker: FakeStoneX) -> None:
+    """IN-5 / PR9: one fetch_open_orders over two trading accounts sends four requests, each waiting for a token
+    (and time passes between them); the stamp is the first send, so the read never looks fresher than its data."""
+    second = "2002"
+    fake_broker.account_info["TradingAccounts"].append(
+        {"ClientAccountId": 1001, "TradingAccountId": int(second), "TradingAccountCode": "TA2",
+         "TradingAccountStatus": "Open", "TradingAccountType": "CFD"})
+    fake_broker.account_info["clientAccounts"].append(
+        {"clientAccountId": 1001, "tradingAccountId": int(second), "clientAccountCurrency": "AUD"})
+    wall = [T0]
+    sent: list[tuple[str, int]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.url.path, wall[0]))
+        wall[0] += 10_000                                # each request takes its time before the next leaves
+        return fake_broker.handler(request)
+
+    budget = RestBudget("stonex", rate_per_s=50.0, burst=1, wall_ms=lambda: wall[0])
+    rest = StoneXRestClient.create(make_settings(), http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    adapter = StoneXAdapter(make_settings(), rest=rest, rest_budget=budget, heartbeat_s=60.0)
+    await adapter.connect()
+    try:
+        assert len(adapter._require_directory().trading_ids) == 2
+        sent.clear()
+        wall[0] = T0
+        budget.spend()                                   # bucket empty: every request below waits for a token
+        clear_rest_sent_ms()
+        with rest_priority(RestPriority.BARS):
+            await adapter.fetch_open_orders()
+        order_reads = [(path, at) for path, at in sent
+                       if path.endswith(("/openpositions", "/activestoplimitorders"))]
+        assert len(order_reads) == 4
+        assert rest_sent_ms() == order_reads[0][1] == T0
+        assert rest_last_sent_ms() == sent[-1][1] >= T0 + 30_000
+    finally:
+        await adapter.close()
+
+
+async def test_a_stonex_session_lost_while_waiting_for_a_token_sets_no_stamp(fake_broker: FakeStoneX) -> None:
+    budget = RestBudget("stonex", rate_per_s=50.0, burst=1, wall_ms=lambda: T0)
+    adapter = make_adapter(fake_broker, rest_budget=budget)
+    await adapter.connect()
+    try:
+        budget.spend()                                   # bucket empty: the next call waits ~20 ms
+
+        async def lose() -> None:
+            await asyncio.sleep(0.005)
+            adapter._rest._session = None                # the session ends while the caller waits
+
+        loser = asyncio.create_task(lose())
+        clear_rest_sent_ms()
+        with pytest.raises(Exception, match="no StoneX session"):
+            await adapter._rest.open_positions(TRADING)
+        await loser
+        assert rest_sent_ms() is None                    # nothing left for the broker, so nothing is stamped
+    finally:
+        await adapter.close()
+
+
+async def test_an_unmetered_stonex_client_stamps_from_its_injected_clock(fake_broker: FakeStoneX) -> None:
+    rest = StoneXRestClient.create(make_settings(), http=httpx.AsyncClient(
+        transport=httpx.MockTransport(fake_broker.handler)), wall_ms=lambda: T0 + 9)
+    await rest.log_on()
+    clear_rest_sent_ms()
+    await rest.open_positions(TRADING)
+    assert rest_sent_ms() == T0 + 9
+    await rest.aclose()
+
+
+def test_the_bars_cap_is_clamped_to_half_the_rate(caplog: pytest.LogCaptureFixture) -> None:
+    assert max_bars_per_min(5.0) == 150 and max_bars_per_min(0.001) == 1
+    assert effective_bars_per_min(5.0, None) == 75 and effective_bars_per_min(5.0, 100_000) == 150
+    with caplog.at_level(logging.WARNING):
+        budget = RestBudget("stonex", rate_per_s=5.0, burst=10, bars_per_min=100_000)
+    assert budget.bars_per_min == 150
+    assert "*_REST_BARS_PER_MIN" in caplog.text and "100000" not in caplog.text
+    budget.bars_per_min = 30                             # a cap-only change keeps the bucket
+    assert budget.bars_per_min == 30
+    with pytest.raises(ValueError):
+        budget.bars_per_min = 0
+
+
+async def test_ctrader_requests_report_outcomes_and_stamp_the_send(fake: FakeCTrader) -> None:
+    adapter = make_ctrader(fake)
+    await adapter.connect()
+    try:
+        budget = adapter.rest_budget
+        clear_rest_sent_ms()
+        with rest_priority(RestPriority.BARS):
+            await adapter.fetch_positions()
+        assert rest_sent_ms() is not None
+        st = budget.stats()
+        assert st.outcomes["bars"].ok >= 1 and st.outcomes["reconcile"].ok >= 1
+        fake.errors[2124] = ["REQUEST_FREQUENCY_EXCEEDED"]          # a throttle: counted apart, no failure
+        with rest_priority(RestPriority.DLQ), pytest.raises(Exception, match="REQUEST_FREQUENCY_EXCEEDED"):
+            await adapter.fetch_positions()
+        dlq = budget.stats().outcomes["dlq"]
+        assert (dlq.throttled, dlq.consecutive_failures, dlq.failed) == (1, 0, 0)
+        fake.errors[2124] = ["INVALID_REQUEST"]                    # an answer about the request: not a failure
+        with rest_priority(RestPriority.DLQ), pytest.raises(Exception, match="INVALID_REQUEST"):
+            await adapter.fetch_positions()
+        assert budget.stats().outcomes["dlq"].ok == 1
+    finally:
+        await adapter.close()
+
+
+def _ct_session(connector: Any, budget: RestBudget, **kw: Any) -> OpenApiSession:
+    return OpenApiSession("wss://fake.ctrader.test:5036", connector, on_event=lambda frame: None,
+                          on_closed=lambda reason: None, heartbeat_s=60.0, budget=budget, **kw)
+
+
+ORDER_LIST = 2175                                        # a historical request (spaced after its token)
+
+
+async def test_ctrader_historical_request_is_stamped_after_the_spacing_wait(fake: FakeCTrader) -> None:
+    wall = [T0]
+    budget = RestBudget("pepperstone", rate_per_s=1000.0, burst=100, wall_ms=lambda: wall[0])
+    session = _ct_session(fake.connect, budget, historical_interval_s=0.05)
+    await session.open()
+    payload = {"ctidTraderAccountId": CT_ACCOUNT, "fromTimestamp": 0, "toTimestamp": 1}
+    try:
+        clear_rest_sent_ms()
+        await session.request(ORDER_LIST, payload)
+        assert rest_sent_ms() == T0
+        clear_rest_sent_ms()
+
+        async def advance() -> None:
+            await asyncio.sleep(0.01)
+            wall[0] = T0 + 5_000                         # time passes during the historical spacing sleep
+
+        mover = asyncio.create_task(advance())
+        with rest_priority(RestPriority.BARS):
+            await session.request(ORDER_LIST, payload)   # token at once, then ~50 ms of spacing
+        await mover
+        assert rest_sent_ms() == T0 + 5_000              # the real send, after the spacing, not the token time
+        assert budget.stats().outcomes["bars"].ok == 1
+    finally:
+        await session.close()
+
+
+class _SilentSocket:
+    """A socket that takes every frame and never answers (a broker that hangs)."""
+
+    def __init__(self) -> None:
+        self.inbox: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def send(self, message: str) -> None:
+        return None
+
+    async def recv(self) -> str:
+        item = await self.inbox.get()
+        if item is None:
+            raise ConnectionError("closed")
+        return item
+
+    async def close(self) -> None:
+        self.inbox.put_nowait(None)
+
+
+async def test_ctrader_timeout_is_a_failure_at_the_callers_priority() -> None:
+    sock = _SilentSocket()
+
+    async def connect(url: str) -> _SilentSocket:
+        return sock
+
+    budget = RestBudget("pepperstone", rate_per_s=1000.0, burst=100, wall_ms=lambda: T0)
+    session = _ct_session(connect, budget)
+    await session.open()
+    try:
+        with rest_priority(RestPriority.BARS), pytest.raises(TransientBrokerError, match="timed out"):
+            await session.request(2104, {}, timeout_s=0.02)
+        bars = budget.stats().outcomes["bars"]
+        assert (bars.consecutive_failures, bars.failed, bars.last_failure_ms) == (1, 1, T0)
+    finally:
+        await session.close()
+
+
+async def test_ctrader_socket_lost_mid_request_is_a_failure_at_the_callers_priority(fake: FakeCTrader) -> None:
+    def drop_on_order_list(sock: Any, frame: dict[str, Any]) -> None:
+        if int(frame["payloadType"]) == ORDER_LIST:
+            sock.drop()                                  # the server drops the socket before answering
+
+    budget = RestBudget("pepperstone", rate_per_s=1000.0, burst=100, wall_ms=lambda: T0)
+    session = _ct_session(fake.connect, budget, historical_interval_s=0.0)
+    await session.open()
+    fake.on_request = drop_on_order_list
+    try:
+        with rest_priority(RestPriority.DLQ), pytest.raises(SessionClosedError):
+            await session.request(ORDER_LIST, {"ctidTraderAccountId": CT_ACCOUNT, "fromTimestamp": 0,
+                                               "toTimestamp": 1})
+        dlq = budget.stats().outcomes["dlq"]
+        assert (dlq.consecutive_failures, dlq.failed) == (1, 1)
+        clear_rest_sent_ms()
+        with rest_priority(RestPriority.DLQ), pytest.raises(SessionClosedError):
+            await session.request(2104, {})             # the socket is gone: nothing leaves, nothing stamped
+        assert rest_sent_ms() is None and budget.stats().outcomes["dlq"].consecutive_failures == 2
+    finally:
+        await session.close()
+
+
+async def test_mock_stamps_the_send_from_its_wall_clock_when_unmetered() -> None:
+    mock = MockBrokerAdapter(wall_ms=lambda: T0 + 3)
+    clear_rest_sent_ms()
+    with rest_priority(RestPriority.BARS):
+        await mock.fetch_positions()
+    assert rest_sent_ms() == T0 + 3
+    assert mock.rest_calls == [("fetch_positions", RestPriority.BARS)]

@@ -42,7 +42,14 @@ from src.runtime.roles import NodeRole
 from src.runtime.probes import ADDRESSES_TTL_S, local_addresses
 from src.runtime.sdnotify import SdNotifier
 from src.runtime.supervisor import LoopWatchdog
-from src.runtime.telemetry import Telemetry, asyncpg_connect, build_telemetry, certs_from_env
+from src.runtime.telemetry import (
+    Telemetry,
+    asyncpg_connect,
+    build_telemetry,
+    cert_endpoints_from_env,
+    certs_from_env,
+    endpoint_trust_warnings,
+)
 from src.runtime.uptime import UptimeTracker
 from src.runtime.wiring import Engine, WiringError, build_engine, check_composition, drain_spill_at_startup
 
@@ -128,12 +135,16 @@ def engine_telemetry(engine: Engine, watchdog: LoopWatchdog | None) -> Telemetry
             hosts[:] = [(now, local_addresses())]
         return hosts[0][1]
 
+    cert_endpoints = cert_endpoints_from_env(engine.environ)
+    for line in endpoint_trust_warnings(cert_endpoints, engine.environ):   # K5: a permanent false alarm otherwise
+        log.warning("%s", line)
     telemetry = build_telemetry(
         node_id=controller.node_id, controller=controller, keeper=controller.keeper, watchdog=watchdog,
         chrony_offset_s=(lambda: chrony.signed_offset_s) if chrony is not None else None,
         peers=peers,
         control=engine.control, redis=engine.redis, patroni=engine.patroni, dsn=engine.settings.storage.dsn,
-        connect=asyncpg_connect, local_hosts=local_hosts, etcd_status=status, certs=certs_from_env(engine.environ))
+        connect=asyncpg_connect, local_hosts=local_hosts, etcd_status=status, certs=certs_from_env(engine.environ),
+        cert_endpoints=cert_endpoints)
     # uptime + downtime catch-up series (any role; in-memory, no I/O at scrape time)
     if engine.uptime is not None:
         telemetry.registry.register("uptime", engine.uptime.samples)

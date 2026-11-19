@@ -8,6 +8,13 @@
 #     docker compose -f deploy/docker-compose.dev.yml down -v
 #
 # 'xtnl_dev_only' is a throwaway local password for this container, not a credential for anything else.
+#
+# redis-md (market data, design docs/design/automated-risk-manager.md §A2) is in compose profile 'md', so the plain
+# 'up' above is unchanged. AOF on, the design's ACL users; the passwords below are throwaway dev-only values:
+#
+#     docker compose -f deploy/docker-compose.dev.yml --profile md up -d --wait redis-md
+#     ORDER_SERVER_TEST_REDIS_MD=redis://127.0.0.1:56383/0      (tests/marketdata/test_acl_live.py, marker md)
+#     docker compose -f deploy/docker-compose.dev.yml --profile md down -v
 
 name: xtnl-dev
 
@@ -51,6 +58,86 @@ services:
       - "127.0.0.1:56379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis-md:
+    profiles: ["md"]
+    image: redis:7.4
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --aof-load-truncated
+      - "yes"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+      - --user
+      - default
+      - "off"
+      - --user
+      - md_writer
+      - "on"
+      - ">md_writer_dev_only"
+      - "resetkeys"
+      - "~md:*"
+      - "resetchannels"
+      - "-@all"
+      - "+@string"
+      - "+@hash"
+      - "+@sortedset"
+      - "+@stream"
+      - "+del"
+      - "+unlink"
+      - "+exists"
+      - "+pexpire"
+      - "+evalsha"
+      - "+script|load"
+      - "+info"
+      - "+waitaof"
+      - "+ping"
+      - "+select"
+      - "+client|setinfo"
+      - --user
+      - md_reader
+      - "on"
+      - ">md_reader_dev_only"
+      - "resetkeys"
+      - "%R~md:*"
+      - "resetchannels"
+      - "-@all"
+      - "+get"
+      - "+hgetall"
+      - "+zrange"
+      - "+zrangebyscore"
+      - "+xrange"
+      - "+xrevrange"
+      - "+xread"
+      - "+exists"
+      - "+ping"
+      - "+select"
+      - "+client|setinfo"
+      - --user
+      - md_health
+      - "on"
+      - "nopass"
+      - "resetkeys"
+      - "resetchannels"
+      - "-@all"
+      - "+ping"
+    ports:
+      - "127.0.0.1:56383:6379"
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "--user", "md_health", "--pass", "unused", "ping"]
       interval: 2s
       timeout: 2s
       retries: 30

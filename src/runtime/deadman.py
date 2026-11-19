@@ -20,6 +20,12 @@ token rotated at the receiver first is picked up within one refresh instead of a
 Heartbeat copy (IMPLEMENTATION_PLAN 7.4, operations.md §9 Dashboard): `DeadmanSender(copies=...)` POSTs the same
 payload to further transports (the Melbourne dashboard's heartbeat listener, src/dashboard/heartbeat.py), after the
 same lease checks. A copy is best effort: its failure is logged (throttled) and never counts as a dead-man failure.
+
+Optional ARM fields (design PR4, §B14, §C2; plan S08): `arm_oldest_undelivered_notification_age_ms`,
+`arm_overdue_positions` and `arm_failed` (the number of FAILED scopes and whether one is global, from memory so it is
+still sent while PostgreSQL is down). They are None until the ARM runs (S32) and are **left out of the JSON while
+None**, so the payload stays byte-identical with the ARM off; the receiver treats an absent key as None (it is
+deployed first and already ignores unknown keys).
 """
 from __future__ import annotations
 
@@ -28,7 +34,7 @@ import contextlib
 import json
 import logging
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 from dataclasses import asdict, dataclass
 from typing import Any, Final, Protocol
@@ -49,6 +55,21 @@ class AdapterBeat:
 
 
 @dataclass(frozen=True)
+class ArmFailedBeat:
+    """The ARM's FAILED scopes (§B14): how many are FAILED, whether one of them is the global ARM scope, and how many
+    episodes PostgreSQL has not recorded (held in this node's memory and spool only; the receiver pages on it and
+    latches it across a leader change, S38c review)."""
+
+    count: int
+    global_failed: bool
+    unrecorded: int = 0
+
+
+#: DeadmanPayload fields sent only when set (src.deadman_receiver.evaluate.OPTIONAL_FIELDS; a test keeps them equal).
+OPTIONAL_PAYLOAD_FIELDS: Final = ("arm_oldest_undelivered_notification_age_ms", "arm_overdue_positions", "arm_failed")
+
+
+@dataclass(frozen=True)
 class DeadmanPayload:
     node: str
     epoch: str | None
@@ -65,11 +86,18 @@ class DeadmanPayload:
     sm5_state: str | None
     spill_bytes: int | None
     degraded: Sequence[str]
+    # optional ARM fields (S08): None until the ARM runs, then sent
+    arm_oldest_undelivered_notification_age_ms: int | None = None
+    arm_overdue_positions: int | None = None
+    arm_failed: ArmFailedBeat | None = None
 
     def to_json(self) -> str:
         d: dict[str, Any] = asdict(self)
         d["adapters"] = {k: asdict(v) for k, v in self.adapters.items()}
         d["degraded"] = list(self.degraded)
+        for name in OPTIONAL_PAYLOAD_FIELDS:
+            if d[name] is None:
+                del d[name]
         return json.dumps(d, separators=(",", ":"), sort_keys=True)
 
 
@@ -112,6 +140,18 @@ class DeadmanSource(Protocol):
 
     def degraded(self) -> Sequence[str]: ...
 
+    def arm_oldest_undelivered_notification_ms(self) -> int | None:
+        """Creation time of the oldest unsent ARM notice (None: the ARM is not running or nothing is unsent)."""
+        ...
+
+    def arm_overdue_positions(self) -> int | None:
+        """Positions with no final decision for more than 2 OPEN bars (None: the ARM is not running)."""
+        ...
+
+    def arm_failed(self) -> ArmFailedBeat | None:
+        """The ARM's FAILED scopes, from memory (None: the ARM is not running)."""
+        ...
+
 
 def _age(now_ms: int, ts: int | None) -> int | None:
     return None if ts is None else max(0, now_ms - ts)
@@ -132,6 +172,8 @@ def build_payload(src: DeadmanSource, now_ms: int) -> DeadmanPayload:
         oldest_undelivered_notification_age_ms=_age(now_ms, src.oldest_undelivered_notification_ms()),
         sm8_state=src.sm8_state(), sm5_state=src.sm5_state(), spill_bytes=src.spill_bytes(),
         degraded=list(src.degraded()),
+        arm_oldest_undelivered_notification_age_ms=_age(now_ms, src.arm_oldest_undelivered_notification_ms()),
+        arm_overdue_positions=src.arm_overdue_positions(), arm_failed=src.arm_failed(),
     )
 
 
@@ -265,7 +307,8 @@ class DeadmanSender:
                  transport: DeadmanTransport | None = None,
                  token_source: Callable[[], str | None] | None = None,
                  on_auth_error: Callable[[], None] | None = None,
-                 copies: Sequence[DeadmanTransport] = ()) -> None:
+                 copies: Sequence[DeadmanTransport] = (),
+                 prepare: Callable[[], Awaitable[None]] | None = None) -> None:
         if transport is None:
             if url is None:
                 raise ValueError("dead-man sender needs a URL or a transport")
@@ -281,6 +324,9 @@ class DeadmanSender:
         self._src = source
         self._lease_valid = lease_valid
         self._is_leader = is_leader
+        # K14: refreshes the source's inputs right before each payload is built (EngineSession.refresh_beat_view:
+        # the halt / epoch fields of gate_state). It bounds and fails closed itself; a raise never stops the beat.
+        self._prepare = prepare
         self._interval = interval_s
         self._clock_ms = clock_ms
         self.sent = 0
@@ -294,6 +340,11 @@ class DeadmanSender:
         if not self._is_leader() or not self._lease_valid():
             self.skipped += 1
             return False
+        if self._prepare is not None:
+            try:
+                await self._prepare()
+            except Exception as exc:          # the source then reports what it last read (fail-closed fields)
+                log.warning("dead-man view refresh raised: %s", type(exc).__name__)
         payload = build_payload(self._src, self._clock_ms())
         if not self._lease_valid():       # synchronous check right before the externally visible send
             self.skipped += 1

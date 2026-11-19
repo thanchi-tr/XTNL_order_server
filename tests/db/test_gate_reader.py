@@ -45,8 +45,9 @@ async def ready(redis: Any, level: str = "NONE", event_id: int = 4) -> None:
     await RedisState(redis, lambda: "run1:7").set_halt_state(level, event_id)
 
 
-def script(conn: FakeConn, *, max_id: int = 4, streams: list[Any] | None = None) -> None:
-    conn.returns(G.SQL_GATE_PG, (7, max_id))
+def script(conn: FakeConn, *, max_id: int = 4, streams: list[Any] | None = None,
+           adapter: str | None = "stonex") -> None:
+    conn.returns(G.SQL_GATE_PG, (7, max_id, adapter))
     conn.returns_all(G.SQL_GATE_STREAMS, streams if streams is not None else
                      [("orders", None, 60_000, 7), ("account", None, 70_000, 7), ("prices", None, 65_000, 7)])
 
@@ -141,3 +142,41 @@ async def test_unknown_latest_open_denies_risk_increasing(conn: FakeConn, redis:
     verdict = await ActionGate(r).check(BUY)
     assert not verdict.allowed and verdict.reason == "latest_open_unknown"
     assert await ActionGate(r).allow(CLOSE)               # risk-reducing actions do not need the calendar
+
+
+async def test_k6_streams_open_and_catchup_are_read_for_the_accounts_own_adapter(conn: FakeConn, redis: Any) -> None:
+    """K6 (oversee-rules.md §8): the account's adapter comes from `adapter_of` in the same round trip; the
+    stream_health rows, latest open and catch-up verdict are read for it, not for the adapter the action names."""
+    await ready(redis)
+    opens: list[str] = []
+    inputs = G.GateInputs(node_epoch=lambda: 7, lease_valid=lambda: True, settle_until_ms=lambda: 0,
+                          sweep_view=lambda a: FRESH, clock_ms=lambda: NOW,
+                          latest_open_ms=lambda a: opens.append(a) or 50_000,
+                          catchup_verified=lambda a: a == "stonex")
+    r = G.TieredGateContextReader(EngineDb(FakeSource(conn), lambda: EPOCH), redis, inputs, run_id)
+    script(conn)
+    ctx = await r.read(BUY)
+    assert ctx.account_adapter_id == "stonex" and evaluate_gate(ctx, BUY).allowed
+    assert conn.args_of(G.SQL_GATE_PG)[-1] == ("ACC",) and conn.args_of(G.SQL_GATE_STREAMS)[-1] == ("stonex",)
+    # An action naming another adapter reads the account's own adapter's inputs and is denied.
+    other = Action(account_id="ACC", adapter_id="pepperstone", risk_increasing=True)
+    script(conn)
+    ctx = await r.read(other)
+    assert conn.args_of(G.SQL_GATE_STREAMS)[-1] == ("stonex",) and opens[-1] == "stonex" and ctx.catchup_verified
+    verdict = evaluate_gate(ctx, other)
+    assert not verdict.allowed and verdict.reason == "adapter_mismatch"
+    # The account's own adapter has an open stream_health row: denied even if the named adapter had none.
+    script(conn, streams=[("orders", 9, 60_000, 7)])
+    verdict = evaluate_gate(await r.read(BUY), BUY)
+    assert not verdict.allowed and verdict.reason == "stream_health_open"
+
+
+async def test_k6_an_account_without_an_adapter_reads_no_streams_and_is_denied(conn: FakeConn, redis: Any) -> None:
+    await ready(redis)
+    script(conn, adapter=None)
+    n = len(conn.args_of(G.SQL_GATE_STREAMS))
+    ctx = await reader(conn, redis, FRESH).read(CLOSE)
+    assert len(conn.args_of(G.SQL_GATE_STREAMS)) == n and ctx.account_adapter_id is None
+    assert ctx.latest_open_ms is None and not ctx.catchup_verified
+    verdict = evaluate_gate(ctx, CLOSE)
+    assert not verdict.allowed and verdict.reason == "account_adapter_unknown"

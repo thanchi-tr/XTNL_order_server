@@ -1,0 +1,58 @@
+// Market data layer: data flow, Redis keys, indicators and SM12, design v11.2. Render: dot -Gdpi=130 -Tpng market_data_flow.dot -o market_data_flow.png
+digraph MD {
+  graph [rankdir=LR, fontname="Segoe UI", fontsize=20, labelloc=t, nodesep=0.4, ranksep=0.7, pad=0.4, compound=true,
+         label="Market data layer (Part A): ticks -> bars -> indicators, Redis only (redis-md)\nBROKER series and their indicators are rebuildable from the broker; TICK series and ticks are best-effort", bgcolor="white"];
+  node  [fontname="Segoe UI", fontsize=11, shape=box, style="rounded,filled", fillcolor="#ffffff", color="#5b6b7f", penwidth=1.2];
+  edge  [fontname="Segoe UI", fontsize=9, color="#5b6b7f", arrowsize=0.7];
+
+  subgraph cluster_in {
+    label="Inputs (read-only)"; style="rounded,filled"; fillcolor="#eef3f8"; color="#9fb3c8"; fontsize=12;
+    ticks  [label="StoneX ticks\n(tradeable, broker-timed,\nno stale snapshots)"];
+    bbars  [label="StoneX broker bars\n(PR3: 1m / 15m, bid + ask)\npriority BARS"];
+  }
+
+  subgraph cluster_build {
+    label="Build (leader only; never blocks ingestion)"; style="rounded,filled"; fillcolor="#eaf6fb"; color="#6fb3d2"; fontsize=12;
+    ring  [label="parser hook (pure, O(1), own circuit)\ntick ring + forming 1m bars + quote"];
+    b1m   [label="TICK series\n1m -> exact roll-ups 5m / 15m / 1h\n(best-effort, per node)"];
+    brk   [label="BROKER series (decision-grade)\nsame store API + Lua as TICK, AOF release\norder: bar -> indicator -> event\nabsent OPEN bucket = blind (coverage map)"];
+    fin   [label="zero trust (A4): hard checks block\nOHLC, slot, side, time, hash on read\ntick-bar cross-check: 3 in a row -> FAILED\nquarantined bar = blind"];
+    ring -> b1m [label="md-writer, every 250 ms"];
+    brk -> fin [arrowhead=none, style=dotted]; b1m -> fin [arrowhead=none, style=dotted];
+  }
+
+  subgraph cluster_ind {
+    label="Indicator engine (demand leases)"; style="rounded,filled"; fillcolor="#f3fbf3"; color="#8fbf8f"; fontsize=12;
+    a13 [label="A13 reset protocol\nreset -> md generation + 1, one INFO notice\nevent id = (series, bar end) + HMAC(OHLC)\nconsumers ack in THEIR OWN store, pull in order\nrollback set: last 8 bar-ends per series (md:rb)\nolder -> re-fetch from StoneX, else FAILED + ping", fillcolor="#fde9e7", color="#c0504d"];
+    lease [label="demand lease  md:demand:{consumer}:{id}\n(TTL, renewed; ARM, later strategies)"];
+    canon [label="canonical value over window W\nexact Decimal; quantised only to store\nincremental = optimisation, checked"];
+    kinds [label="v1: ATR (= ta.atr)\nlater: SMA, EMA, RSI, Bollinger,\nmulti-output, multi-input, any timeframe\nCLOCK(params) drives step(); inputs aligned\nsame / higher (last closed) / lower (child bars)"];
+    lease -> canon; kinds -> canon [style=dashed];
+  }
+
+  rmd [shape=cylinder, fillcolor="#e3f1f8", color="#4f97bd",
+       label="redis-md  (ACL: default off, md_writer, md_reader)\nmd:ticks (2 h)   md:bars:{series} + md:bars_rev\nmd:forming   md:ind:{id} + md:ind_ckpt:{id}\nmd:demand   md:registry (series, ind, leases, stored)\nmd:meta   md:events   md:rb (write_seq re-based on restore)\nmd:writer (token)   md:boot (written last)\nrestart check: INFO run_id on every reconnect"];
+
+  subgraph cluster_out {
+    label="Consumers (MarketDataPort; bucket-addressed reads)"; style="rounded,filled"; fillcolor="#fff8e6"; color="#e0b450"; fontsize=12;
+    arm  [label="ARM (now)\nBROKER bar 0 + ATR(14)\nPOST close, exit quote"];
+    fut  [label="Automated strategies (later)\nany demanded indicator /\ntimeframe, same port", style="rounded,dashed"];
+    dash [label="Dashboard / external\n(md_reader, md:events,\nfreshness by writer epoch)", style="rounded,dashed"];
+  }
+
+  subgraph cluster_sm12 {
+    label="SM12 per series (start-up, leader change, Redis reset, suspend)"; style="rounded,filled"; fillcolor="#f7f7f7"; color="#aaaaaa"; fontsize=12;
+    EMPTY [fillcolor="#eeeeee"]; BACKFILLING [fillcolor="#fff3d6"]; LIVE [fillcolor="#d9f0dc"]; GAPPED [fillcolor="#f8e0e0"];
+    EMPTY -> BACKFILLING [label="BROKER bars"];
+    BACKFILLING -> LIVE [label="continuous to now\n(indicators warm first)"];
+    LIVE -> GAPPED [label="down, sub lost,\nsuspend, outage"];
+    GAPPED -> LIVE [label="BROKER backfilled\n(TICK gaps stay blind)"];
+  }
+
+  ticks -> ring;
+  bbars -> brk [label="md-bars"];
+  b1m -> rmd; brk -> rmd; ring -> rmd [label="ticks + forming", style=dashed];
+  brk -> canon [label="bar_closed / bar_revised"];
+  canon -> rmd [label="value + lineage"];
+  rmd -> arm; rmd -> fut; rmd -> dash;
+}

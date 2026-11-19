@@ -46,6 +46,40 @@ SQL_OWN_TERMS: Final = (
     "FROM leader_terms WHERE node = $1 ORDER BY started_at DESC LIMIT 50"
 )
 
+# --- SAFE_HOLD resume (operations.md §4) ---------------------------------------------------------------------
+# The statement the operator CLI runs (src/ops/sql.py SQL_SAFE_HOLD_RESUME, kept identical by a test). Fenced: $1 =
+# the stored epoch.
+SQL_SAFE_HOLD_RESUME: Final = (
+    "UPDATE cluster_state SET safe_hold = false, last_resume_at = now_ms(), resumed_by = $2::text, "
+    f"updated_at_ms = now_ms() WHERE id = 1 AND safe_hold AND {FENCE} "
+    "RETURNING safe_hold_since, safe_hold_reason, last_resume_at"
+)
+# The single-PC auto-resume's form of it (src/runtime/single_pc.py, XTNL_SINGLE_PC=1 only): it clears only the hold
+# its cool-down and budget were judged for ($3 = that hold's safe_hold_since, $4 = its reason). A newer hold set
+# between the decision and this UPDATE matches no row (the caller then re-judges it), never cleared unjudged.
+SQL_SAFE_HOLD_AUTO_RESUME: Final = (
+    "UPDATE cluster_state SET safe_hold = false, last_resume_at = now_ms(), resumed_by = $2::text, "
+    "updated_at_ms = now_ms() WHERE id = 1 AND safe_hold AND safe_hold_since IS NOT DISTINCT FROM $3::bigint "
+    f"AND safe_hold_reason IS NOT DISTINCT FROM $4::text AND {FENCE} "
+    "RETURNING safe_hold_since, safe_hold_reason, last_resume_at"
+)
+# operator_audit (migration 0007, append-only): the same columns the operator CLI writes (src/ops/sql.py).
+SQL_AUDIT_INSERT: Final = (
+    "INSERT INTO operator_audit (command, target, operator, approver, reason, outcome, detail, epoch, os_user) "
+    "VALUES ($1::text, $2::text, $3::text, $4::text, $5::text, $6::text, $7::text::jsonb, $8::bigint, $9::text) "
+    "RETURNING audit_id, at_ms"
+)
+# The single-PC auto-resume budget: applied SAFE_HOLD resumes written by the auto-resume actor ($1) at or after a time
+# ($2) and after the last applied resume by anyone else (a person's resume starts a fresh budget: the operator has
+# judged the cause, so the next hold is not refused for auto-resumes made before that judgement). Ordered by
+# audit_id (the append-only sequence), never by clock.
+SQL_COUNT_AUTO_RESUMES: Final = (
+    "SELECT count(*) FROM operator_audit a WHERE a.command = 'safe_hold.resume' AND a.operator = $1::text "
+    "AND a.outcome = 'applied' AND a.at_ms >= $2::bigint AND a.audit_id > COALESCE((SELECT max(h.audit_id) "
+    "FROM operator_audit h WHERE h.command = 'safe_hold.resume' AND h.outcome = 'applied' "
+    "AND h.operator <> $1::text), 0)"
+)
+
 
 @dataclass(frozen=True)
 class ClusterStateRow:

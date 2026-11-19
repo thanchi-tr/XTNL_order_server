@@ -94,7 +94,7 @@ class RedisBootstrap:
         self._lock_lost = False
         self.state = BootState.NOT_BOOTED
         self.history: deque[tuple[BootState, BootState, str]] = deque(maxlen=500)  # bounded for 24/7 runs
-        self.signals: list[str] = []
+        self.signals: deque[str] = deque(maxlen=500)   # bounded: NO_BOOT enqueues signal too (K3)
         self.runs = 0
         self.last_ready_ms: int | None = None
 

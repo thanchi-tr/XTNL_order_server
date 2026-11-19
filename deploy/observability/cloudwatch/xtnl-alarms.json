@@ -3657,6 +3657,58 @@
     ]
    }
   },
+  "XtnlCertExpiryNodeAEtcdServer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-a-etcd-server",
+    "AlarmDescription": "etcd-server on node-a expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-server"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-a-etcd-server",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
   "XtnlCertExpiryNodeAPgServer": {
    "Type": "AWS::CloudWatch::Alarm",
    "Properties": {
@@ -3761,6 +3813,214 @@
     ]
    }
   },
+  "XtnlCertExpiryNodeAPatroniEtcdClient": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-a-patroni-etcd-client",
+    "AlarmDescription": "patroni-etcd-client on node-a expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "patroni-etcd-client"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-a-patroni-etcd-client",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeAPatroniCa": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-a-patroni-ca",
+    "AlarmDescription": "patroni-ca on node-a expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "patroni-ca"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-a-patroni-ca",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeARedisProxy": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-a-redis-proxy",
+    "AlarmDescription": "redis-proxy on node-a expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "redis-proxy"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-a-redis-proxy",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeARedisProxyClientCa": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-a-redis-proxy-client-ca",
+    "AlarmDescription": "redis-proxy-client-ca on node-a expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "redis-proxy-client-ca"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-a-redis-proxy-client-ca",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
   "XtnlCertExpiryNodeACa": {
    "Type": "AWS::CloudWatch::Alarm",
    "Properties": {
@@ -3793,6 +4053,214 @@
       "Id": "e1",
       "Expression": "m0",
       "Label": "xtnl-cert-expiry-node-a-ca",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeAEtcdWitnessServer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-a-etcd-witness-server",
+    "AlarmDescription": "etcd-witness-server on node-a expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-witness-server"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-a-etcd-witness-server",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeAEtcdWitnessPeer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-a-etcd-witness-peer",
+    "AlarmDescription": "etcd-witness-peer on node-a expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-witness-peer"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-a-etcd-witness-peer",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeADeadmanReceiver": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-a-deadman-receiver",
+    "AlarmDescription": "deadman-receiver on node-a expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "deadman-receiver"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-a-deadman-receiver",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeADashboardHeartbeat": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-a-dashboard-heartbeat",
+    "AlarmDescription": "dashboard-heartbeat on node-a expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "dashboard-heartbeat"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-a-dashboard-heartbeat",
       "ReturnData": true
      }
     ],
@@ -3917,6 +4385,58 @@
     ]
    }
   },
+  "XtnlCertExpiryNodeBEtcdServer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-b-etcd-server",
+    "AlarmDescription": "etcd-server on node-b expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-server"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-b-etcd-server",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
   "XtnlCertExpiryNodeBPgServer": {
    "Type": "AWS::CloudWatch::Alarm",
    "Properties": {
@@ -4021,6 +4541,214 @@
     ]
    }
   },
+  "XtnlCertExpiryNodeBPatroniEtcdClient": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-b-patroni-etcd-client",
+    "AlarmDescription": "patroni-etcd-client on node-b expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "patroni-etcd-client"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-b-patroni-etcd-client",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeBPatroniCa": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-b-patroni-ca",
+    "AlarmDescription": "patroni-ca on node-b expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "patroni-ca"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-b-patroni-ca",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeBRedisProxy": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-b-redis-proxy",
+    "AlarmDescription": "redis-proxy on node-b expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "redis-proxy"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-b-redis-proxy",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeBRedisProxyClientCa": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-b-redis-proxy-client-ca",
+    "AlarmDescription": "redis-proxy-client-ca on node-b expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "redis-proxy-client-ca"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-b-redis-proxy-client-ca",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
   "XtnlCertExpiryNodeBCa": {
    "Type": "AWS::CloudWatch::Alarm",
    "Properties": {
@@ -4061,6 +4789,2090 @@
     "EvaluationPeriods": 1,
     "DatapointsToAlarm": 1,
     "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeBEtcdWitnessServer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-b-etcd-witness-server",
+    "AlarmDescription": "etcd-witness-server on node-b expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-witness-server"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-b-etcd-witness-server",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeBEtcdWitnessPeer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-b-etcd-witness-peer",
+    "AlarmDescription": "etcd-witness-peer on node-b expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-witness-peer"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-b-etcd-witness-peer",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeBDeadmanReceiver": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-b-deadman-receiver",
+    "AlarmDescription": "deadman-receiver on node-b expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "deadman-receiver"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-b-deadman-receiver",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertExpiryNodeBDashboardHeartbeat": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-expiry-node-b-dashboard-heartbeat",
+    "AlarmDescription": "dashboard-heartbeat on node-b expires within 30 days",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_expires_in_seconds",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "dashboard-heartbeat"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-expiry-node-b-dashboard-heartbeat",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 2592000,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "TreatMissingData": "missing",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeAEtcdClient": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-etcd-client",
+    "AlarmDescription": "etcd-client on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-client"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-etcd-client",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeAEtcdClientNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeAEtcdClient",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-etcd-client-notify",
+    "AlarmDescription": "etcd-client on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-etcd-client\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeAEtcdPeer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-etcd-peer",
+    "AlarmDescription": "etcd-peer on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-peer"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-etcd-peer",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeAEtcdPeerNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeAEtcdPeer",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-etcd-peer-notify",
+    "AlarmDescription": "etcd-peer on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-etcd-peer\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeAEtcdServer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-etcd-server",
+    "AlarmDescription": "etcd-server on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-server"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-etcd-server",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeAEtcdServerNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeAEtcdServer",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-etcd-server-notify",
+    "AlarmDescription": "etcd-server on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-etcd-server\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeAPgServer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-pg-server",
+    "AlarmDescription": "pg-server on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "pg-server"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-pg-server",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeAPgServerNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeAPgServer",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-pg-server-notify",
+    "AlarmDescription": "pg-server on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-pg-server\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeAPatroniRest": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-patroni-rest",
+    "AlarmDescription": "patroni-rest on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "patroni-rest"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-patroni-rest",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeAPatroniRestNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeAPatroniRest",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-patroni-rest-notify",
+    "AlarmDescription": "patroni-rest on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-patroni-rest\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeAPatroniEtcdClient": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-patroni-etcd-client",
+    "AlarmDescription": "patroni-etcd-client on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "patroni-etcd-client"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-patroni-etcd-client",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeAPatroniEtcdClientNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeAPatroniEtcdClient",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-patroni-etcd-client-notify",
+    "AlarmDescription": "patroni-etcd-client on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-patroni-etcd-client\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeAPatroniCa": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-patroni-ca",
+    "AlarmDescription": "patroni-ca on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "patroni-ca"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-patroni-ca",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeAPatroniCaNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeAPatroniCa",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-patroni-ca-notify",
+    "AlarmDescription": "patroni-ca on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-patroni-ca\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeARedisProxy": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-redis-proxy",
+    "AlarmDescription": "redis-proxy on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "redis-proxy"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-redis-proxy",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeARedisProxyNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeARedisProxy",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-redis-proxy-notify",
+    "AlarmDescription": "redis-proxy on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-redis-proxy\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeARedisProxyClientCa": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-redis-proxy-client-ca",
+    "AlarmDescription": "redis-proxy-client-ca on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "redis-proxy-client-ca"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-redis-proxy-client-ca",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeARedisProxyClientCaNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeARedisProxyClientCa",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-redis-proxy-client-ca-notify",
+    "AlarmDescription": "redis-proxy-client-ca on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-redis-proxy-client-ca\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeACa": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-ca",
+    "AlarmDescription": "ca on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "ca"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-ca",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeACaNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeACa",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-ca-notify",
+    "AlarmDescription": "ca on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-ca\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeAEtcdWitnessServer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-etcd-witness-server",
+    "AlarmDescription": "etcd-witness-server on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-witness-server"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-etcd-witness-server",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeAEtcdWitnessServerNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeAEtcdWitnessServer",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-etcd-witness-server-notify",
+    "AlarmDescription": "etcd-witness-server on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-etcd-witness-server\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeAEtcdWitnessPeer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-etcd-witness-peer",
+    "AlarmDescription": "etcd-witness-peer on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-witness-peer"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-etcd-witness-peer",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeAEtcdWitnessPeerNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeAEtcdWitnessPeer",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-etcd-witness-peer-notify",
+    "AlarmDescription": "etcd-witness-peer on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-etcd-witness-peer\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeADeadmanReceiver": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-deadman-receiver",
+    "AlarmDescription": "deadman-receiver on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "deadman-receiver"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-deadman-receiver",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeADeadmanReceiverNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeADeadmanReceiver",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-deadman-receiver-notify",
+    "AlarmDescription": "deadman-receiver on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-deadman-receiver\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeADashboardHeartbeat": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-dashboard-heartbeat",
+    "AlarmDescription": "dashboard-heartbeat on node-a unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         },
+         {
+          "Name": "cert",
+          "Value": "dashboard-heartbeat"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-a-dashboard-heartbeat",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeADashboardHeartbeatNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeADashboardHeartbeat",
+    "XtnlEngineDownNodeA"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-a-dashboard-heartbeat-notify",
+    "AlarmDescription": "dashboard-heartbeat on node-a unreadable, not verifying or not exported (held back while xtnl-engine-down-node-a is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-a-dashboard-heartbeat\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-a",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBEtcdClient": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-etcd-client",
+    "AlarmDescription": "etcd-client on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-client"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-etcd-client",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBEtcdClientNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBEtcdClient",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-etcd-client-notify",
+    "AlarmDescription": "etcd-client on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-etcd-client\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBEtcdPeer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-etcd-peer",
+    "AlarmDescription": "etcd-peer on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-peer"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-etcd-peer",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBEtcdPeerNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBEtcdPeer",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-etcd-peer-notify",
+    "AlarmDescription": "etcd-peer on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-etcd-peer\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBEtcdServer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-etcd-server",
+    "AlarmDescription": "etcd-server on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-server"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-etcd-server",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBEtcdServerNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBEtcdServer",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-etcd-server-notify",
+    "AlarmDescription": "etcd-server on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-etcd-server\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBPgServer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-pg-server",
+    "AlarmDescription": "pg-server on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "pg-server"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-pg-server",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBPgServerNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBPgServer",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-pg-server-notify",
+    "AlarmDescription": "pg-server on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-pg-server\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBPatroniRest": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-patroni-rest",
+    "AlarmDescription": "patroni-rest on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "patroni-rest"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-patroni-rest",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBPatroniRestNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBPatroniRest",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-patroni-rest-notify",
+    "AlarmDescription": "patroni-rest on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-patroni-rest\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBPatroniEtcdClient": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-patroni-etcd-client",
+    "AlarmDescription": "patroni-etcd-client on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "patroni-etcd-client"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-patroni-etcd-client",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBPatroniEtcdClientNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBPatroniEtcdClient",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-patroni-etcd-client-notify",
+    "AlarmDescription": "patroni-etcd-client on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-patroni-etcd-client\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBPatroniCa": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-patroni-ca",
+    "AlarmDescription": "patroni-ca on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "patroni-ca"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-patroni-ca",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBPatroniCaNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBPatroniCa",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-patroni-ca-notify",
+    "AlarmDescription": "patroni-ca on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-patroni-ca\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBRedisProxy": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-redis-proxy",
+    "AlarmDescription": "redis-proxy on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "redis-proxy"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-redis-proxy",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBRedisProxyNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBRedisProxy",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-redis-proxy-notify",
+    "AlarmDescription": "redis-proxy on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-redis-proxy\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBRedisProxyClientCa": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-redis-proxy-client-ca",
+    "AlarmDescription": "redis-proxy-client-ca on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "redis-proxy-client-ca"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-redis-proxy-client-ca",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBRedisProxyClientCaNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBRedisProxyClientCa",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-redis-proxy-client-ca-notify",
+    "AlarmDescription": "redis-proxy-client-ca on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-redis-proxy-client-ca\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBCa": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-ca",
+    "AlarmDescription": "ca on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "ca"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-ca",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBCaNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBCa",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-ca-notify",
+    "AlarmDescription": "ca on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-ca\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBEtcdWitnessServer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-etcd-witness-server",
+    "AlarmDescription": "etcd-witness-server on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-witness-server"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-etcd-witness-server",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBEtcdWitnessServerNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBEtcdWitnessServer",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-etcd-witness-server-notify",
+    "AlarmDescription": "etcd-witness-server on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-etcd-witness-server\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBEtcdWitnessPeer": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-etcd-witness-peer",
+    "AlarmDescription": "etcd-witness-peer on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "etcd-witness-peer"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-etcd-witness-peer",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBEtcdWitnessPeerNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBEtcdWitnessPeer",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-etcd-witness-peer-notify",
+    "AlarmDescription": "etcd-witness-peer on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-etcd-witness-peer\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBDeadmanReceiver": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-deadman-receiver",
+    "AlarmDescription": "deadman-receiver on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "deadman-receiver"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-deadman-receiver",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBDeadmanReceiverNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBDeadmanReceiver",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-deadman-receiver-notify",
+    "AlarmDescription": "deadman-receiver on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-deadman-receiver\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlCertUnreadableNodeBDashboardHeartbeat": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-dashboard-heartbeat",
+    "AlarmDescription": "dashboard-heartbeat on node-b unreadable, not verifying or not exported",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_cert_readable",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         },
+         {
+          "Name": "cert",
+          "Value": "dashboard-heartbeat"
+         }
+        ]
+       },
+       "Period": 300,
+       "Stat": "Minimum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-cert-unreadable-node-b-dashboard-heartbeat",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "TreatMissingData": "breaching"
+   }
+  },
+  "XtnlCertUnreadableNodeBDashboardHeartbeatNotify": {
+   "Type": "AWS::CloudWatch::CompositeAlarm",
+   "DependsOn": [
+    "XtnlCertUnreadableNodeBDashboardHeartbeat",
+    "XtnlEngineDownNodeB"
+   ],
+   "Properties": {
+    "AlarmName": "xtnl-cert-unreadable-node-b-dashboard-heartbeat-notify",
+    "AlarmDescription": "dashboard-heartbeat on node-b unreadable, not verifying or not exported (held back while xtnl-engine-down-node-b is in ALARM)",
+    "AlarmRule": "ALARM(\"xtnl-cert-unreadable-node-b-dashboard-heartbeat\")",
+    "ActionsSuppressor": "xtnl-engine-down-node-b",
+    "ActionsSuppressorWaitPeriod": 60,
+    "ActionsSuppressorExtensionPeriod": 600,
     "AlarmActions": [
      {
       "Ref": "SnsWarningTopicArn"
@@ -4415,6 +7227,168 @@
     "ActionsSuppressor": "xtnl-epoch-change-settling",
     "ActionsSuppressorWaitPeriod": 60,
     "ActionsSuppressorExtensionPeriod": 30,
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlArmFailed": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-arm-failed",
+    "AlarmDescription": "ARM FAILED scopes > 0",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_arm_failed_scopes",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         }
+        ]
+       },
+       "Period": 10,
+       "Stat": "Maximum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "m1",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_arm_failed_scopes",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         }
+        ]
+       },
+       "Period": 10,
+       "Stat": "Maximum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "MAX([FILL(m0, 0), FILL(m1, 0)])",
+      "Label": "xtnl-arm-failed",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "GreaterThanThreshold",
+    "Threshold": 0,
+    "EvaluationPeriods": 6,
+    "DatapointsToAlarm": 6,
+    "TreatMissingData": "notBreaching",
+    "AlarmActions": [
+     {
+      "Ref": "SnsCriticalTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsCriticalTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlRedisMdMemoryNodeA": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-redis-md-memory-node-a",
+    "AlarmDescription": "redis-md on node-a > 70 % of maxmemory",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_md_redis_used_memory_ratio",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-a"
+         }
+        ]
+       },
+       "Period": 60,
+       "Stat": "Maximum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-redis-md-memory-node-a",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "GreaterThanThreshold",
+    "Threshold": 0.7,
+    "EvaluationPeriods": 2,
+    "DatapointsToAlarm": 2,
+    "TreatMissingData": "notBreaching",
+    "AlarmActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ],
+    "OKActions": [
+     {
+      "Ref": "SnsWarningTopicArn"
+     }
+    ]
+   }
+  },
+  "XtnlRedisMdMemoryNodeB": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmName": "xtnl-redis-md-memory-node-b",
+    "AlarmDescription": "redis-md on node-b > 70 % of maxmemory",
+    "Metrics": [
+     {
+      "Id": "m0",
+      "MetricStat": {
+       "Metric": {
+        "Namespace": "XTNL",
+        "MetricName": "xtnl_md_redis_used_memory_ratio",
+        "Dimensions": [
+         {
+          "Name": "node",
+          "Value": "node-b"
+         }
+        ]
+       },
+       "Period": 60,
+       "Stat": "Maximum"
+      },
+      "ReturnData": false
+     },
+     {
+      "Id": "e1",
+      "Expression": "m0",
+      "Label": "xtnl-redis-md-memory-node-b",
+      "ReturnData": true
+     }
+    ],
+    "ComparisonOperator": "GreaterThanThreshold",
+    "Threshold": 0.7,
+    "EvaluationPeriods": 2,
+    "DatapointsToAlarm": 2,
+    "TreatMissingData": "notBreaching",
     "AlarmActions": [
      {
       "Ref": "SnsWarningTopicArn"

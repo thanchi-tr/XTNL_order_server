@@ -70,12 +70,28 @@ CONTRACT: Final[Mapping[str, tuple[MetricType, tuple[str, ...]]]] = {
     "xtnl_token_age_seconds": ("gauge", ("adapter",)),
     "xtnl_token_expires_in_seconds": ("gauge", ("adapter",)),
     "xtnl_cert_expires_in_seconds": ("gauge", ("cert",)),
+    "xtnl_cert_readable": ("gauge", ("cert",)),
     # engine uptime + downtime catch-up (migration 0012; src/runtime/uptime.py, src/runtime/catchup.py)
     "xtnl_engine_uptime_seconds": ("gauge", ()),
     "xtnl_suspended_gaps_total": ("counter", ()),
     "xtnl_offline_gap_seconds": ("gauge", ()),
     "xtnl_catchup_runs_total": ("counter", ("adapter", "complete")),
     "xtnl_catchup_rows_total": ("counter", ("adapter", "kind")),
+    # optional market-data and ARM services (plan S32; absent while XTNL_MD_ENABLED / XTNL_ARM_ENABLED are off)
+    "xtnl_md_series": ("gauge", ("state",)),
+    "xtnl_md_indicators": ("gauge", ("state",)),
+    "xtnl_md_aof_wait_timeouts_total": ("counter", ()),
+    "xtnl_md_events_total": ("counter", ("component", "event")),
+    # plan S37: the rest of the design §C2 list that the term's objects already hold
+    "xtnl_md_redis_used_memory_ratio": ("gauge", ()),
+    "xtnl_md_shed_step": ("gauge", ()),
+    "xtnl_md_queue_depth": ("gauge", ("queue",)),
+    "xtnl_arm_positions": ("gauge", ("view",)),
+    "xtnl_arm_paused": ("gauge", ()),
+    "xtnl_arm_failed_scopes": ("gauge", ()),
+    "xtnl_arm_failed_global": ("gauge", ()),
+    "xtnl_arm_oldest_undelivered_notice_age_seconds": ("gauge", ()),
+    "xtnl_arm_events_total": ("counter", ("component", "event")),
 }
 
 HELP: Final[Mapping[str, str]] = {

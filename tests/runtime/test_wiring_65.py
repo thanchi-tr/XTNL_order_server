@@ -135,6 +135,34 @@ async def test_dlq_check_before_retry_reads_run_at_dlq_priority(built: Built) ->
     assert [p for _, p in built.adapter.rest_calls] == [RestPriority.DLQ] * 3
 
 
+async def test_account_refreshes_re_read_with_origin_snapshot(built: Built) -> None:
+    """Plan S04 (design PR8): the SM8 in-place and PRE_OPEN account refreshes are snapshot reads, the DLQ
+    check-before-retry re-reads are `dlq`."""
+    from decimal import Decimal
+
+    from src.dto import AccountDTO
+    from src.runtime.session import _ReadinessActions
+
+    s = built.session
+    o = s.orchestrator
+    rt = o.runtime("mock")
+    rt.conn.state = ConnState.STREAMING
+    rt.accounts["ACC-65"] = AccountDTO(account_id="ACC-65", adapter_id="mock", currency="AUD", balance=Decimal(1))
+    calls: list[tuple[str, str, str]] = []
+    real = o.reread_entity
+
+    async def spy(adapter_id: str, event_type: Any, entity_id: str, origin: Any = "dlq") -> Any:
+        calls.append((event_type, entity_id, origin))
+        return await real(adapter_id, event_type, entity_id, origin)
+
+    o.reread_entity = spy  # type: ignore[method-assign]
+    await s._refresh_all_accounts()
+    await _ReadinessActions(s).refresh_account_snapshot("mock")
+    bridge = s.dlq_worker._broker
+    await bridge.reread_entity("mock", "ORDER", "nope")
+    assert calls == [("ACCOUNT", "ACC-65", "snapshot"), ("ACCOUNT", "ACC-65", "snapshot"), ("ORDER", "nope", "dlq")]
+
+
 async def test_untagged_re_reads_stay_at_reconcile_priority(built: Built) -> None:
     """SM8 / readiness account re-reads (and every snapshot / resync) are reconcile-class: not demoted."""
     await built.session.orchestrator.reread_entity("mock", "ACCOUNT", "nope")
@@ -362,6 +390,34 @@ def test_a_rotated_adapter_shares_the_bucket_and_new_limits_replace_it(caplog: p
         c = make_adapter(faster, check, budgets=budgets)
     assert c.rest_budget is not a.rest_budget and c.rest_budget is not None and c.rest_budget.rate_per_s == 8.0
     assert "REST limits changed" in caplog.text
+
+
+def test_the_bars_cap_comes_from_the_settings_and_a_changed_cap_keeps_the_bucket() -> None:
+    """S06 (design PR11): the per-adapter BARS cap; default a quarter of the rate, `STONE_X_REST_BARS_PER_MIN`
+    overrides it, and an unreadable value keeps the default instead of stopping start-up. A cap-only change is
+    set in place: the bucket keeps its tokens, request counts and outcome counters (no fresh full bucket)."""
+    budgets = RestBudgets()
+    check = LeaseCheck(lambda: True)
+    a = make_adapter(_plan_for("stonex", STONEX), check, budgets=budgets)
+    assert a.rest_budget is not None and a.rest_budget.bars_per_min == 75
+    budget = a.rest_budget
+    budget.spend(RestPriority.DLQ)
+    budget.note_result(RestPriority.DLQ, False)
+    tokens = budget.tokens()
+    bad = make_adapter(_plan_for("stonex", {**STONEX, "STONE_X_REST_BARS_PER_MIN": "lots"}), check, budgets=budgets)
+    assert bad.rest_budget is budget
+    capped = make_adapter(_plan_for("stonex", {**STONEX, "STONE_X_REST_BARS_PER_MIN": "20"}), check,
+                          budgets=budgets)
+    assert capped.rest_budget is budget and budget.bars_per_min == 20
+    st = budget.stats()
+    assert st.requests["dlq"] == 1 and st.outcomes["dlq"].failed == 1 and budget.tokens() <= tokens + 1.0
+    # Above half the rate (150/min at 5/s) the cap is clamped, and the same clamped value keeps the bucket.
+    huge = make_adapter(_plan_for("stonex", {**STONEX, "STONE_X_REST_BARS_PER_MIN": "100000"}), check,
+                        budgets=budgets)
+    assert huge.rest_budget is budget and budget.bars_per_min == 150
+    again = make_adapter(_plan_for("stonex", {**STONEX, "STONE_X_REST_BARS_PER_MIN": "100000"}), check,
+                         budgets=budgets)
+    assert again.rest_budget is budget and budget.bars_per_min == 150
 
 
 def test_the_default_session_timings_settle_for_rto_plus_30_s() -> None:

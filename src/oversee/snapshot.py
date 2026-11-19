@@ -131,7 +131,6 @@ class AccountSnapshot:
     # Leader terms [start, end or None] near the roll (only read when the day's sod row is missing). When given,
     # the leaderless test runs per held symbol from its own reference point (dayroll.build_sod_mark).
     leader_terms: tuple[tuple[int, int | None], ...] | None = None
-    cash_flow_request_pending: bool = False             # set by the RiskSweep, not the reader
 
 
 class DependencyUnavailable(Exception):

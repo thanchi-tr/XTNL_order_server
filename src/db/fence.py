@@ -18,6 +18,9 @@ operations.md §3), and the bump terminates older-epoch backends after it commit
 """
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Final
 
 from src.db.pg import PgConnection, Row, rowcount
@@ -25,6 +28,11 @@ from src.db.pg import PgConnection, Row, rowcount
 #: The fence predicate. Append with AND / WHERE; `$1` is the caller's epoch.
 FENCE: Final = "(SELECT epoch FROM engine_epoch WHERE id = 1) = $1::bigint"
 SQL_CHECK_EPOCH: Final = "SELECT (SELECT epoch FROM engine_epoch WHERE id = 1)"
+#: Savepoints (ST-2). One fixed name: PostgreSQL resolves a repeated name to the most recent savepoint, so nested
+#: `FencedTx.savepoint()` blocks release and roll back in LIFO order.
+SQL_SAVEPOINT: Final = "SAVEPOINT xtnl_sp"
+SQL_RELEASE_SAVEPOINT: Final = "RELEASE SAVEPOINT xtnl_sp"
+SQL_ROLLBACK_TO_SAVEPOINT: Final = "ROLLBACK TO SAVEPOINT xtnl_sp"
 
 
 class EpochMismatch(RuntimeError):
@@ -51,6 +59,7 @@ class FencedTx:
       `must=True`: 0 rows can only mean a lost fence -> EpochMismatch. `must=False`: 0 rows is
       re-checked; a lost fence raises, otherwise 0 is returned to the caller.
     * `write_returning(sql, *args)`: the same for `... RETURNING` statements (one row or None).
+    * `savepoint()`: a nested block whose writes are undone on error while the transaction carries on.
     * `execute` / `fetchrow` / `fetch`: unfenced reads (and the named exceptions) on the same connection.
     """
 
@@ -80,6 +89,26 @@ class FencedTx:
         if must:
             raise EpochMismatch(f"fenced write affected 0 rows (epoch {self.epoch}): {sql[:60]}")
         await assert_epoch(self.conn, self.epoch)
+
+    @asynccontextmanager
+    async def _savepoint(self) -> AsyncIterator[FencedTx]:
+        await self.conn.execute(SQL_SAVEPOINT)
+        try:
+            yield self
+        except BaseException:
+            # undo only the block's statements; the outer transaction stays usable. A failure here (connection
+            # lost) never hides the block's own error: the outer transaction rolls back anyway.
+            with contextlib.suppress(Exception):
+                await self.conn.execute(SQL_ROLLBACK_TO_SAVEPOINT)
+                await self.conn.execute(SQL_RELEASE_SAVEPOINT)
+            raise
+        await self.conn.execute(SQL_RELEASE_SAVEPOINT)
+
+    def savepoint(self) -> AbstractAsyncContextManager[FencedTx]:
+        """A nested unit inside this transaction (ST-2): `SAVEPOINT`, then `RELEASE` when the block ends normally,
+        or `ROLLBACK TO` + `RELEASE` and the error re-raised when it raises, so the block's writes are undone and
+        the outer transaction carries on. Savepoints nest (the same name refers to the most recent one)."""
+        return self._savepoint()
 
     async def execute(self, sql: str, *args: object) -> str:
         return await self.conn.execute(sql, *args)

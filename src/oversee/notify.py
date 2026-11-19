@@ -33,6 +33,9 @@ EMAIL: Final = "email"
 MOBILE_PUSH: Final = "mobile_push"
 KNOWN_CHANNELS: Final = (EMAIL, MOBILE_PUSH)
 ESCALATED_TOKEN: Final = "+escalated"   # marker in the outbox `channels` column (SM6 ESCALATED)
+#: The outbox kind of ARM notices (PR4, migration 0016). They share notification_outbox but are delivered by the
+#: ARM relay's own store; every Oversee outbox read skips them. Not an AlertKind: Oversee never writes one.
+ARM_OUTBOX_KIND: Final[str] = "arm"
 
 
 def channels_for(severity: Severity) -> tuple[str, ...]:

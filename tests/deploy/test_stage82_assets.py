@@ -44,7 +44,8 @@ def test_dashboard_install_deploys_the_heartbeat_listener() -> None:
     assert "deploy/env/dashboard-heartbeat.json.example" in sec
     assert "XTNL_HEARTBEAT_COPY_TOKEN" in sec and "XTNL_HEARTBEAT_COPY_URL" in sec
     # the directory the unit's user traverses, and a readability check as that user
-    assert "install -d -m 0750 -o root -g xtnl /etc/xtnl /etc/xtnl/dashboard" in sec
+    # (0751, K5: others may traverse, not list, so the receiver can read the public Redis client certificate)
+    assert "install -d -m 0751 -o root -g xtnl /etc/xtnl /etc/xtnl/dashboard" in sec
     assert f"sudo -u xtnl test -r {hb}" in sec
     # firewall: 8444 from node A and node B only
     assert str(H.DEFAULT_HEARTBEAT_PORT) == "8444"
@@ -127,5 +128,7 @@ def test_receiver_rotation_waits_for_the_receiver_and_keeps_next_out_of_the_env_
     rb = _section(_text(RUNBOOKS / "deadman-alert.md"), "## Token rotation")
     assert "tokens rotated: current + next" in rb
     src = _text(ROOT / "src" / "deadman_receiver" / "tokens.py")
-    assert "dead-man receiver tokens rotated: %s" in src and '"current + next" if new.next' in src
+    # K10: the message names its ring (label "dead-man receiver" here, "dashboard heartbeat" on the dashboard)
+    assert '"%s tokens rotated: %s;' in src and 'label: str = "dead-man receiver"' in src
+    assert '"current + next" if new.next' in src
     assert f"keep `{T.TOKEN_NEXT_VAR}` out of `/etc/xtnl/deadman-receiver.env`" in rb

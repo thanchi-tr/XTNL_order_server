@@ -30,7 +30,7 @@ def mapper(known: dict[str, InstrumentSpec] | None = None) -> OrderStreamMapper:
                              account_for=lambda t: CLIENT if t in (TRADING, None) else None)
 
 
-def frame(order_id: str, status: str, *, type_: str = "1", direction: str = "1", qty: str | None = "10000",
+def frame(order_id: str, status: str, *, type_: str | None = "1", direction: str = "1", qty: str | None = "10000",
           orig: str | None = None, open_price: str | None = "1.08500", exec_price: str | None = "0",
           ts: int = T0, market: str = EURUSD_ID) -> dict[str, str | None]:
     return {"OrderId": order_id, "Direction": direction, "Type": type_, "ExecutionPrice": exec_price,
@@ -208,3 +208,53 @@ def test_unmappable_items_raise(bad: dict[str, str | None]) -> None:
     values = frame("950", "2") | bad
     with pytest.raises(UnmappableError):
         run(m, values)
+
+
+# --- order_kind (design PR1) -----------------------------------------------------------------------
+def test_stream_items_carry_the_order_kind_of_their_type() -> None:
+    m = mapper()
+    m.learn_parent("1001", "1000")
+    m.learn_parent("1002", "1000")
+    run(m, frame("1000", "3", type_="1"))
+    (stop,) = run(m, frame("1001", "2", type_="2", direction="0", ts=T0 + 1))
+    (limit,) = run(m, frame("1002", "2", type_="3", direction="0", ts=T0 + 1))
+    assert isinstance(stop, OrderDTO) and stop.order_kind == "STOP"
+    assert isinstance(limit, OrderDTO) and limit.order_kind == "LIMIT"
+    (trade,) = orders(run(m, frame("1003", "3", type_="1", ts=T0 + 2)))
+    assert trade.order_kind is None
+
+
+def test_an_item_without_type_keeps_the_memo_type() -> None:
+    m = mapper()
+    m.learn_parent("1101", "1100")
+    run(m, frame("1101", "2", type_="2", direction="0"))
+    (moved,) = run(m, frame("1101", "2", type_=None, direction="0", open_price="1.08500", ts=T0 + 1))
+    assert isinstance(moved, OrderDTO) and moved.order_kind == "STOP"
+    (filled,) = run(m, frame("1101", "9", type_="", direction="0", ts=T0 + 2))
+    assert isinstance(filled, OrderDTO) and filled.order_kind == "STOP"
+
+
+def test_a_rest_read_teaches_the_type_to_a_later_untyped_item() -> None:
+    m = mapper()
+    rest = OrderDTO(client_order_id="1201", broker_order_id="1201", account_id=CLIENT, adapter_id="stonex",
+                    symbol="EURUSD", side="SELL", status=OrderStatus.WORKING, entry_price=Decimal("1.08"),
+                    ordered_units=Decimal(10000), remaining_units=Decimal(10000), raw_qty=Decimal(10000),
+                    is_reduce_only=True, linked_position_id="1200", source="REST", order_kind="LIMIT")
+    m.learn_order(rest, EURUSD_ID)
+    (item,) = run(m, frame("1201", "2", type_=None, direction="0", ts=T0 + 1))
+    assert isinstance(item, OrderDTO) and item.order_kind == "LIMIT" and item.linked_position_id == "1200"
+
+
+def test_in7_an_item_with_open_price_empty_re_emits_the_last_known_level() -> None:
+    """IN-7, documented here and decided by the PR3 probe (S39): ORDER_FIELDS has no TriggerPrice, so an ORDERS
+    item whose OpenPrice is empty or 0 carries the level last seen for that order. If StoneX moves a stop without
+    sending its new level in OpenPrice, the stream re-emits the old level until a REST read corrects it."""
+    m = mapper()
+    m.learn_parent("1301", "1300")
+    run(m, frame("1301", "2", type_="2", direction="0", open_price="1.08000"))
+    (moved,) = run(m, frame("1301", "2", type_="2", direction="0", open_price="1.08200", ts=T0 + 1))
+    assert isinstance(moved, OrderDTO) and moved.entry_price == Decimal("1.08200")
+    for empty in (None, "", "0"):
+        (again,) = run(m, frame("1301", "2", type_="2", direction="0", open_price=empty, ts=T0 + 2))
+        assert isinstance(again, OrderDTO) and again.entry_price == Decimal("1.08200")
+        assert again.order_kind == "STOP"

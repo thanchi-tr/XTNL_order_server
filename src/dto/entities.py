@@ -1,7 +1,11 @@
 """Canonical, immutable DTOs (dto-contracts.md §3). Money and quantities are Decimal.
 
 `checksum` is derived from the broker payload fields at construction and excludes the
-version fields and seq_id, so re-labelling (dataclasses.replace) never changes it.
+version fields and seq_id, so re-labelling (dataclasses.replace) never changes it. The optional
+payload fields added for the ARM prerequisites (`order_kind`, the InstrumentSpec metadata) count
+only when set, and the version labels `origin` / `broker_time_source` never count
+(src/dto/versioning.py OPTIONAL_PAYLOAD_FIELDS, NON_PAYLOAD_FIELDS); every producer leaves them None
+until its stage sets them.
 Adapters leave `observed_seq` and `seq_id` at 0; the ingestion orchestrator stamps them.
 """
 from __future__ import annotations
@@ -11,12 +15,18 @@ from decimal import Decimal
 from enum import Enum
 from typing import Literal
 
-from src.dto.versioning import Source, payload_checksum
+from src.dto.versioning import BrokerTimeSource, Origin, Source, payload_checksum
 
 Side = Literal["BUY", "SELL"]
 PositionStatus = Literal["OPEN", "CLOSED"]
 CashFlowKind = Literal["DEPOSIT", "WITHDRAWAL", "TRADE_PNL", "FINANCING", "COMMISSION", "ADJUSTMENT"]
 UnitKind = Literal["UNITS", "CENTI_UNITS", "LOTS", "CONTRACTS", "STAKE"]
+#: Broker order type of a child / working order (design PR1): a STOP counts as a stop at any price, a LIMIT
+#: never does; None = not known (today's rule applies).
+OrderKind = Literal["STOP", "LIMIT"]
+ORDER_KINDS: frozenset[str] = frozenset({"STOP", "LIMIT"})
+#: Where PriceDTO.timestamp_ms came from (design PR2): the broker's own tick time or the local receipt time.
+TsSource = Literal["BROKER", "RECEIPT"]
 TRANSFER_KINDS: frozenset[str] = frozenset({"DEPOSIT", "WITHDRAWAL"})
 
 
@@ -74,9 +84,12 @@ class OrderDTO:
     raw_qty: Decimal | None = None
     is_reduce_only: bool = False
     linked_position_id: str | None = None
+    order_kind: OrderKind | None = None   # PR1; optional payload field (checksum-neutral while None)
     broker_updated_at_ms: int = 0
     broker_seq: int | None = None
     source: Source = "STREAM"
+    origin: Origin | None = None                         # PR8 version label, non-payload
+    broker_time_source: BrokerTimeSource | None = None   # PR8 version label, non-payload
     observed_seq: int = 0
     seq_id: int = 0
     checksum: str = field(init=False, default="", compare=False)
@@ -111,6 +124,8 @@ class PositionDTO:
     broker_updated_at_ms: int = 0
     broker_seq: int | None = None
     source: Source = "STREAM"
+    origin: Origin | None = None                         # PR8 version label, non-payload
+    broker_time_source: BrokerTimeSource | None = None   # PR8 version label, non-payload
     observed_seq: int = 0
     seq_id: int = 0
     checksum: str = field(init=False, default="", compare=False)
@@ -137,6 +152,8 @@ class AccountDTO:
     broker_updated_at_ms: int = 0
     broker_seq: int | None = None
     source: Source = "STREAM"
+    origin: Origin | None = None                         # PR8 version label, non-payload
+    broker_time_source: BrokerTimeSource | None = None   # PR8 version label, non-payload
     observed_seq: int = 0
     seq_id: int = 0
     checksum: str = field(init=False, default="", compare=False)
@@ -195,6 +212,8 @@ class PriceDTO:
     seq_id: int = 0
     broker_market_id: str | None = None
     tradeable: bool = True
+    ts_source: TsSource | None = None   # PR2: what timestamp_ms is; None = not stated by the producer
+    received_ms: int | None = None      # PR2: local receipt time on the stream thread
 
     @property
     def mid(self) -> Decimal:
@@ -214,6 +233,11 @@ class InstrumentSpec:
     min_qty: Decimal
     swap_booked_to_balance: bool
     broker_symbol: str = ""   # broker-native id, e.g. the StoneX MarketId
+    # PR7 instrument metadata (not market data); optional payload fields, checksum-neutral while None. Never
+    # shown in a notice, page or log line.
+    price_increment: Decimal | None = None
+    min_stop_distance: Decimal | None = None
+    asset_class: str | None = None
 
     def to_notional(self, broker_qty: Decimal) -> Decimal:
         """Convert a broker quantity into canonical units of the base currency."""

@@ -13,7 +13,8 @@ a timeout, run as background tasks of the process in every SM9 role):
                                   pg_stat_archiver through a short read-only connection
     Redis (own)                   used_memory / maxmemory; oversee:feed length, PEL size, oldest pending (leader)
     etcd                          member health, raft leader, db size / quota, alarms
-    files                         disk use per mount, certificate notAfter
+    files                         disk use per mount, certificate notAfter and readability (K5)
+    TLS endpoints (every 300 s)   the certificate each configured endpoint presents (XTNL_METRICS_CERT_ENDPOINTS)
 
 Per adapter (6.5): `xtnl_rest_bucket_tokens` / `xtnl_rest_requests_total` come from the adapter's shared REST
 bucket (`adapter.rest_budget.stats()`, absent for an unmetered adapter) and `xtnl_token_age_seconds` from
@@ -27,7 +28,6 @@ import importlib
 import logging
 import os
 import shutil
-import ssl
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -38,6 +38,14 @@ import redis.asyncio as aioredis
 from src.cache import keys as K
 from src.cache.feed_stream import FEED_GROUP
 from src.db.pg import ConnectionSource
+from src.observability.certs import (
+    CertReading,
+    cert_not_after_s,
+    endpoint_not_after_s,
+    parse_endpoint,
+    parse_name_list,
+    read_file_certs,
+)
 from src.observability.metrics import MetricsRegistry, Sample, gauge
 from src.observability.periodic import PeriodicReader
 from src.runtime.etcd import EtcdClusterStatus
@@ -53,6 +61,7 @@ DLQ_STATUSES: Final = ("QUEUED", "LEASED", "BACKOFF", "QUARANTINED")
 ETCD_QUOTA_BYTES: Final = 2 * 1024 ** 3          # deploy/etcd/etcd.conf.yml quota-backend-bytes
 DEFAULT_MOUNTS: Final = ("/", "/var/lib/postgresql", "/var/lib/etcd", "/var/lib/redis", "/var/lib/xtnl")
 CERTS_VAR: Final = "XTNL_METRICS_CERTS"
+CERT_ENDPOINTS_VAR: Final = "XTNL_METRICS_CERT_ENDPOINTS"
 LEASE_P99_WINDOW: Final = 60                     # keepalives (1 s renew interval: the last ~60 s)
 
 SQL_EPOCH: Final = "SELECT revision, bumped_at_ms FROM engine_epoch WHERE id = 1"
@@ -253,42 +262,100 @@ def disk_samples(mounts: Sequence[str]) -> list[Sample]:
     return out
 
 
-def cert_not_after_s(path: str) -> float | None:
-    """notAfter of a PEM certificate (epoch seconds), via the stdlib's certificate decoder; None if unreadable."""
-    decode = getattr(getattr(ssl, "_ssl", None), "_test_decode_cert", None)
-    if decode is None or not os.path.isfile(path):
-        return None
-    try:
-        return float(ssl.cert_time_to_seconds(str(decode(path)["notAfter"])))
-    except Exception:
-        return None
-
-
 def cert_samples(certs: Mapping[str, str], now_s: float) -> list[Sample]:
+    """K5: every configured certificate file gets `xtnl_cert_readable{cert}` (1 / 0), and a readable one its
+    `xtnl_cert_expires_in_seconds{cert}`; an unreadable one is reported, never just left out."""
+    return reading_samples(read_file_certs(certs), now_s)
+
+
+def reading_samples(readings: Iterable[CertReading], now_s: float) -> list[Sample]:
     out: list[Sample] = []
-    for name, path in sorted(certs.items()):
-        na = cert_not_after_s(path)
-        if na is not None:
-            out += gauge("xtnl_cert_expires_in_seconds", na - now_s, cert=name)
+    for r in readings:
+        out += gauge("xtnl_cert_readable", 1 if r.readable else 0, cert=r.name)
+        left = r.expires_in_s(now_s)
+        if left is not None:
+            out += gauge("xtnl_cert_expires_in_seconds", left, cert=r.name)
     return out
+
+
+@dataclass(frozen=True)
+class CertEndpoint:
+    """A TLS server whose presented certificate this node reads by a verifying handshake (K5)."""
+
+    name: str
+    host: str
+    port: int
+    client_cert: tuple[str, str] | None = None
+    cafile: str | None = None    # trust only this CA; None = SSL_CERT_FILE / the system store
 
 
 def certs_from_env(environ: Mapping[str, str]) -> dict[str, str]:
     """XTNL_METRICS_CERTS='etcd-client=/etc/xtnl/pki/etcd-client.crt,ca=/etc/xtnl/pki/ca.crt,...'; without it,
     the etcd client certificate and CA the engine already uses (XTNL_ETCD_CERT / XTNL_ETCD_CA)."""
     raw = (environ.get(CERTS_VAR) or "").strip()
-    out: dict[str, str] = {}
     if raw:
-        for part in raw.split(","):
-            name, _, path = part.partition("=")
-            if name.strip() and path.strip():
-                out[name.strip()] = path.strip()
-        return out
+        return parse_name_list(raw)
+    out: dict[str, str] = {}
     if environ.get("XTNL_ETCD_CERT"):
         out["etcd-client"] = environ["XTNL_ETCD_CERT"]
     if environ.get("XTNL_ETCD_CA"):
         out["ca"] = environ["XTNL_ETCD_CA"]
     return out
+
+
+def cert_endpoints_from_env(environ: Mapping[str, str]) -> list[CertEndpoint]:
+    """K5: XTNL_METRICS_CERT_ENDPOINTS='etcd-witness-server=10.0.3.10:2379,etcd-witness-peer=10.0.3.10:2380,
+    deadman-receiver=deadman.vpn:8443,dashboard-heartbeat=dashboard.vpn:8444': the certificates served on hosts
+    that export no metrics themselves, read from this node by a verifying handshake. Trust, per entry: its own
+    `;ca=/path` suffix (`name=host:port;ca=/path`); else, for an `etcd-*` name, the etcd CA XTNL_ETCD_CA (the
+    witness's etcd certificates are issued by it, and SSL_CERT_FILE need not hold it); else SSL_CERT_FILE / the
+    system store. The etcd client certificate (XTNL_ETCD_CERT / XTNL_ETCD_KEY), when set, is presented, so a
+    mutual-TLS port (the etcd peer port) completes its handshake. A malformed entry is reported as an unreadable
+    certificate (an endpoint of port 0), never dropped."""
+    cert, key = (environ.get("XTNL_ETCD_CERT") or "").strip(), (environ.get("XTNL_ETCD_KEY") or "").strip()
+    client = (cert, key) if cert and key else None
+    etcd_ca = (environ.get("XTNL_ETCD_CA") or "").strip() or None
+    out: list[CertEndpoint] = []
+    for name, value in sorted(parse_name_list(environ.get(CERT_ENDPOINTS_VAR)).items()):
+        addr, _, opts = value.partition(";")
+        ca: str | None = etcd_ca if name.startswith("etcd-") else None
+        ok = True
+        for opt in (o.strip() for o in opts.split(";") if o.strip()):
+            k, sep, v = opt.partition("=")
+            if k.strip() == "ca" and sep and v.strip():
+                ca = v.strip()
+            else:
+                ok = False                    # an unknown option: reported, never silently ignored
+        hp = parse_endpoint(addr) if ok else None
+        out.append(CertEndpoint(name, hp[0], hp[1], client, ca) if hp is not None else CertEndpoint(name, "", 0))
+    return out
+
+
+def endpoint_trust_warnings(endpoints: Sequence[CertEndpoint], environ: Mapping[str, str]) -> list[str]:
+    """K5: one line per configured endpoint that only the system trust store would verify (no `ca=`, no etcd CA,
+    no SSL_CERT_FILE). An internal-CA certificate would then read unreadable for ever (a permanent false
+    XtnlCertUnreadable), so the engine logs these at start. Names only, no paths."""
+    if (environ.get("SSL_CERT_FILE") or "").strip():
+        return []
+    return [f"cert endpoint {ep.name}: no trust source but the system store (set XTNL_ETCD_CA, a ';ca=' suffix "
+            f"or SSL_CERT_FILE); an internal-CA certificate will read as unreadable"
+            for ep in endpoints if ep.port and ep.cafile is None]
+
+
+async def read_endpoint_certs(endpoints: Sequence[CertEndpoint], *, timeout_s: float = 3.0,
+                              read: Callable[..., float | None] = endpoint_not_after_s) -> list[CertReading]:
+    """One verifying handshake per endpoint, concurrently, each in a thread and bounded by `timeout_s`."""
+    async def one(ep: CertEndpoint) -> CertReading:
+        if not ep.port:
+            return CertReading(ep.name, None)
+        try:
+            na = await asyncio.wait_for(asyncio.to_thread(read, ep.host, ep.port, timeout_s=timeout_s,
+                                                          client_cert=ep.client_cert, cafile=ep.cafile),
+                                        timeout_s + 0.5)
+        except Exception:
+            na = None
+        return CertReading(ep.name, na)
+    return list(await asyncio.gather(*(one(ep) for ep in endpoints)))
 
 
 async def asyncpg_connect(dsn: str, *, application_name: str = "xtnl-metrics") -> Any:
@@ -326,6 +393,7 @@ def build_telemetry(*, node_id: str, controller: ControllerView, keeper: KeeperV
                     local_hosts: Callable[[], frozenset[str]] | None = None,
                     etcd_status: Callable[[], EtcdClusterStatus] | None = None,
                     mounts: Sequence[str] = DEFAULT_MOUNTS, certs: Mapping[str, str] | None = None,
+                    cert_endpoints: Sequence[CertEndpoint] = (),
                     clock_ms: Callable[[], int] = _wall_ms, interval_s: float = 5.0) -> Telemetry:
     reg = MetricsRegistry(node_id)
 
@@ -384,9 +452,20 @@ def build_telemetry(*, node_id: str, controller: ControllerView, keeper: KeeperV
         return (await asyncio.to_thread(disk_samples, list(mounts))
                 + await asyncio.to_thread(cert_samples, dict(certs or {}), clock_ms() / 1000.0))
     add("files", files, 30.0)
+    if cert_endpoints:
+        eps = tuple(cert_endpoints)
+
+        async def endpoint_certs() -> list[Sample]:
+            return reading_samples(await read_endpoint_certs(eps), clock_ms() / 1000.0)
+        # 300 s between reads (a handshake per endpoint); the 4 s collect bound covers the concurrent handshakes.
+        r = PeriodicReader("cert-endpoints", endpoint_certs, interval_s=300.0, timeout_s=4.0)
+        readers.append(r)
+        reg.register("cert-endpoints", r.collect)
     return Telemetry(reg, readers)
 
 
-__all__ = ["CERTS_VAR", "CONTRACT_ROLES", "DLQ_STATUSES", "ETCD_QUOTA_BYTES", "Telemetry", "asyncpg_connect",
+__all__ = ["CERTS_VAR", "CERT_ENDPOINTS_VAR", "CONTRACT_ROLES", "CertEndpoint", "cert_endpoints_from_env",
+           "endpoint_trust_warnings",
+           "cert_not_after_s", "read_endpoint_certs", "reading_samples", "DLQ_STATUSES", "ETCD_QUOTA_BYTES", "Telemetry", "asyncpg_connect",
            "build_telemetry", "cert_samples", "certs_from_env", "disk_samples", "etcd_samples", "health_samples",
            "lease_samples", "p99", "read_patroni", "read_pg_cluster", "read_redis", "role_samples"]

@@ -6,7 +6,7 @@ import asyncio
 import dataclasses
 import threading
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Collection, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -322,13 +322,22 @@ async def test_execution_events_reach_the_market_calendar(built: Built) -> None:
 
 # ============================================================================================ operator loop
 class FakeQueue:
+    """OperatorRequestQueue with the pending query's semantics (src/db/operator_requests.py SQL_PENDING_WITH_PAYLOAD):
+    unconsumed rows whose kind is in `kinds` and whose id is not in `exclude`, by request id, at most 50."""
+
     def __init__(self, reqs: Sequence[OperatorRequest]) -> None:
         self.reqs = list(reqs)
         self.consumed: list[tuple[int, int, str]] = []
+        self.kinds_asked: list[frozenset[str]] = []
+        self.excluded_asked: list[frozenset[int]] = []
 
-    async def pending(self, epoch_token: int) -> Sequence[OperatorRequest]:
-        done = {c[1] for c in self.consumed}
-        return [r for r in self.reqs if r.request_id not in done]
+    async def pending(self, epoch_token: int, kinds: Collection[str],
+                      exclude: Collection[int] = ()) -> Sequence[OperatorRequest]:
+        self.kinds_asked.append(frozenset(kinds))
+        self.excluded_asked.append(frozenset(exclude))
+        done = {c[1] for c in self.consumed} | set(exclude)
+        return [r for r in sorted(self.reqs, key=lambda r: r.request_id)
+                if r.request_id not in done and r.kind in kinds][:50]
 
     async def consume(self, epoch_token: int, request_id: int, result: str) -> None:
         self.consumed.append((epoch_token, request_id, result))
@@ -363,9 +372,10 @@ async def test_engine_consumes_reset_task_requests(built: Built) -> None:
     try:
         await s.operator_pass()
         assert audits == [("reset_task", "risksweep", "alice")]
-        assert queue.consumed == [(5, 1, "applied"), (5, 2, "unknown_task"), (5, 3, "unsupported_kind")]
+        # S10 (RT-M10): a kind with no handler is not read, so it stays pending instead of `unsupported_kind`
+        assert queue.consumed == [(5, 1, "applied"), (5, 2, "unknown_task")]
         await s.operator_pass()                              # consumed: nothing is applied twice
-        assert len(audits) == 1 and len(queue.consumed) == 3
+        assert len(audits) == 1 and len(queue.consumed) == 2
     finally:
         await sup.stop_all()
 
@@ -417,8 +427,10 @@ async def test_pg_operator_requests_and_rearm_reader() -> None:
     from src.db.epoch import EngineDb
     db = EngineDb(FakeSource(conn), lambda: DB_EPOCH)
     q = PgOperatorRequests(db)
-    assert await q.pending(7) == [OperatorRequest(4, "reset_task", "risksweep", "alice")]
-    assert conn.args_of(SQL_OPERATOR_REQUESTS_PENDING) == [(7,)]
+    assert await q.pending(7, {"reset_task", "arm_disarm"}) == [OperatorRequest(4, "reset_task", "risksweep", "alice")]
+    assert conn.args_of(SQL_OPERATOR_REQUESTS_PENDING) == [(7, ["arm_disarm", "reset_task"], [])]   # $2 = the kinds
+    await q.pending(7, {"reset_task"}, {9, 3})
+    assert conn.args_of(SQL_OPERATOR_REQUESTS_PENDING)[-1] == (7, ["reset_task"], [3, 9])   # $3 = accepted ids
     await q.consume(7, 4, "applied")
     assert conn.args_of(SQL_OPERATOR_REQUEST_CONSUME) == [(7, 4, "applied")]   # $1 = the fencing token
     conn.stored_epoch = 99

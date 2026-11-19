@@ -43,6 +43,10 @@ class HealthRecord:
     spill_bytes: int = 0
     backoff_until_ms: int | None = None      # this node's effective back-off (peers read it)
     safe_hold: bool = False
+    # The ARM / market-data registry this node runs (design §B6.1 version lifecycle, PR13): the sorted `KIND:VERSION`
+    # tokens of its strategies, guards and indicators; empty until the optional services publish it (S32). Readers
+    # test membership (`arm config accept` refuses while a fresh node's list lacks a referenced version).
+    registry: tuple[str, ...] = ()
 
     # --- checks ------------------------------------------------------------------------------------
     def fresh(self, now_ms: int) -> bool:
@@ -79,6 +83,7 @@ class HealthRecord:
     def to_json(self) -> str:
         d = asdict(self)
         d["broker_tls"] = dict(self.broker_tls)
+        d["registry"] = list(self.registry)
         return json.dumps(d, separators=(",", ":"), sort_keys=True)
 
     @staticmethod
@@ -93,7 +98,15 @@ class HealthRecord:
             broker_tls={str(k): (None if v is None else bool(v)) for k, v in (d.get("broker_tls") or {}).items()},
             hosts_patroni_primary=bool(d.get("hosts_patroni_primary", False)),
             spill_bytes=int(d.get("spill_bytes", 0)),
-            backoff_until_ms=d.get("backoff_until_ms"), safe_hold=bool(d.get("safe_hold", False)))
+            backoff_until_ms=d.get("backoff_until_ms"), safe_hold=bool(d.get("safe_hold", False)),
+            registry=_registry(d.get("registry")))
+
+
+def _registry(raw: object) -> tuple[str, ...]:
+    """The published registry tokens; a record from a node without the field (or with a malformed one) has none."""
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(x for x in raw if isinstance(x, str) and x)
 
 
 class HealthProbe(Protocol):

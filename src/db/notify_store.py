@@ -14,6 +14,11 @@
   `name:n` (n = its failed attempts for this row, the back-off exponent and the escalation counter) and
   the `+escalated` marker once the alert was escalated to the other channel (`encode_channels` /
   `decode_channels` in src/oversee/notify.py). `escalated_since` lists escalated rows for the dashboard.
+* ARM notices (kind `arm`, PR4, 0016) share the table but belong to the ARM relay's own store: the pending,
+  due and oldest-unsent reads here skip them (`kind <> 'arm'`), so the Oversee relay never sends, reschedules or
+  finishes one, and the dead-man's `oldest_undelivered_notification_age_ms` never counts one. `SQL_OUTBOX_INSERT`
+  (channels `email` / `mobile_push`) and `SQL_OUTBOX_ESCALATED` (the 0016 CHECK keeps `+escalated` out of ARM
+  rows) are unchanged.
 Every write is fenced (`$1` = epoch): only the leader queues or marks alerts.
 """
 from __future__ import annotations
@@ -41,7 +46,8 @@ SQL_OUTBOX_INSERT: Final = (
     f"WHERE {FENCE}"
 )
 SQL_OUTBOX_PENDING: Final = (
-    f"SELECT {OUTBOX_COLS} FROM notification_outbox WHERE sent_at_ms IS NULL ORDER BY outbox_id LIMIT $1"
+    f"SELECT {OUTBOX_COLS} FROM notification_outbox WHERE sent_at_ms IS NULL AND kind <> 'arm' "
+    "ORDER BY outbox_id LIMIT $1"
 )
 SQL_OUTBOX_MARK: Final = (
     "UPDATE notification_outbox SET sent_at_ms = $3, delivered = $4, "
@@ -50,7 +56,7 @@ SQL_OUTBOX_MARK: Final = (
 )
 SQL_OUTBOX_DUE: Final = (
     f"SELECT {OUTBOX_COLS}, channels, attempts FROM notification_outbox "
-    "WHERE sent_at_ms IS NULL AND next_attempt_at_ms <= $1 ORDER BY outbox_id LIMIT $2"
+    "WHERE sent_at_ms IS NULL AND kind <> 'arm' AND next_attempt_at_ms <= $1 ORDER BY outbox_id LIMIT $2"
 )
 SQL_OUTBOX_RESCHEDULE: Final = (
     "UPDATE notification_outbox SET channels = $3::text[], next_attempt_at_ms = $4::bigint, "
@@ -67,7 +73,9 @@ SQL_OUTBOX_ESCALATED: Final = (
     f"SELECT {OUTBOX_COLS}, channels, attempts, sent_at_ms, delivered, last_error FROM notification_outbox "
     "WHERE $1::text = ANY(channels) AND created_at_ms >= $2::bigint ORDER BY outbox_id DESC LIMIT $3"
 )
-SQL_OUTBOX_OLDEST_UNSENT: Final = "SELECT MIN(created_at_ms) FROM notification_outbox WHERE sent_at_ms IS NULL"
+SQL_OUTBOX_OLDEST_UNSENT: Final = (
+    "SELECT MIN(created_at_ms) FROM notification_outbox WHERE sent_at_ms IS NULL AND kind <> 'arm'"
+)
 SQL_DEDUPE_GET: Final = "SELECT last_sent_at_ms FROM notification_dedupe WHERE dedupe_key = $1"
 SQL_DEDUPE_ALL: Final = "SELECT dedupe_key, last_sent_at_ms FROM notification_dedupe"
 #: Only the rows a re-page pass needs (primary-key lookups; IMPLEMENTATION_PLAN 8.2).

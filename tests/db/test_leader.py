@@ -36,6 +36,13 @@ async def test_three_abnormal_ends_set_safe_hold_and_abort_term(conn: FakeConn) 
     assert L.SQL_SET_SAFE_HOLD in conn.sql
 
 
+def test_abnormal_count_needs_the_term_to_start_inside_the_window() -> None:
+    """A predecessor closed now by step 1 (`ended_at` = now) after a kill hours ago is no flap: the count
+    requires started_at in the window too (false SAFE_HOLD after a PC shutdown, 2026-11-18)."""
+    assert "started_at >= $1::bigint" in L.SQL_COUNT_ABNORMAL
+    assert "ended_at >= $1::bigint" in L.SQL_COUNT_ABNORMAL
+
+
 async def test_epoch_change_budget(conn: FakeConn) -> None:
     conn.returns(L.SQL_READ_CLUSTER_STATE, (False, None))
     conn.returns(L.SQL_COUNT_ABNORMAL, (0,))
