@@ -93,7 +93,7 @@ metric a rule or alarm uses is listed here, and that every alert of operations.m
 | `xtnl_dlq_rows` | gauge | `node`, `status` | leader | `events_dlq` rows per status (`QUEUED`, `LEASED`, `BACKOFF`, `QUARANTINED`; `RESOLVED` not exported) |
 | `xtnl_adapter_state` | gauge | `node`, `adapter`, `state` | leader | 1 for each adapter's current SM4 state |
 | `xtnl_rest_bucket_tokens` | gauge | `node`, `adapter` | leader | tokens left in the adapter's shared REST bucket |
-| `xtnl_rest_requests_total` | counter | `node`, `adapter`, `priority` | leader | REST calls through the bucket by priority (`reconcile`, `cash_flows`, `dlq`, `poll`) |
+| `xtnl_rest_requests_total` | counter | `node`, `adapter`, `priority` | leader | REST calls through the bucket by priority (`reconcile`, `cash_flows`, `bars`, `dlq`, `poll`; labels come from the priority names, so a new class adds a label and changes no other; `bars` stays 0 while the optional market-data and ARM services are off) |
 | `xtnl_frames_lost_total` | counter | `node`, `stream` | leader | lost-frame events of the ingestion orchestrator (`IngestionOrchestrator.frames_lost`, summed over adapters, per stream `prices`, `orders`, `account`; positions travel on `orders`): +1 per frame it could not validate or map, and +1 per check that found newly skipped broker rows (`unmapped_rows`, one event however many rows). Each one opened a gap on its stream (or was a dropped price frame), never a silent loss (dto-contracts.md §4). A rising value means a broker sends something the adapter does not understand. Exported by the leader (`EngineSession.metrics_samples`); no alert uses it yet |
 
 ### Oversee, runtime, time, credentials (operations.md §3, §13, §14; oversee-rules.md §2)
@@ -106,7 +106,8 @@ metric a rule or alarm uses is listed here, and that every alert of operations.m
 | `xtnl_clock_offset_seconds` | gauge | `node` | any | chrony system-time offset (signed) |
 | `xtnl_token_age_seconds` | gauge | `node`, `adapter` | leader | age of the adapter's current credential (cTrader token pair since its save; StoneX session since LogOn) |
 | `xtnl_token_expires_in_seconds` | gauge | `node`, `adapter` | leader | time until the adapter's credential expires (absent when it does not expire) |
-| `xtnl_cert_expires_in_seconds` | gauge | `node`, `cert` | any | time until a TLS certificate's notAfter (`etcd-client`, `etcd-peer`, `pg-server`, `patroni-rest`, `ca`) |
+| `xtnl_cert_expires_in_seconds` | gauge | `node`, `cert` | any | time until a TLS certificate's notAfter: the files this node serves or presents (`XTNL_METRICS_CERTS`: `etcd-client`, `etcd-peer`, `etcd-server`, `pg-server`, `patroni-rest`, `patroni-etcd-client`, `patroni-ca`, `redis-proxy`, `redis-proxy-client-ca`, `ca`, each at the path its service loads; on the single PC also `api-server`) and the certificates served on hosts without an exporter, read by a verifying handshake every 300 s (`XTNL_METRICS_CERT_ENDPOINTS`: `etcd-witness-server`, `etcd-witness-peer`, `deadman-receiver`, `dashboard-heartbeat`); absent while unreadable |
+| `xtnl_cert_readable` | gauge | `node`, `cert` | any | 1 when that certificate could be read (an endpoint's: and verified), 0 when not (missing or unreadable file, failed handshake, expired / untrusted / misnamed certificate); one series per configured certificate (K5) |
 
 ### Uptime and downtime catch-up (migration 0012; the engine is not on 24/7)
 
@@ -119,6 +120,69 @@ Counts and durations only: no series carries an amount. No alert uses them yet (
 | `xtnl_offline_gap_seconds` | gauge | `node` | any | the offline span of the newest downtime catch-up of this process: from the adapter's last recorded `adapter_coverage.last_streaming_ms` to the term start (or the resume); absent before the first catch-up with a coverage row |
 | `xtnl_catchup_runs_total` | counter | `node`, `adapter`, `complete` | any | downtime catch-ups finished by this process per adapter, `complete` = `true` / `false` (an incomplete one also pages "downtime catch-up incomplete") |
 | `xtnl_catchup_rows_total` | counter | `node`, `adapter`, `kind` | any | rows the catch-ups changed, per `kind`: `order_new`, `order_updated`, `position_new`, `position_closed`, `cash_flow_new`, `anomaly` (a stored working order / OPEN position the broker no longer knows by id) |
+
+### Market data and ARM (optional services, plan S32; design §B14, §C2)
+
+Exported by the leader only while `XTNL_MD_ENABLED=1` (the ARM rows also need `XTNL_ARM_ENABLED=1` and a running
+ARM); absent otherwise. Counts and states only: no series carries a price, a level, an indicator value or an amount.
+Labels are bounded: `state` is an SM12 or indicator state, `component` a fixed component name and `event` a counter
+field name of that component.
+
+| Name | Type | Labels | Role | Meaning |
+|---|---|---|---|---|
+| `xtnl_md_series` | gauge | `node`, `state` | leader | market-data series per SM12 state (`EMPTY`, `BACKFILLING`, `LIVE`, `GAPPED`, `FAILED`) |
+| `xtnl_md_indicators` | gauge | `node`, `state` | leader | tracked indicators per state (`pending`, `ready`, `faulted`) |
+| `xtnl_md_aof_wait_timeouts_total` | counter | `node` | leader | `redis-md` AOF confirmations that timed out (the bars stay queued and are re-written on the next flush) |
+| `xtnl_md_events_total` | counter | `node`, `component`, `event` | leader | market-data counters of this term per component (`writer`, `bars`, `indicators`, `service`, `hook`, `crosscheck`; `src/runtime/optional_plan.py` `MD_EVENT_COMPONENTS`) and counter name (`flush_errors`, `invalid_bars`, `faulted`, `bootstraps`, `ticks`, `mismatches`, ...) |
+| `xtnl_md_redis_used_memory_ratio` | gauge | `node` | leader | `redis-md` `used_memory` / `maxmemory` as `md-writer` last read it (`INFO memory` every 10 s; absent while unknown). md-writer pages at 70 % and sheds TICK data in its fixed order (design §A2, §A8) |
+| `xtnl_md_shed_step` | gauge | `node` | leader | `md-writer`'s memory shedding step (0 = none, 1-4 = the §A8 order) |
+| `xtnl_md_queue_depth` | gauge | `node`, `queue` | leader | `md-writer`'s in-memory backlog: `closed_bars` (the closed-bar queue, 6 h bound) and `pending_ticks` (ticks drained from the hook rings, not yet written) |
+| `xtnl_arm_failed_scopes` | gauge | `node` | leader | open ARM FAILED scopes, from memory (§B14; the off-node backstop `XtnlArmFailed`) |
+| `xtnl_arm_failed_global` | gauge | `node` | leader | 1 while the ARM-global scope is FAILED (or the open episodes are unreadable) |
+| `xtnl_arm_oldest_undelivered_notice_age_seconds` | gauge | `node` | leader | age of the oldest undelivered kind `arm` outbox row (absent when none) |
+| `xtnl_arm_events_total` | counter | `node`, `component`, `event` | leader | ARM counters of this term per component (`failed`, `budget`, `tracker`, `barclock`, `stopreads`, `notices`, `evaluation`; `ARM_EVENT_COMPONENTS`) and counter name (`entered`, `recorded`, `clears_applied`, `faults`, `decisions`, ...); component `pre_skipped` counts the PRE decisions not taken, with the reason code as `event` |
+| `xtnl_arm_positions` | gauge | `node`, `view` | leader | positions as the `arm-tracker`'s last pass saw them: `armed` (live `arm_positions` rows), `unmanaged`, `overdue` (armed positions with more than 2 OPEN bars past their decision cap undecided, or no loaded schedule: the dead-man's `arm_overdue_positions`, S38g), `unarmed` (assigned but not armed after 5 min). SM11 states per position: `arm show` |
+| `xtnl_arm_paused` | gauge | `node` | leader | 1 while the ARM is paused (operator `arm pause` or the configuration-hash pause): no decision until resumed |
+
+### Design §C2 metric list (plan S37)
+
+Where each item of the design's §C2 metric list is exported. Series are written `name{label="value"}`; for the two
+`*_events_total` families the `event` is a counter field of the component's counters class
+(`MD_EVENT_COMPONENTS` / `ARM_EVENT_COMPONENTS` in `src/runtime/optional_plan.py`), so a renamed counter fails
+`tests/deploy/test_md_arm_deploy.py`. An item marked "not exported" has no metric series yet; the row names where an
+operator reads it instead. Nothing here carries a price, a level, an indicator value, a spread or an amount.
+
+| §C2 item | Series | Status |
+|---|---|---|
+| ticks in | `xtnl_md_events_total{component="hook",event="ticks"}`, `xtnl_md_events_total{component="writer",event="ticks_written"}` | exported |
+| ticks dropped | `xtnl_md_events_total{component="hook",event="ring_dropped"}`, `xtnl_md_events_total{component="writer",event="ticks_dropped"}`, `xtnl_md_events_total{component="hook",event="rejected"}` | exported |
+| receipt-time ticks | `xtnl_md_events_total{component="hook",event="receipt_timed"}` | exported |
+| ring and queue depth | `xtnl_md_queue_depth{queue="closed_bars"}`, `xtnl_md_queue_depth{queue="pending_ticks"}`, `xtnl_md_events_total{component="writer",event="queue_dropped"}` | exported (the per-market hook ring depth itself is not: its overflow is `ring_dropped`) |
+| writer lag | `xtnl_md_events_total{component="writer",event="deadline_skips"}`, `xtnl_md_events_total{component="writer",event="flush_errors"}` | not exported as a lag: the backlog is `xtnl_md_queue_depth`; `md show` lists `last_write_ms` per series |
+| series by SM12 state | `xtnl_md_series{state="LIVE"}` | exported (one series per state) |
+| gaps | `xtnl_md_series{state="GAPPED"}`, `xtnl_md_events_total{component="bars",event="heal_holes"}`, `xtnl_md_events_total{component="bars",event="unfillable"}` | exported |
+| bars by source and quality | `xtnl_md_events_total{component="bars",event="bars_queued"}`, `xtnl_md_events_total{component="bars",event="no_trade"}`, `xtnl_md_events_total{component="writer",event="bars_released"}` | partly: no per-quality count (`md bars <series>` counts by quality) |
+| revisions | `xtnl_md_events_total{component="bars",event="revisions"}` | exported |
+| bar-fetch latency and REST waits / timeouts | `xtnl_rest_requests_total{priority="bars"}`, `xtnl_md_events_total{component="bars",event="pass_timeouts"}`, `xtnl_md_events_total{component="bars",event="series_timeouts"}`, `xtnl_md_events_total{component="bars",event="failed_reads"}` | partly: no latency histogram yet |
+| backfill remaining buckets | `xtnl_md_events_total{component="bars",event="lane_added"}`, `xtnl_md_events_total{component="bars",event="lane_resolved"}`, `xtnl_md_events_total{component="bars",event="backfill_done"}` | partly: the remaining count is added minus resolved; `md show` per series |
+| indicator warm / FAULTED and recompute queue | `xtnl_md_indicators{state="ready"}`, `xtnl_md_events_total{component="indicators",event="deferred"}` | exported |
+| validation failures and quarantined buckets by check | `xtnl_md_events_total{component="bars",event="invalid_bars"}`, `xtnl_md_events_total{component="writer",event="quarantined"}` | partly: per check name only in `md bars <series>` (a check label would not be bounded per series) |
+| BROKER-vs-TICK mismatches and run length | `xtnl_md_events_total{component="crosscheck",event="mismatches"}`, `xtnl_md_events_total{component="crosscheck",event="skipped"}` | partly: the run length per series is in `md show` (D6 counters) |
+| AOF wait timeouts | `xtnl_md_aof_wait_timeouts_total` | exported |
+| md generation and store class | `xtnl_md_events_total{component="service",event="bootstraps"}` | not exported as a value: `md show` and `arm_status` |
+| rollback-set depth | | not exported: `md show` |
+| consumer cursor lag | | not exported: no out-of-process consumer exists in Phase 1 |
+| redis-md memory and shedding step | `xtnl_md_redis_used_memory_ratio`, `xtnl_md_shed_step` | exported (`XtnlRedisMdMemoryHigh` at 70 %) |
+| skew | | not exported: `md:skew:{adapter}` through `md show` |
+| positions by state | `xtnl_arm_positions{view="armed"}`, `xtnl_arm_paused` | partly: tracker views, not SM11 states (`arm show`) |
+| decisions by kind / event / outcome | `xtnl_arm_events_total{component="barclock",event="decisions"}`, `xtnl_arm_events_total{component="barclock",event="pre_decisions"}`, `xtnl_arm_events_total{component="barclock",event="spans"}` | partly: no per-outcome count (`arm decisions`) |
+| PRE skipped by reason | `xtnl_arm_events_total{component="pre_skipped"}` | exported (`event` = the reason code) |
+| POST decision latency | | not exported: `arm decisions` shows `decided_at_ms` against the bar end |
+| close source | | not exported: `arm decisions` |
+| last POST age | | not exported: `arm_status` / `arm show` |
+| notice hand-off lag and expiries | `xtnl_arm_oldest_undelivered_notice_age_seconds`, `xtnl_arm_events_total{component="notices",event="pre_expired"}` | exported |
+| config age | | not exported: `arm config show` and the `arm_status` `config_state_*` counters |
+| FAILED scopes and error-budget counters | `xtnl_arm_failed_scopes`, `xtnl_arm_failed_global`, `xtnl_arm_events_total{component="failed",event="entered"}`, `xtnl_arm_events_total{component="budget",event="faults"}` | exported (`XtnlArmFailed`) |
 
 ## Witness host
 
@@ -150,6 +214,7 @@ Its etcd member is covered by `xtnl_etcd_endpoint_healthy{member="witness"}` fro
 | leader not on the primary's node > 10 min | `XtnlLeaderNotOnPrimary` | `xtnl-leader-not-on-primary` | `xtnl_leader_colocated_with_primary` |
 | disk 70 / 85 % | `XtnlDisk70`, `XtnlDisk85`, `XtnlWitnessDisk70`, `XtnlWitnessDisk85` | `xtnl-disk-70-*`, `xtnl-disk-85-*`, `xtnl-witness-disk-*` | `xtnl_disk_used_ratio`, `disk_used_percent` / `node_filesystem_*` |
 | certificate expiry 30 days | `XtnlCertExpiry` | `xtnl-cert-expiry-*` | `xtnl_cert_expires_in_seconds` |
+| certificate unreadable / not verifying / not watched | `XtnlCertUnreadable` | `xtnl-cert-unreadable-*` | `xtnl_cert_readable`, `xtnl_exporter_up` |
 | PITR horizon broken | `XtnlPitrHorizonBroken` | `xtnl-pitr-horizon-broken-*` | `xtnl_wal_archive_failed_total`, `xtnl_pg_timeline` |
 | lease-renew p99 > 500 ms | `XtnlLeaseRenewSlow` | `xtnl-lease-renew-slow` | `xtnl_lease_renew_p99_seconds` |
 | event-loop lag 100 ms | `XtnlEventLoopLag` | `xtnl-event-loop-lag-*` | `xtnl_event_loop_lag_seconds` |
@@ -157,6 +222,8 @@ Its etcd member is covered by `xtnl_etcd_endpoint_healthy{member="witness"}` fro
 | feed lag at 50 % of the cap | `XtnlFeedLengthHigh`, `XtnlFeedPendingOld` | `xtnl-feed-length-high`, `xtnl-feed-pending-old` | `xtnl_feed_stream_length`, `xtnl_feed_oldest_pending_age_seconds` |
 | replication lag | `XtnlReplicationLag` | `xtnl-replication-lag` | `xtnl_pg_replication_lag_seconds` |
 | clock | `XtnlClockOffset` | `xtnl-clock-offset-*` | `xtnl_clock_offset_seconds` |
+| ARM FAILED scopes (design §B14 backstop) | `XtnlArmFailed` | `xtnl-arm-failed` | `xtnl_arm_failed_scopes` |
+| redis-md memory 70 % (design §A2) | `XtnlRedisMdMemoryHigh` | `xtnl-redis-md-memory-*` | `xtnl_md_redis_used_memory_ratio` |
 | inhibition: epoch change, RTO + 30 s | `XtnlEpochChangeSettling` (source of `inhibit_rules`) | `xtnl-epoch-change-settling` (`ActionsSuppressor`) | `xtnl_epoch_change_age_seconds` |
 
 ## CloudWatch notes

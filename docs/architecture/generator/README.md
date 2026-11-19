@@ -1,7 +1,9 @@
 # Phase 1 architecture diagram generator
 
-`gen_phase1_arch.py` builds `docs/architecture/phase1_ingestion_arch.drawio` (5 pages: Architecture,
-Design Patterns, State Machines, Use Cases, Deployment). Edit the diagram by editing this script, not the
+`gen_phase1_arch.py` builds `docs/architecture/phase1_ingestion_arch.drawio` (6 pages: Architecture,
+Design Patterns, State Machines, Use Cases, Deployment, Market data & ARM). Page 6 (plan S37) shows the optional
+market-data layer (`redis-md`) and the advice-only ARM with SM12 and SM11; its boxes are not in `measured.json` yet, so
+they use fixed default heights until re-measured (below). Edit the diagram by editing this script, not the
 `.drawio` file, so the layout checks keep working.
 
 ## Regenerate

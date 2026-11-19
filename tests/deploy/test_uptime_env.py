@@ -13,7 +13,7 @@ ENV = Path(__file__).resolve().parents[2] / "deploy" / "env"
 VARS = ("XTNL_UPTIME_PING_S", "XTNL_CATCHUP_OVERLAP_S", "XTNL_CATCHUP_FIRST_RUN_DAYS")
 
 
-@pytest.mark.parametrize("name", ["engine.env.example", "local.env.example"])
+@pytest.mark.parametrize("name", ["engine.env.example", "local.env.example", "local-live.env.example"])
 def test_examples_assign_valid_uptime_settings(name: str) -> None:
     assigned: dict[str, str] = {}
     for raw in (ENV / name).read_text(encoding="utf-8").splitlines():

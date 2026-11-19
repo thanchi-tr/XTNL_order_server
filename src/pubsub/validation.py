@@ -6,7 +6,7 @@ re-reads the entity from the broker (check-before-retry, tier-persistence.md §5
 
 Pure functions, no I/O: they run on the parser path. The DTO constructors already reject some shapes
 (units missing while the instrument is known); these checks cover what a constructor cannot: an empty id,
-a non-finite or wrong-typed amount, an unknown side / status / kind, a row whose adapter_id is not the
+a non-finite or wrong-typed amount, an unknown side / status / order_kind / kind, a row whose adapter_id is not the
 adapter that produced it, and a checksum that no longer matches the payload (a row mutated after it was
 sealed).
 """
@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from decimal import Decimal
 
-from src.dto import AccountDTO, CashFlowDTO, OrderDTO, OrderStatus, PositionDTO, payload_checksum
+from src.dto import ORDER_KINDS, AccountDTO, CashFlowDTO, OrderDTO, OrderStatus, PositionDTO, payload_checksum
 
 Checked = OrderDTO | PositionDTO | AccountDTO | CashFlowDTO
 
@@ -60,6 +60,7 @@ def schema_problem(dto: Checked, adapter_id: str) -> str | None:
             (_blank(dto.symbol), "symbol empty"),
             (dto.side not in _SIDES, "side invalid"),
             (not isinstance(dto.status, OrderStatus), "status invalid"),
+            (dto.order_kind is not None and dto.order_kind not in ORDER_KINDS, "order_kind invalid"),
             (_bad_amount(dto.entry_price, optional=True), "entry_price invalid"),
             (_bad_amount(dto.stop_loss, optional=True), "stop_loss invalid"),
             (_bad_amount(dto.take_profit, optional=True), "take_profit invalid"),

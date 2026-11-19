@@ -159,3 +159,26 @@ def test_mock_versioning_is_configurable() -> None:
                                          "ACCOUNT": VersionDecl(True, False)})
     assert mock.VERSIONING["ACCOUNT"].has_broker_seq
     assert not MockBrokerAdapter().VERSIONING["ACCOUNT"].has_broker_time
+
+
+# --- ARM prerequisites: scripted order_kind and instrument metadata (design PR1, PR7) ------------------
+async def test_mock_scripts_order_kind_and_instrument_metadata() -> None:
+    fx = build_fx_fixture()
+    mock = MockBrokerAdapter.from_fixture(fx)
+    # the default fixture leaves every new field None, so its checksums are unchanged
+    assert all(o.order_kind is None for o in await mock.fetch_open_orders())
+    assert all(i.price_increment is None and i.asset_class is None for i in await mock.fetch_instruments())
+
+    before = {o.broker_order_id: o for o in await mock.fetch_open_orders()}["PF-1-SL"]
+    stop = mock.set_order_kind("PF-1-SL", "STOP")
+    assert stop.order_kind == "STOP" and stop.checksum != before.checksum
+    served = await mock.fetch_order_status("PF-1-SL")
+    assert served is not None and served.order_kind == "STOP"
+    assert mock.set_order_kind("PF-1-SL", None).checksum == before.checksum
+
+    spec = mock.set_instrument_metadata("EURUSD", price_increment=Decimal("0.00001"), asset_class="FX")
+    assert spec.min_stop_distance is None
+    eur = {i.symbol: i for i in await mock.fetch_instruments()}["EURUSD"]
+    assert (eur.price_increment, eur.asset_class) == (Decimal("0.00001"), "FX")
+    with pytest.raises(KeyError):
+        mock.set_order_kind("NO-SUCH-ORDER", "LIMIT")

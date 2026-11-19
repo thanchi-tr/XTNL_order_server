@@ -5,11 +5,14 @@ the leader key, read cluster_state, then act on the role:
 
 * STANDBY   -> CANDIDATE when `may_campaign()`; campaign through the LeaseKeeper (txn on /xtnl/leader).
 * CANDIDATE -> LEADER_INIT on a win (the keeper enforces the 120 s deadline), else back to STANDBY.
+* LEADER_INIT -> DRAINING / STANDBY on a stop (K15): the step in flight is cancelled; a started term (step 1
+               committed) ends through DRAINING (`switchover`), else the lease is released with no term.
 * LEADER    -> DRAINING on an abdication decision or SIGTERM (`request_drain`).
 * DRAINING  -> STANDBY (60 s back-off, the engine's Redis database flushed with FLUSHDB); the keeper
                enforces the 10 s deadline. The standby spill drain restarts one spill period later, with
                the term's torn-tail baseline (IMPLEMENTATION_PLAN 4.9).
-* STANDBY  <-> SAFE_HOLD while cluster_state.safe_hold is set (operator `resume()` clears it).
+* STANDBY  <-> SAFE_HOLD while cluster_state.safe_hold is set (operator `resume()` clears it; on the single PC,
+               `XTNL_SINGLE_PC=1` only, the node resumes it itself after a cool-down: src/runtime/single_pc.py).
 
 Every leader-side component comes from a `LeaderSession` (the coordinator wires adapters, stores,
 consumers, Oversee and the dead-man sender); it receives the TaskSupervisor so LEADER_INIT step 6 can
@@ -21,6 +24,7 @@ import asyncio
 import dataclasses
 import logging
 import time
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from typing import Protocol
 
@@ -41,6 +45,7 @@ from src.runtime.roles import (
     RoleMachine,
     TermRow,
 )
+from src.runtime.single_pc import NotRecordingWatch, SafeHoldAutoResume, SinglePcPage
 from src.runtime.supervisor import Pager, TaskContext, TaskSpec, TaskSupervisor
 
 log = logging.getLogger(__name__)
@@ -91,6 +96,11 @@ class LeaderSession(Protocol):
         term's end_reason, close sockets. The lease is released by the controller afterwards."""
         ...
 
+    def start_optional_services(self) -> None:
+        """Called once right after LEADER entry; synchronous, never awaits. Adds the optional (market-data / ARM)
+        work when its local flags are on; nothing otherwise. A raise is paged and never ends the term."""
+        ...
+
 
 LeaderSessionFactory = Callable[[Epoch], LeaderSession]
 
@@ -107,7 +117,9 @@ class NodeController:
                  clock_ms: Callable[[], int] = _wall_ms, monotonic: Callable[[], float] = time.monotonic,
                  step_interval_s: float = 1.0, require_keeper_thread: bool = True,
                  standby_work: StandbyWork | None = None, startup_retry_s: float = 1.0,
-                 startup_retry_max_s: float = 30.0, standby_delay_after_drain_s: float = 0.0) -> None:
+                 startup_retry_max_s: float = 30.0, standby_delay_after_drain_s: float = 0.0,
+                 auto_resume: SafeHoldAutoResume | None = None,
+                 idle_watch: NotRecordingWatch | None = None, direct_pager: Pager | None = None) -> None:
         self.node_id = node_id
         self.machine = RoleMachine(node_id)
         self.keeper = keeper
@@ -135,9 +147,18 @@ class NodeController:
         self._sup_stop: asyncio.Event | None = None
         self._sup_task: asyncio.Task[None] | None = None
         self._drain_request: tuple[EndReason, bool] | None = None
+        self._init_abort: asyncio.Event | None = None    # set while LEADER_INIT runs; a stop sets it (K15)
         self._stop = asyncio.Event()
         self.last_record: HealthRecord | None = None
         self.last_view: ClusterView | None = None
+        self.last_cluster: ClusterState = ClusterState()
+        # single PC only (XTNL_SINGLE_PC=1; both None otherwise: SAFE_HOLD stays operator-only)
+        self._auto_resume = auto_resume
+        self._idle_watch = idle_watch
+        # critical single-PC pages while there is no leader session (operations.md §2 exception; single_pc.py)
+        self._direct_pager = direct_pager
+        # pages for the notification path, sent when this node next reaches LEADER (only the leader sends, §2)
+        self._leader_pages: deque[SinglePcPage] = deque(maxlen=20)
 
     @property
     def role(self) -> NodeRole:
@@ -148,14 +169,21 @@ class NodeController:
 
     # --- external requests -------------------------------------------------------------------------
     def request_drain(self, reason: EndReason = "switchover", *, exit_after: bool = True) -> None:
-        """SIGTERM / planned switchover. A non-leader just stops."""
+        """SIGTERM / planned switchover. A non-leader just stops. A request taken during LEADER_INIT stops it promptly
+        (K15): before the epoch bump commits, the lease is released with no term; after it, the step in flight is
+        cancelled and the term ends through DRAINING with this reason. A SAFE_HOLD due at step 1 honours it as a
+        non-leader stop (K1), so a SIGTERM is never lost to systemd's stop timeout."""
         if self.machine.role in (NodeRole.LEADER, NodeRole.LEADER_INIT):
             self._drain_request = (reason, exit_after)
+            if self.machine.role is NodeRole.LEADER_INIT and self._init_abort is not None:
+                self._init_abort.set()
         elif exit_after:
             self._stop.set()
 
     def stop(self) -> None:
         self._stop.set()
+        if self._init_abort is not None:
+            self._init_abort.set()
 
     # --- main loop ---------------------------------------------------------------------------------
     async def startup(self) -> None:
@@ -177,6 +205,7 @@ class NodeController:
                 lvl = logging.ERROR if failures == 1 or failures % 10 == 0 else logging.WARNING
                 log.log(lvl, "STARTING: leader_terms / cluster_state unreadable (%s, attempt %d); "
                         "retrying in %.0f s", type(exc).__name__, failures, delay)
+                self._watch_idle(self._clock_ms(), f"leader_terms / cluster_state unreadable ({type(exc).__name__})")
             try:
                 await asyncio.wait_for(self._stop.wait(), delay)
                 return                        # stop requested while STARTING
@@ -216,6 +245,8 @@ class NodeController:
             if exit_after:
                 self._stop.set()
             return
+        if self._honour_pending_drain_as_non_leader():
+            return
         view = await self._observe()
         role = self.machine.role
         if role is NodeRole.STANDBY:
@@ -226,6 +257,8 @@ class NodeController:
         elif role is NodeRole.SAFE_HOLD:
             if not view.safe_hold:
                 self.machine.go(NodeRole.STANDBY, "SAFE_HOLD resumed by operator", view.now_ms)
+            elif self._auto_resume is not None:
+                await self._safe_hold_auto_resume(view)
         elif role is NodeRole.LEADER:
             session = self.session
             links = session.broker_links() if session is not None else {}
@@ -233,6 +266,74 @@ class NodeController:
             if decision is not None:
                 log.critical("abdicating (%s) to %s: %s", decision.grounds, decision.target, decision.reason)
                 await self._drain("abdicate")
+        self._watch_idle(view.now_ms, self._idle_detail(view))
+
+    # --- single PC (XTNL_SINGLE_PC=1) ----------------------------------------------------------------
+    async def _safe_hold_auto_resume(self, view: ClusterView) -> None:
+        """SAFE_HOLD on the single PC: the auto-resume decides; a resume returns the node to STANDBY at once (it
+        campaigns from the next step). Never raises: a failure keeps the node held and is retried."""
+        auto = self._auto_resume
+        if auto is None:
+            return
+        try:
+            page = await auto.step(view.now_ms, view.own, self.last_cluster)
+        except Exception:
+            log.exception("SAFE_HOLD auto-resume step failed")
+            return
+        if page is None:
+            return
+        if page.kind == "resumed":
+            self.machine.go(NodeRole.STANDBY, "SAFE_HOLD auto-resumed (single PC)", self._clock_ms())
+            self._leader_pages.append(page)
+        else:
+            self._page(page)
+
+    def _idle_detail(self, view: ClusterView) -> str:
+        parts: list[str] = []
+        failed = view.own.failed_hard_checks(view.now_ms, as_leader=False)
+        if failed:
+            parts.append("hard checks failing: " + ", ".join(failed))
+        if view.safe_hold:
+            parts.append("SAFE_HOLD set" + (" (auto-resume budget used up)" if self._auto_resume is not None
+                                            and self._auto_resume.exhausted else ""))
+        until = self.machine.effective_backoff_until(view.now_ms, bool(view.fresh_peers()))
+        if until is not None:
+            parts.append("in back-off")
+        if view.lease_holder is not None and view.lease_holder != self.node_id:
+            parts.append(f"lease held by {view.lease_holder}")
+        return "; ".join(parts)
+
+    def _watch_idle(self, now_ms: int, detail: str = "") -> None:
+        watch = self._idle_watch
+        if watch is None:
+            return
+        page = watch.observe(now_ms, self.machine.role, detail)
+        if page is not None:
+            self._page(page)
+
+    def _page(self, page: SinglePcPage) -> None:
+        """Through the controller's pager (the leader's notification outbox; a non-leader logs it). Single PC: a
+        critical page raised while this node has no leader session also goes straight to the alert channels
+        (`direct_pager`; no outbox exists then, and no peer exists that could send it too)."""
+        if self._pager is None:
+            level = logging.CRITICAL if page.severity == "critical" else logging.WARNING
+            log.log(level, "PAGE[%s] %s: %s", page.severity, page.title, page.body)
+        else:
+            try:
+                self._pager.page(page.severity, page.title, page.body)
+            except Exception as exc:
+                log.error("page %r failed: %s", page.title, type(exc).__name__)
+        if self._direct_pager is not None and page.severity == "critical" and self.session is None:
+            try:
+                self._direct_pager.page(page.severity, page.title, page.body)
+            except Exception as exc:
+                log.error("direct page %r failed: %s", page.title, type(exc).__name__)
+
+    def _after_leader_entry(self) -> None:
+        """LEADER reached: hand the pages held for the notification path to it (single PC only)."""
+        self._watch_idle(self._clock_ms())
+        while self._leader_pages:
+            self._page(self._leader_pages.popleft())
 
     async def _observe(self) -> ClusterView:
         now = self._clock_ms()
@@ -254,6 +355,7 @@ class NodeController:
             holder = "?"                      # unknown: never treat the lease as free
             log.warning("etcd read failed: %r", exc)
         cluster = await self._cluster.read()
+        self.last_cluster = cluster
         any_fresh = any(p.fresh(now) for p in peers)
         sweep_age = self.supervisor.circuit_open_age_s(RISKSWEEP_TASK) if self.supervisor else None
         record = dataclasses.replace(
@@ -286,8 +388,18 @@ class NodeController:
         if epoch is None:
             self.machine.go(NodeRole.STANDBY, "campaign lost", self._clock_ms())
             return
+        if self._stop.is_set():
+            # K1: a stop (SIGTERM) taken while CANDIDATE. The term has not started (no epoch bump, no leader_terms
+            # row), so the lease is released at once instead of running a LEADER_INIT of up to 120 s that systemd's
+            # stop timeout would SIGKILL mid-way (an abnormal `init_failed` term toward the anti-flap budget).
+            await asyncio.to_thread(self.keeper.release)    # blocking etcd revoke: never on the loop
+            self.machine.go(NodeRole.STANDBY, "stop requested while CANDIDATE; lease released", self._clock_ms())
+            return
         self.keeper.begin_leader_init()
         self.machine.go(NodeRole.LEADER_INIT, f"won lease, epoch {epoch.label}", self._clock_ms())
+        abort = self._init_abort = asyncio.Event()      # K15: no await since the role change, so no stop is missed
+        if self._stop.is_set() or self._drain_request is not None:
+            abort.set()
         await self._stop_standby_work()       # the term's own spooler now owns the spill file
         session = self._factory(epoch)
         self.session = session
@@ -296,23 +408,101 @@ class NodeController:
         self.supervisor = sup
         self._sup_stop = asyncio.Event()
         self._sup_task = asyncio.create_task(sup.run(self._sup_stop), name="supervisor")
-        report = await LeaderInit(session.init_deps(sup), exit_fn=self._exit,
-                                  deadline_s=self.keeper.timings.leader_init_deadline_s,
-                                  clock_ms=self._clock_ms).run(epoch, self.node_id)
+        try:
+            report = await LeaderInit(session.init_deps(sup), exit_fn=self._exit,
+                                      deadline_s=self.keeper.timings.leader_init_deadline_s,
+                                      clock_ms=self._clock_ms, stop=abort).run(epoch, self.node_id)
+        finally:
+            self._init_abort = None
         if report is None:                    # hard exit already requested (tests: injected exit)
             await self._stop_supervisor()
             self.machine.go(NodeRole.FENCED, "LEADER_INIT failed", self._clock_ms())
+            self._drain_request = None        # the process is stopping anyway
             self._stop.set()
             return
         if report.outcome is InitOutcome.SAFE_HOLD:
             await self._stop_supervisor()
+            # K2: release what the aborted term holds (HTTP client, term pool), bounded by the session's own
+            # aclose budget (`drain_aclose_s`, as in DRAINING), before the lease goes; never left to the garbage
+            # collector.
+            await _close_session(session)
             await asyncio.to_thread(self.keeper.release)    # blocking etcd revoke: never on the loop
             self.session = None
             self.machine.go(NodeRole.SAFE_HOLD, "SAFE_HOLD due at LEADER_INIT", self._clock_ms())
             self._start_standby_work()
+            # K1: a SIGTERM taken during LEADER_INIT is honoured now, as a non-leader's stop.
+            self._honour_pending_drain_as_non_leader()
+            return
+        if report.outcome is InitOutcome.STOPPED:
+            await self._stop_leader_init(session, report.term_started)
             return
         self.keeper.reached_leader()
         self.machine.go(NodeRole.LEADER, f"LEADER_INIT done ({', '.join(report.steps)})", self._clock_ms())
+        self._start_optional_services(session)
+        self._after_leader_entry()
+
+    def _start_optional_services(self, session: LeaderSession) -> None:
+        """Design §A2 (RT-M1): the optional services start only after LEADER; whatever the hook does, the term goes
+        on (no exit, no drain, no role change), so a failure there never touches ingestion or Oversee."""
+        try:
+            session.start_optional_services()
+        except Exception as exc:
+            # The error type only: a bootstrap error message could carry a setting value (design: a problem names
+            # the variable, never its value), so neither str(exc) nor the traceback is logged.
+            log.error("optional services failed to start: %s", type(exc).__name__)
+            if self._pager is not None:
+                try:
+                    self._pager.page("high", "optional services failed to start",
+                                     f"{type(exc).__name__}; the term, ingestion and Oversee continue")
+                except Exception as page_exc:
+                    log.error("optional services page failed: %s", type(page_exc).__name__)
+
+    async def _stop_leader_init(self, session: LeaderSession, term_started: bool) -> None:
+        """K15: a stop (SIGTERM / `stop()`) ended LEADER_INIT before LEADER.
+
+        * Before the epoch bump committed: no term exists (no epoch bump, no leader_terms row), so, as for a stop
+          taken while CANDIDATE, the aborted session is closed and the lease released; LEADER_INIT -> STANDBY (with
+          the normal 60 s back-off when the node stays up, `exit_after` False, so a switchover is not undone by
+          re-winning the lease at once).
+        * After it: the term is ended like a LEADER's stop, through DRAINING with the request's reason (SIGTERM:
+          `switchover`; the keeper's 10 s DRAINING deadline replaces the 120 s LEADER_INIT one): intake stopped, the
+          DlqSpooler flushed, the fenced end_reason written, sockets closed, the lease released, 60 s back-off. A clean
+          stop is never an abnormal end (operations.md §4), so it never counts toward SAFE_HOLD's 3-in-15-min brake
+          (the term still counts as an epoch change).
+        The stop then takes effect (`exit_after`), well inside systemd's TimeoutStopSec."""
+        reason, exit_after = self._drain_request or ("switchover", True)
+        self._drain_request = None
+        if term_started:
+            await self._drain(reason)
+        else:
+            await self._stop_supervisor()
+            await _close_session(session)
+            await asyncio.to_thread(self.keeper.release)    # blocking etcd revoke: never on the loop
+            self.session = None
+            now = self._clock_ms()
+            if not exit_after:
+                # A planned switchover that stays up: without the normal back-off this node could re-win the lease
+                # at once and defeat the switchover (a stop that exits needs none: the process ends here).
+                self.machine.set_backoff(now, f"{reason} requested before the epoch bump")
+            self.machine.go(NodeRole.STANDBY, "stop requested before the epoch bump; lease released, no term", now)
+            self._start_standby_work()
+        if exit_after:
+            self._stop.set()
+
+    def _honour_pending_drain_as_non_leader(self) -> bool:
+        """A drain request stored while LEADER / LEADER_INIT whose term then ended without reaching LEADER (SAFE_HOLD
+        at LEADER_INIT): there is nothing to drain, so it acts as a non-leader's request (stop when `exit_after`).
+        Returns True when a request was consumed. Never touches a request while LEADER / LEADER_INIT."""
+        req = self._drain_request
+        if req is None or self.machine.role in (NodeRole.LEADER, NodeRole.LEADER_INIT):
+            return False
+        self._drain_request = None
+        reason, exit_after = req
+        log.warning("%s requested during LEADER_INIT; the term ended as %s: %s", reason, self.machine.role.value,
+                    "stopping as a non-leader" if exit_after else "nothing to drain")
+        if exit_after:
+            self._stop.set()
+        return True
 
     def _lease_link_spec(self) -> TaskSpec:
         keeper, require = self.keeper, self._require_thread
@@ -391,6 +581,19 @@ class NodeController:
             await self._redis.flushdb()
         except Exception as exc:
             log.warning("STANDBY FLUSHDB failed: %r", exc)
+
+
+async def _close_session(session: LeaderSession) -> None:
+    """The aborted term's close: `aclose_for_abort()` when the session has one (EngineSession: `aclose` within the
+    term's own `drain_aclose_s`, the budget DRAINING uses, K2), else its plain `aclose()`, else nothing. A failure
+    is logged; it never stops the controller from releasing the lease."""
+    fn = getattr(session, "aclose_for_abort", None) or getattr(session, "aclose", None)
+    if fn is None:
+        return
+    try:
+        await fn()
+    except Exception:
+        log.exception("closing the aborted term's session failed")
 
 
 def _spill_busy(session: LeaderSession | None) -> Callable[[], bool] | None:

@@ -13,7 +13,7 @@ from types import MappingProxyType
 
 from src.oversee.dayroll import trading_day
 from src.oversee.halt import HaltEvent, HaltTxn, NewHaltEvent
-from src.oversee.notify import EpisodeKey, OutboxRow
+from src.oversee.notify import ARM_OUTBOX_KIND, EpisodeKey, OutboxRow
 from src.oversee.snapshot import AccountSnapshot, BreachAck, DependencyUnavailable, SodMark, StopWatchKey
 from src.oversee.sweep import AccountWrite, CasConflict, EpochMismatch
 from src.oversee.types import BreachState, HaltLevel, StateKey, Transition
@@ -148,7 +148,9 @@ class InMemoryOverseeDb:
         self._add_outbox(rows)
 
     async def pending(self, limit: int) -> list[OutboxRow]:
-        rows = [r for r in self.t.outbox if r.outbox_id is not None and r.outbox_id not in self.t.outbox_sent]
+        """Unsent rows, oldest first; never an ARM notice (kind `arm`, PR4), like the PostgreSQL store."""
+        rows = [r for r in self.t.outbox if r.outbox_id is not None and r.outbox_id not in self.t.outbox_sent
+                and str(r.kind) != ARM_OUTBOX_KIND]
         return rows[:limit]
 
     async def mark_sent(self, outbox_id: int, at_ms: int, delivered: bool) -> None:

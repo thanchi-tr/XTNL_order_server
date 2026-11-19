@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import pathlib
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -57,7 +58,7 @@ from src.adapters.base import BrokerAdapter, TransientBrokerError
 from src.adapters.mock import MockBrokerAdapter, build_fx_fixture
 from src.adapters.pepperstone.adapter import PepperstoneAdapter
 from src.adapters.pepperstone.tokens import TokenPair, TokenStore
-from src.adapters.ratelimit import RestBudget
+from src.adapters.ratelimit import RestBudget, effective_bars_per_min
 from src.adapters.stonex.adapter import StoneXAdapter
 from src.cache.client import create_redis
 from src.cache.live_reader import RunIdReader, info_run_id
@@ -77,7 +78,7 @@ from src.runtime.config import RuntimeConfig
 from src.runtime.etcd import EtcdClient, EtcdTls, HttpEtcdClient
 from src.runtime.exits import ExitFn, hard_exit
 from src.runtime.health import HealthBoard
-from src.runtime.lease import LeaseKeeper
+from src.runtime.lease import LeaseKeeper, system_suspend_clock
 from src.runtime.maintenance import MaintenanceSource, maintenance_source_from_env
 from src.runtime.node import NodeController
 from src.runtime.roles import NodeRole
@@ -105,15 +106,28 @@ from src.runtime.probes import (
     TlsConnector,
     tls_handshake,
 )
+from src.runtime.optional_settings import OptionalFlags, optional_flags_from_env
+from src.oversee.risk import stop_at_entry
+from src.oversee.stop_rule import configure_stop_rule
 from src.runtime.session import (
     EngineSession,
+    OptionalBootstrap,
     SessionContext,
     SessionTimings,
     check_drain_budget,
     default_credential_generation,
 )
+from src.runtime.single_pc import (
+    DirectChannelPager,
+    NotRecordingWatch,
+    PgAutoResumeStore,
+    SafeHoldAutoResume,
+    single_pc_settings_from_env,
+)
 from src.runtime.spill_standby import NodeSpillDrain
 from src.runtime.supervisor import LogPager, TaskSupervisor
+from src.runtime.sleeplog import FILE_NAME as SLEEP_LOG_FILE
+from src.runtime.sleeplog import SleepFenceLog
 from src.runtime.uptime import SuspendEvent, UptimeStore, UptimeTracker, ping_s_from_env
 from src.secrets.aws import CredentialProvider, Imdsv2Credentials
 from src.secrets.kms import Cipher, KmsCipher, KmsSettings
@@ -374,7 +388,9 @@ class RestBudgets:
     """One REST token bucket per adapter id for the whole process (operations.md §15): every term's adapter and a
     replacement built from a rotated secret share it, so a rotation or a new term never hands out a fresh full
     bucket next to tokens already spent, and `xtnl_rest_requests_total` stays cumulative. The limits come from
-    the adapter's settings (`*_REST_RATE_PER_S` / `*_REST_BURST`); a changed limit replaces the bucket."""
+    the adapter's settings (`*_REST_RATE_PER_S` / `*_REST_BURST`, and the BARS cap `*_REST_BARS_PER_MIN`). A
+    changed rate or burst replaces the bucket; a changed BARS cap alone is set in place, so the bucket keeps its
+    tokens, `requests_total` and the outcome counters S31 reads."""
 
     def __init__(self) -> None:
         self._by_id: dict[str, RestBudget] = {}
@@ -392,13 +408,20 @@ class RestBudgets:
         if cfg is None:
             return None
         rate, burst = float(cfg.rest_rate_per_s), int(cfg.rest_burst)
+        # The BARS cap (design PR11): `*_REST_BARS_PER_MIN`, default a quarter of the rate, at most half of it.
+        bars = effective_bars_per_min(rate, cfg.rest_bars_per_min)
         cur = self._by_id.get(plan.adapter_id)
         if cur is not None and cur.rate_per_s == rate and cur.capacity == burst:
+            if cur.bars_per_min != bars:
+                log.warning("%s: REST BARS cap changed (%d/min -> %d/min); same bucket", plan.adapter_id,
+                            cur.bars_per_min, bars)
+                cur.bars_per_min = bars
             return cur
         if cur is not None:
-            log.warning("%s: REST limits changed (%.3g/s burst %d -> %.3g/s burst %d); new bucket", plan.adapter_id,
-                        cur.rate_per_s, cur.capacity, rate, burst)
-        fresh = RestBudget(plan.adapter_id, rate_per_s=rate, burst=burst)
+            log.warning("%s: REST limits changed (%.3g/s burst %d bars %d/min -> %.3g/s burst %d bars %d/min); "
+                        "new bucket", plan.adapter_id, cur.rate_per_s, cur.capacity, cur.bars_per_min, rate, burst,
+                        bars)
+        fresh = RestBudget(plan.adapter_id, rate_per_s=rate, burst=burst, bars_per_min=bars)
         self._by_id[plan.adapter_id] = fresh
         return fresh
 
@@ -584,6 +607,8 @@ class EngineHooks:
     require_keeper_thread: bool = True
     maintenance: MaintenanceSource | None = None
     uptime_store: UptimeStore | None = None
+    # S09: the `optional-bootstrap` factory (S31 wires the production one); used only with XTNL_MD_ENABLED=1.
+    optional_bootstrap: OptionalBootstrap | None = None
 
 
 @dataclass(frozen=True)
@@ -616,6 +641,26 @@ class Engine:
                 await close()
             except Exception as exc:
                 log.warning("engine close step failed: %r", exc)
+
+
+def _production_optional_bootstrap(flags: OptionalFlags, raw: Mapping[str, str], config: RuntimeConfig,
+                                   settings: EngineSettings, control: ConnectionSource) -> OptionalBootstrap | None:
+    """S31: the production `optional-bootstrap` factory, built only when `XTNL_MD_ENABLED=1` (the modules of the
+    optional services are not even imported otherwise). The ARM pool uses the engine DSN under its own
+    `application_name` and `SET ROLE xtnl_arm`; the control pool reads the epoch, the previous term and this node's
+    market-data record; the FAILED spool sits beside the DLQ spill file. S32: the production plan
+    (`src/runtime/optional_plan.py`) gives the tasks and the request handlers."""
+    if not flags.md_enabled:
+        return None
+    from src.runtime.optional import OptionalDeps, default_arm_pool, make_optional_bootstrap
+    from src.runtime.optional_plan import production_plan
+
+    unfiltered = tuple(sorted({StoneXAdapter.adapter_id for p in settings.adapters
+                               if p.stonex is not None and p.stonex.price_unfiltered}))
+    return make_optional_bootstrap(OptionalDeps(
+        environ=raw, repo_root=pathlib.Path(__file__).resolve().parents[2], spool_dir=config.spill_path.parent,
+        arm_pool=default_arm_pool(settings.storage.dsn) if flags.arm_enabled else None, control=control,
+        unfiltered=unfiltered, plan=production_plan(raw)))
 
 
 def build_engine(config: RuntimeConfig, *, environ: Mapping[str, str] | None = None,
@@ -687,7 +732,11 @@ def build_engine(config: RuntimeConfig, *, environ: Mapping[str, str] | None = N
         async def close_etcd() -> None:
             http_etcd.close()
         closers.append(close_etcd)
-    keeper = LeaseKeeper(etcd, fence=exit_fn)
+    # S38g (round 14): a fence in an iteration that follows a suspend (a PC sleep longer than the fence) is recorded
+    # node-locally first, so the ARM knows that restart for a sleep's, not a crash's (src/runtime/sleeplog.py)
+    sleep_log = SleepFenceLog(config.spill_path.parent / SLEEP_LOG_FILE)
+    keeper = LeaseKeeper(etcd, fence=exit_fn, on_suspended_fence=sleep_log.record,
+                         suspend_clock=system_suspend_clock())
     board = HealthBoard(etcd, node)
     timings = h.timings or SessionTimings()
     lt = keeper.timings
@@ -787,6 +836,21 @@ def build_engine(config: RuntimeConfig, *, environ: Mapping[str, str] | None = N
     # Engine uptime (every node, any role) and the leader's downtime catch-up (migration 0012). The tracker's
     # coverage / resume hooks are bound to the controller below.
     uptime = UptimeTracker(h.uptime_store or PgUptimeStore(control), node, ping_s=ping_s, clock_ms=clock_ms)
+    # S09 (plan §2, RT-M13): the two enable flags, parsed tolerantly (a bad value is off plus a page per term,
+    # never a WiringError); the other XTNL_MD_* / XTNL_ARM_* settings are parsed inside the optional bootstrap.
+    optional_flags = optional_flags_from_env(raw)
+    for problem in optional_flags.problems:
+        log.warning("config: %s", problem)
+    # S38f: the S07 / PR1 Oversee stop rule only with XTNL_OVERSEE_STOP_AT_ENTRY=1 (off: the exact pre-S07 rule).
+    stop_problem = configure_stop_rule(raw)
+    if stop_problem is not None:
+        log.warning("config: %s", stop_problem)
+    log.info("oversee stop rule: %s", "S07 kind rules (XTNL_OVERSEE_STOP_AT_ENTRY=1)" if stop_at_entry()
+             else "pre-S07 (XTNL_OVERSEE_STOP_AT_ENTRY off)")
+    if optional_flags.md_enabled:
+        # PR13 (S32): this node's registry tokens in its health record (every role; read by `arm config accept`).
+        from src.runtime.optional_plan import registry_tokens
+        probe.registry_tokens = registry_tokens
     ctx = SessionContext(
         node_id=node, spill_path=config.spill_path, redis=redis, ports=h.ports or default_ports, adapters=adapters,
         lease=keeper, notifications=settings.notifications, deadman=settings.deadman, oversee=settings.oversee,
@@ -799,7 +863,10 @@ def build_engine(config: RuntimeConfig, *, environ: Mapping[str, str] | None = N
         deadman_token=deadman_token_loader(source, raw) if source.kind != "env" else None,
         heartbeat_copy=settings.heartbeat_copy,
         heartbeat_copy_token=heartbeat_copy_token_loader(source, raw) if source.kind != "env" else None,
-        catchup=catchup_settings, catchup_metrics=CatchupMetrics(), engine_run_id=lambda: uptime.run_id)
+        catchup=catchup_settings, catchup_metrics=CatchupMetrics(), engine_run_id=lambda: uptime.run_id,
+        optional_flags=optional_flags, sleep_log=sleep_log,
+        optional_bootstrap=h.optional_bootstrap or _production_optional_bootstrap(
+            optional_flags, raw, config, settings, control))
 
     def session_factory(epoch: Epoch) -> EngineSession:
         return EngineSession(ctx, epoch)
@@ -807,11 +874,36 @@ def build_engine(config: RuntimeConfig, *, environ: Mapping[str, str] | None = N
     # Any node drains its own spill file outside a leader term (tier-persistence.md §5): at start-up, and
     # in STANDBY / SAFE_HOLD whenever PostgreSQL accepts the idempotent insert again.
     spill = NodeSpillDrain(SpillOnlySink(control), config.spill_path, node=node, clock_ms=clock_ms, pager=pager)
+    # Single PC only (XTNL_SINGLE_PC=1, set by deploy/local/start-xtnl.ps1 / run-local.ps1; never on AWS): SAFE_HOLD
+    # auto-resume after a cool-down and the "not recording" page (operations.md §4, §17; src/runtime/single_pc.py).
+    single_pc = single_pc_settings_from_env(raw)
+    for problem in single_pc.problems:
+        log.warning("config: %s", problem)
+    auto_resume: SafeHoldAutoResume | None = None
+    idle_watch: NotRecordingWatch | None = None
+    direct_pager: DirectChannelPager | None = None
+    if single_pc.enabled:
+        auto_resume = SafeHoldAutoResume(single_pc, PgAutoResumeStore(control, mirror=mirror_safe_hold))
+        idle_watch = NotRecordingWatch(single_pc.idle_page_s * 1000)
+        # its critical pages arise with no leader (no outbox): straight to the Oversee channels (§2 exception)
+        static_notifications = settings.notifications
+
+        def notification_settings() -> NotificationSettings:
+            return static_notifications
+
+        direct_pager = DirectChannelPager(
+            settings_from_secrets(source, raw) if source.kind != "env" else notification_settings,
+            h.http_client or _http_client, clock_ms=clock_ms)
+        closers.append(direct_pager.aclose)
+        log.warning("config: XTNL_SINGLE_PC=1: SAFE_HOLD auto-resumes after a %d s cool-down (doubling to %d s, at "
+                    "most %d within %d h); single-PC deployments only", single_pc.resume_first_s,
+                    single_pc.resume_max_s, single_pc.resume_limit, single_pc.resume_window_s // 3600)
     controller = NodeController(node, keeper=keeper, board=board, probe=probe, terms=cluster, cluster=cluster,
                                 local_redis=StandbyRedisFlush(redis), session_factory=session_factory,
                                 pager=pager, ledger=cluster, exit_fn=exit_fn, clock_ms=clock_ms,
                                 require_keeper_thread=h.require_keeper_thread, standby_work=spill,
-                                standby_delay_after_drain_s=timings.drain_spill_s)
+                                standby_delay_after_drain_s=timings.drain_spill_s, auto_resume=auto_resume,
+                                idle_watch=idle_watch, direct_pager=direct_pager)
 
     def leader_streaming() -> Mapping[str, bool]:
         session = controller.session
@@ -871,7 +963,8 @@ CHECK_EPOCH: Final = Epoch("check-config", 0)
 async def check_composition(config: RuntimeConfig, *, environ: Mapping[str, str] | None = None,
                             hooks: EngineHooks | None = None) -> list[str]:
     """`--check-config`: build the engine and one term's session (placeholder epoch, no connection),
-    then close them. Returns the problems; an empty list means the composition is complete."""
+    then close them. Returns the problems; an empty list means the composition is complete. The session never
+    reaches LEADER here, so `start_optional_services` (and any optional bootstrap factory) is never called."""
     problems = list(config.problems())
     if problems:
         return problems

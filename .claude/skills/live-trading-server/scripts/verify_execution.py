@@ -14,6 +14,9 @@ Checks (current design, .claude/rules/*):
   4. Topic isolation: a price surge never blocks or drops order / position / account items.
   5. DLQ spooler: offer() is a pure in-memory append (no I/O, not a coroutine).
   6. Oversee: ActionGate fails closed; no Oversee timers exist (no oversee:timers usage).
+  7. ARM lockout: src/riskmgr/lockout.py passes today's src/riskmgr, src/marketdata, src/armconfig tree (no
+     violation, nothing unreadable) and refuses a planted sender name and network import.
+  8. ARM registry: every released (pinned) strategy / guard / indicator version still loads (design §B6.1).
 """
 from __future__ import annotations
 
@@ -104,6 +107,18 @@ def _() -> None:
         except ExecutionLockedError:
             continue
         raise AssertionError(f"BROKER_ENV={bad!r} accepted")
+
+
+@check("read-only: ARM lockout scanner")
+def _() -> None:
+    from src.riskmgr.lockout import Rule, scan, scan_source
+
+    result = scan([ROOT])
+    assert not result.violations, "; ".join(str(v) for v in result.violations[:5])
+    assert not result.incomplete, "; ".join(result.incomplete[:5])
+    assert any(s.endswith("src/riskmgr/lockout.py") for s in result.scanned), "the scanner did not scan itself"
+    planted = scan_source("import socket\nclass ModifyStop:\n    pass\n", "src/riskmgr/planted.py")
+    assert {v.rule for v in planted} >= {Rule.IMPORT, Rule.NAME_BAN}, "a planted sample was not refused"
 
 
 # ---------------------------------------------------------------- 2. adapter isolation
@@ -269,6 +284,18 @@ def _() -> None:
     from src.oversee import gate as gatemod
 
     assert hasattr(gatemod, "ActionGate"), "src/oversee/gate.py must define ActionGate"
+
+
+@check("arm: every pinned KIND:VERSION is still in the registry")
+def _() -> None:
+    from src.ops.arm_registry import PINNED_TOKENS, pinned_registry_problems
+
+    assert PINNED_TOKENS, "PINNED_TOKENS must list the released versions"
+    for t in PINNED_TOKENS:
+        kind, _, version = t.rpartition(":")
+        assert kind and version.isdigit() and int(version) >= 1, f"malformed pinned token {t!r}"
+    problems = pinned_registry_problems()
+    assert not problems, "; ".join(problems)
 
 
 def main() -> int:

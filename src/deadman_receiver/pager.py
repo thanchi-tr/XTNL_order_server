@@ -54,6 +54,17 @@ class Pager:
         self.failed = 0
         self.dropped = 0
 
+    def replace_transports(self, transports: Sequence[AlertTransport]) -> None:
+        """K10 (operations.md §13 rotation without restart): use rebuilt transports (rotated channel credentials).
+        A pending retry moves to the new transport of the same backend, so it is retried with the new credentials;
+        one whose backend is gone keeps its old transport until it succeeds or gives up. Never empties the set."""
+        if not transports:
+            raise ValueError("the receiver needs at least one paging transport")
+        by_backend = {t.backend: t for t in transports}
+        for p in self._pending:
+            p.transport = by_backend.get(p.transport.backend, p.transport)
+        self._transports = tuple(transports)
+
     @property
     def backends(self) -> tuple[str, ...]:
         return tuple(t.backend for t in self._transports)

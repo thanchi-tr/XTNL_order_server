@@ -76,6 +76,51 @@ IMPLEMENTATION_PLAN 7.1:
 * A row the store refused (`IllegalTransitionParked`, relayed by the consumers through
   `CommitBarrier.refused`, or by a caller through `on_store_refused`) does not stay in memory with its refused
   status: the stored status is restored on that row (or the row is forgotten when the stored status is unknown).
+
+Old schema (plan S38f): `optional_payload()` False (the schema has no 0015 columns: migrations held back by
+`XTNL_MIGRATIONS_ACCEPTED_UPTO`, `src/db/schema_compat.py`) makes every entity row and instrument enter in its pre-0015
+shape (`without_optional_payload`: `order_kind` and the PR7 instrument fields None, checksum re-sealed) before anything
+else looks at it, so nothing stored, cached or published differs from what the pre-0015 code produced.
+
+ARM prerequisites (design PR1, PR8, PR9; arm-implementation-plan S04):
+* `order_kind` inheritance: an order row without a kind takes the entity's known kind (`AdapterRuntime.order_kind`, a
+  plain dict seeded from the stored rows), before the version compare, as `broker_seq` does, so a stream / REST
+  resync never flips a STOP child to None. Two different known kinds page `order_kind_conflict` once per entity and
+  the entity counts as None (unknown) for the rest of the term.
+* Version labels: every labelled row carries `origin` (`stream`, `snapshot`, `history`, `dlq`, `stop_read`: the path
+  that read it) and `broker_time_source` (`BROKER` when its `broker_updated_at_ms` is the broker's own record time,
+  else `WATERMARK`: a watermark-labelled REST row, or an entity type kept in the local-time domain). Both are
+  non-payload labels: checksums never change.
+* `reread_entity(..., origin="dlq")` returns a `RereadResult` (status, labelled row, version string, send time);
+  `reread_stop_orders(adapter_id)` makes one stop-order list read (`fetch_active_stop_orders`, REST class BARS) and
+  applies it row by row, never closing an entity absent from the list.
+
+Market-data prerequisites (design PR5, PR6; arm-implementation-plan S05):
+* Tick-only symbols: `set_md_tick_symbols(adapter_id, symbols)` keeps a separate per-adapter set (the market-data
+  layer's `XTNL_TICK_SYMBOLS`, empty by default). They are subscribed together with the required symbols (stream
+  start and `ensure_ticks()`) but never join `rt.tick_symbols` / `pending_symbols`, which feed the session's wanted
+  symbols (SM10's adapter OPEN), the stale-price watch and the clean-mid watch. A tick of a tick-only symbol
+  (`is_md_only`) reaches `on_price_tick` only: it is never published to `market.price.dto`, so it never reaches the
+  Redis price keys or `last_clean_marks`. Its `ensure_ticks()` runs in a separate call whose failure is only logged
+  and retried, and a per-market UNSUBSCRIBED / ERROR on it closes its interval without opening the prices gap. A
+  removed tick-only symbol is kept as retired (`md_retired`): the adapters subscribe it again at every stream start,
+  so it stays tick-only for the runtime's life unless it is held. When no required symbol is asked for, the stream
+  starts with the (empty) required set only, the tick-only symbols get their own `ensure_ticks()`, and the stream
+  is trivially subscribed; a tick-only market's SUBSCRIBED never marks the stream subscribed after a required
+  market or the whole stream failed.
+* Per-market SUBSCRIBED intervals: `StreamEvent.market` opens / closes one market's interval (a whole-stream
+  SUBSCRIBED opens every market the adapter reports in `subscribed_price_markets`, else every requested market; a
+  socket or session loss, a whole-stream UNSUBSCRIBED / ERROR, the end of the prices pump and its restart close
+  them). `on_price_subscription(adapter_id, market, subscribed, ts_ms)` is called on each open / close (pure, never
+  awaited, its errors logged and swallowed; `ts_ms` is always this orchestrator's clock); a downtime catch-up's
+  fence hold never closes an interval. A per-market SUBSCRIBED clears only that market's snapshot tracking (IN-12).
+* `on_stream_frame(adapter_id, market, ts_ms)` (plan S39b, go-live gate `receipt_gap_feed`): the per-adapter frame
+  hook of the market-data layer's receipt-gap detector, called with market None (adapter-wide) on every prices-stream
+  HEARTBEAT while that subscription is SUBSCRIBED and not lost (`ts_ms` is this orchestrator's clock). Pure, never
+  awaited; an error is logged (throttled per adapter) and never touches the socket path. Ticks reach the detector
+  through `on_price_tick` already, so a silence is a stretch with neither ticks nor heartbeats.
+* `dropped_prices_by_market(adapter_id)`: price frames dropped here (backpressure, a full price topic) per symbol,
+  plus the adapter's own `dropped_price_frames` (frames and lost updates per market) when it has one.
 """
 from __future__ import annotations
 
@@ -89,6 +134,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
+from enum import Enum
 from typing import Literal, Protocol, TypeVar
 
 from src.adapters.base import (
@@ -103,20 +149,26 @@ from src.adapters.base import (
     cash_flows_partial,
     history_read,
 )
+from src.adapters.ratelimit import RestPriority, clear_rest_sent_ms, rest_priority, rest_sent_ms
 from src.dto import (
     AccountDTO,
     AccountLive,
+    BrokerTimeSource,
     CashFlowDTO,
     Decision,
     InstrumentSpec,
     OrderDTO,
+    OrderKind,
     OrderStatus,
+    Origin,
     PositionDTO,
     PriceDTO,
     Source,
     decide,
     is_future_timestamp,
     is_legal_transition,
+    version_str,
+    without_optional_payload,
 )
 from src.config import ExecutionLockedError
 from src.observability.redact import redact_urls
@@ -175,6 +227,8 @@ DRIVER_ERROR_PAGE_INTERVAL_MS = 300_000    # at most one SM4 driver-error page p
 #: reconnecting and re-snapshotting every ~1 s.
 DRIVER_ERROR_STREAK_RESET_MS = 60_000
 FRAME_LOST_LOG_INTERVAL_MS = 60_000        # full "frame lost" log (with traceback) per (adapter, stream)
+MD_ENSURE_RETRY_MS = 60_000                # a failed ensure_ticks() of tick-only symbols is retried after this
+HOOK_ERROR_LOG_INTERVAL_MS = 60_000        # full log of a failing on_price_subscription hook, per adapter
 #: Optional adapter attribute: monotonic counters of broker rows the adapter could not map and skipped, keyed
 #: by stream kind ("orders" also counts positions; "positions" is accepted as an alias), or a single int that
 #: counts for both the "orders" and "account" streams. Any increase opens that stream's gap.
@@ -286,6 +340,80 @@ class CatchupPass:
     timed_out: bool = False
 
 
+class RereadStatus(str, Enum):
+    """What a by-id re-read (`reread_entity`) or one row of a stop-order list read did (design PR8, IN-4). The
+    version compare is the orchestrator's in-memory one at publish time; the store repeats it against PostgreSQL."""
+
+    APPLIED = "APPLIED"               # published, newer and different content
+    NOOP = "NOOP"                     # published, same content (the store only advances the stored version)
+    DROPPED_STALE = "DROPPED_STALE"   # published, but older than the known version (event_log DROPPED_STALE)
+    NOT_FOUND = "NOT_FOUND"           # the broker has no row for that id
+    TRANSIENT = "TRANSIENT"           # read, but not handed over (parked in the DLQ, or lost like a dropped frame)
+
+
+_STATUS_OF: dict[Decision, RereadStatus] = {
+    Decision.APPLY: RereadStatus.APPLIED,
+    Decision.NOOP_ADVANCE: RereadStatus.NOOP,
+    Decision.NOOP: RereadStatus.NOOP,
+    Decision.DROP_STALE: RereadStatus.DROPPED_STALE,
+}
+
+
+@dataclass(frozen=True)
+class ExecutionTimeResult:
+    """`history_execution_time` (plan S39b, go-live gate `entry_time_source`): the execution times the broker's trade
+    history gives for one entry order (`FILLED` / `PARTIALLY_FILLED`, not reduce-only, matched on the broker order id),
+    oldest first, distinct; `complete` is the history answer's own flag. Times only, never a price or a quantity."""
+
+    adapter_id: str
+    order_id: str
+    fill_times_ms: tuple[int, ...]
+    complete: bool
+
+    @property
+    def first_fill_ms(self) -> int | None:
+        return self.fill_times_ms[0] if self.fill_times_ms else None
+
+
+@dataclass(frozen=True)
+class RereadResult:
+    """The outcome of one re-read row. `dto`: the labelled version that was published (APPLIED, NOOP,
+    DROPPED_STALE), the broker's row as read when it was not handed over (TRANSIENT), None for NOT_FOUND.
+    `version`: `version_str` of the labelled row (None when it was not labelled). `sent_ms`: wall time the read's
+    first request left for the broker, after any REST token wait (`rest_sent_ms`, IN-5); None when unknown."""
+
+    status: RereadStatus
+    dto: OrderDTO | PositionDTO | AccountDTO | None = None
+    version: str | None = None
+    sent_ms: int | None = None
+
+    @property
+    def found(self) -> bool:
+        """The broker had a row (the DLQ check-before-retry's 'converged' read)."""
+        return self.status is not RereadStatus.NOT_FOUND
+
+
+@dataclass(frozen=True)
+class StopReadResult:
+    """One stop-order list read (`reread_stop_orders`, design PR9): one `RereadResult` per listed row, never a row
+    for an entity the list did not name. `supported` False: the adapter has no such read (nothing was read)."""
+
+    adapter_id: str
+    supported: bool
+    rows: tuple[RereadResult, ...] = ()
+    sent_ms: int | None = None
+    skipped: int = 0                  # listed rows that are not this adapter's (ignored)
+
+
+@dataclass(frozen=True)
+class _Accepted:
+    """`_accept_detail`: whether the row reached the bus, the labelled row and the in-memory version decision."""
+
+    published: bool
+    labelled: OrderDTO | PositionDTO | AccountDTO | None = None
+    decision: Decision | None = None
+
+
 class _LRU(OrderedDict[str, _S]):
     def __init__(self, cap: int) -> None:
         super().__init__()
@@ -311,6 +439,10 @@ class AdapterRuntime:
         self.positions: _LRU[PositionDTO] = _LRU(max_entities)
         self.accounts: dict[str, AccountDTO] = {}
         self.broker_seq: dict[str, int] = {}
+        #: entity key -> the order's known kind (design PR1); a key held with None had two different known kinds
+        #: (`order_kind_conflict`) and counts as unknown for the rest of the term. A plain dict, not the LRU, so
+        #: an evicted entity never loses its kind.
+        self.order_kind: dict[str, OrderKind | None] = {}
         self.instruments: dict[str, InstrumentSpec] = {}
         self.snapshots_done = 0
         self.local_loaded = False
@@ -362,6 +494,29 @@ class AdapterRuntime:
         #: orders placed and finished while it lasted are in no reconcile snapshot, so the downtime catch-up
         #: re-reads the broker history after it (src/runtime/catchup.py). A fence hold is not an interruption.
         self.last_interruption_seq = 0
+        #: Tick-only symbols (design PR5; `set_md_tick_symbols`): wanted by the market-data layer, never part of
+        #: `tick_symbols` / `pending_symbols`. `md_subscribed` is what the current prices stream was asked for
+        #: (stream start or a successful ensure_ticks), `md_pending` what still waits for ensure_ticks.
+        #: `md_retired`: tick-only symbols removed from the set. The adapters keep every market they ever subscribed
+        #: and subscribe it again on each stream start, so a retired symbol stays tick-only (never published, never
+        #: the prices gap) for the life of this runtime, until it is held or wanted again.
+        self.md_tick_symbols: frozenset[str] = frozenset()
+        self.md_subscribed: set[str] = set()
+        self.md_pending: set[str] = set()
+        self.md_retired: set[str] = set()
+        #: The current prices stream asked for at least one required symbol at its start (else the tick-only
+        #: symbols wait for their own ensure_ticks() and the stream is trivially subscribed, `start_missing_streams`).
+        self.price_required_asked = False
+        #: A whole-stream or required-market UNSUBSCRIBED / ERROR (or a socket loss) since the prices stream started:
+        #: from then on only a whole-stream or required market's SUBSCRIBED marks the stream subscribed again.
+        self.price_stream_failed = False
+        self.last_md_ensure_ms = 0
+        self.md_ensure_failed_ms = 0
+        #: Per-market price subscription intervals (design PR6): market -> start of its open interval (ms).
+        self.price_sub_since: dict[str, int] = {}
+        self.dropped_prices_by_symbol: dict[str, int] = {}   # price frames dropped here, per symbol
+        self.sub_hook_logged_ms = 0
+        self.frame_hook_logged_ms = 0
 
     def decl(self, entity: EntityType) -> VersionDecl:
         return self.adapter.VERSIONING.get(entity, _NO_DECL)
@@ -423,8 +578,12 @@ class IngestionOrchestrator:
                  transfer_sources: Mapping[str, bool] | None = None,
                  refresh_adapter: AdapterRefresher | None = None,
                  park_page_interval_ms: int = PARK_PAGE_INTERVAL_MS,
-                 clean_spread: CleanSpread | None = None, clean_mid_ms: int = CLEAN_MID_MS) -> None:
+                 clean_spread: CleanSpread | None = None, clean_mid_ms: int = CLEAN_MID_MS,
+                 on_price_subscription: Callable[[str, str, bool, int], None] | None = None,
+                 optional_payload: Callable[[], bool] | None = None,
+                 on_stream_frame: Callable[[str, str | None, int], None] | None = None) -> None:
         self.bus = bus
+        self._optional_payload = optional_payload
         self.spooler = spooler
         self.health = HealthMirror(health)
         self.hlc = hlc
@@ -445,6 +604,8 @@ class IngestionOrchestrator:
         self._instrument_sink = instrument_sink
         self._auth_poll_s = auth_poll_s
         self._on_price_tick = on_price_tick
+        self._on_price_subscription = on_price_subscription
+        self._on_stream_frame = on_stream_frame
         self._on_execution = on_execution
         self._pager = pager
         self._market_open = market_open
@@ -537,7 +698,7 @@ class IngestionOrchestrator:
             elif isinstance(item, (OrderDTO, PositionDTO, AccountDTO)):
                 observed = self.hlc.next()
                 self._accept_entity(rt, item, "STREAM", observed_seq=observed, local_ms=now,
-                                    watermark=None, stream=stream)
+                                    watermark=None, stream=stream, origin="stream")
             else:
                 self._frame_lost(rt, stream, f"unexpected stream item {type(item).__name__}")
         except Exception as exc:
@@ -608,16 +769,36 @@ class IngestionOrchestrator:
     def _on_control(self, rt: AdapterRuntime, ev: StreamEvent) -> None:
         sub = rt.subs[ev.stream]
         kind = ev.kind
+        prices = ev.stream == "prices"
         if kind is StreamEventKind.SUBSCRIBED:
-            if ev.stream == "prices":
-                rt.priced_symbols.clear()       # the next tick per symbol is the subscription snapshot
+            md_only = prices and ev.market is not None and self._md_only(rt, ev.market)
+            if prices:
+                self._price_subscribed(rt, ev)
+            if md_only and (sub.subscribed or rt.price_stream_failed):
+                # A tick-only market's own SUBSCRIBED leaves the stream's state (and the gap-clearing order) alone:
+                # it never marks the stream subscribed after a required market or the whole stream failed.
+                return
             sub.subscribed = True
             sub.subscribed_seq = self.hlc.next()
             rt.wake.set()
         elif kind is StreamEventKind.HEARTBEAT:
             if sub.subscribed and not sub.lost:
                 self._health(rt, "heartbeat", ev.stream)
+                if prices:
+                    self._frame_hook(rt, None, self._clock_ms())
         elif kind in (StreamEventKind.UNSUBSCRIBED, StreamEventKind.ERROR):
+            if prices:
+                at = self._clock_ms()
+                if ev.market is None:
+                    self._close_price_subs(rt, at)
+                else:
+                    self._close_price_sub(rt, ev.market, at)
+                    if self._md_only(rt, ev.market):
+                        # A tick-only market is the market-data layer's: losing it never opens the prices gap.
+                        log.warning("%s: tick-only market %s %s: %s", rt.adapter_id, ev.market, kind.value,
+                                    redact_urls(ev.detail)[:200])
+                        return
+                rt.price_stream_failed = True
             sub.subscribed = False
             self._open_gap(rt, ev.stream, f"{kind.value}: {ev.detail}")
         elif kind is StreamEventKind.GAP:
@@ -643,8 +824,11 @@ class IngestionOrchestrator:
         self._request_resync(rt)
 
     def _lose_all(self, rt: AdapterRuntime, why: str) -> None:
-        """Socket closed / lost or auth lost: every subscription on it is no longer SUBSCRIBED."""
+        """Socket closed / lost or auth lost: every subscription on it is no longer SUBSCRIBED (every price
+        market's interval closes)."""
         rt.priced_symbols.clear()
+        self._close_price_subs(rt, self._clock_ms())
+        rt.price_stream_failed = True
         rt.last_interruption_seq = self.hlc.next()
         for stream, sub in rt.subs.items():
             sub.subscribed = False
@@ -652,6 +836,93 @@ class IngestionOrchestrator:
                 sub.lost = True
                 self._health(rt, "lost", stream)
         log.warning("%s: all subscriptions lost (%s)", rt.adapter_id, why)
+
+    # ------------------------------------------------------------------ per-market price subscriptions (PR6)
+    def _price_subscribed(self, rt: AdapterRuntime, ev: StreamEvent) -> None:
+        """A prices SUBSCRIBED: a per-market one (`ev.market`) opens that market's interval and resets only its
+        snapshot tracking (IN-12); a whole-stream one (a batch subscribe) resets every symbol and opens every market
+        the adapter reports as subscribed (`subscribed_price_markets`), or, when it reports none, every market the
+        stream was asked for. A repeated SUBSCRIBED restarts the interval (the hook sees it open again). Every
+        interval timestamp (open and close) is this orchestrator's clock, never the adapter's `ev.at_ms`."""
+        at = self._clock_ms()
+        if ev.market is None:
+            rt.priced_symbols.clear()       # the next tick per symbol is the subscription snapshot
+            markets: Iterable[str] = sorted(self._subscribed_price_markets(rt))
+        else:
+            rt.priced_symbols.discard(ev.market)
+            markets = (ev.market,)
+        for market in markets:
+            rt.price_sub_since[market] = at
+            self._price_sub_hook(rt, market, True, at)
+
+    @staticmethod
+    def _subscribed_price_markets(rt: AdapterRuntime) -> set[str]:
+        """The markets a whole-stream SUBSCRIBED covers: the canonical symbols the adapter reports it actually
+        subscribed (`subscribed_price_markets`; a failed cTrader single-symbol subscribe or an unresolved StoneX
+        symbol is not in it), else what the stream was asked for (required, tick-only and retired tick-only)."""
+        try:
+            raw = getattr(rt.adapter, "subscribed_price_markets", None)
+        except Exception:
+            log.exception("%s: subscribed_price_markets unreadable", rt.adapter_id)
+            raw = None
+        if isinstance(raw, (set, frozenset)):
+            return {m for m in raw if isinstance(m, str) and m}
+        return rt.tick_symbols | rt.md_subscribed | rt.md_retired
+
+    def _close_price_sub(self, rt: AdapterRuntime, market: str, at: int) -> None:
+        if rt.price_sub_since.pop(market, None) is not None:
+            self._price_sub_hook(rt, market, False, at)
+
+    def _close_price_subs(self, rt: AdapterRuntime, at: int) -> None:
+        """Every open price interval ends (the socket or session is lost, the prices pump ended or restarts)."""
+        for market in sorted(rt.price_sub_since):
+            self._close_price_sub(rt, market, at)
+
+    def _price_sub_hook(self, rt: AdapterRuntime, market: str, subscribed: bool, at: int) -> None:
+        """`on_price_subscription(adapter_id, market, subscribed, ts_ms)`: pure, never awaited; an error is logged
+        (throttled per adapter) and never touches the socket path."""
+        if self._on_price_subscription is None:
+            return
+        try:
+            self._on_price_subscription(rt.adapter_id, market, subscribed, at)
+        except Exception:
+            now = self._clock_ms()
+            if not rt.sub_hook_logged_ms or now - rt.sub_hook_logged_ms >= HOOK_ERROR_LOG_INTERVAL_MS:
+                rt.sub_hook_logged_ms = now
+                log.exception("%s: price subscription hook failed", rt.adapter_id)
+
+    def _frame_hook(self, rt: AdapterRuntime, market: str | None, at: int) -> None:
+        """`on_stream_frame(adapter_id, market, ts_ms)` (plan S39b): pure, never awaited; an error is logged
+        (throttled per adapter) and never touches the socket path."""
+        if self._on_stream_frame is None:
+            return
+        try:
+            self._on_stream_frame(rt.adapter_id, market, at)
+        except Exception:
+            now = self._clock_ms()
+            if not rt.frame_hook_logged_ms or now - rt.frame_hook_logged_ms >= HOOK_ERROR_LOG_INTERVAL_MS:
+                rt.frame_hook_logged_ms = now
+                log.exception("%s: stream frame hook failed", rt.adapter_id)
+
+    def price_subscriptions(self, adapter_id: str) -> dict[str, int]:
+        """The open per-market price intervals: market -> start (ms). A copy."""
+        return dict(self._runtimes[adapter_id].price_sub_since)
+
+    def dropped_prices_by_market(self, adapter_id: str) -> dict[str, int]:
+        """Price frames lost per symbol: dropped here (backpressure, a full price topic) plus the adapter's own
+        `dropped_price_frames` (full channel and lost updates per market) when it reports them. Counts only."""
+        rt = self._runtimes[adapter_id]
+        out = dict(rt.dropped_prices_by_symbol)
+        try:
+            raw = getattr(rt.adapter, "dropped_price_frames", None)
+        except Exception:
+            log.exception("%s: dropped_price_frames unreadable", adapter_id)
+            raw = None
+        if isinstance(raw, Mapping):
+            for market, n in raw.items():
+                if isinstance(market, str) and isinstance(n, int) and not isinstance(n, bool):
+                    out[market] = out.get(market, 0) + n
+        return out
 
     def _health(self, rt: AdapterRuntime, op: HealthOp, stream: StreamKind) -> None:
         """Enqueue a health op and track whether the stream's conn: key exists (heartbeat / reconcile write
@@ -721,10 +992,14 @@ class IngestionOrchestrator:
 
     # ------------------------------------------------------------------ entities
     def _label(self, rt: AdapterRuntime, dto: StatefulDTO, source: Source, observed_seq: int, local_ms: int,
-               watermark: int | None) -> StatefulDTO:
-        """Version labelling per the adapter's declaration (dto-contracts.md §2), then seq_id."""
+               watermark: int | None, origin: Origin) -> StatefulDTO:
+        """Version labelling per the adapter's declaration (dto-contracts.md §2), the PR8 labels (`origin`,
+        `broker_time_source`) and the PR1 `order_kind` inheritance, then seq_id."""
         decl = rt.decl(_entity_type(dto))
         t = dto.broker_updated_at_ms
+        # BROKER only for the broker's own record time; a watermark-labelled REST row and the local-time domain are
+        # WATERMARK (never a real broker time, so never `event_log.broker_time_ms`; IN-3, R11-M06).
+        time_source: BrokerTimeSource = "BROKER" if decl.has_broker_time and t else "WATERMARK"
         if not decl.has_broker_time:
             t = local_ms                                   # receipt time (stream) / send time (REST)
         elif t == 0 and source == "REST":
@@ -732,73 +1007,122 @@ class IngestionOrchestrator:
         bseq = dto.broker_seq
         if decl.has_broker_seq and bseq is None:
             bseq = rt.broker_seq.get(dto.entity_key)
-        return replace(dto, broker_updated_at_ms=t, broker_seq=bseq, source=source,
-                       observed_seq=observed_seq, seq_id=self.hlc.next())
+        if isinstance(dto, OrderDTO):
+            kind = self._order_kind(rt, dto)
+            if kind != dto.order_kind:
+                dto = replace(dto, order_kind=kind)        # a payload field: the checksum is re-sealed
+        return replace(dto, broker_updated_at_ms=t, broker_seq=bseq, source=source, origin=origin,
+                       broker_time_source=time_source, observed_seq=observed_seq, seq_id=self.hlc.next())
+
+    def _order_kind(self, rt: AdapterRuntime, dto: OrderDTO) -> OrderKind | None:
+        """The kind this order row is published with (design PR1, dto-contracts §2 as for `broker_seq`): an incoming
+        None takes the entity's known kind; a first known kind is remembered; two different known kinds page
+        `order_kind_conflict` once and the entity counts as None (unknown) for the rest of the term."""
+        key = dto.entity_key
+        incoming = dto.order_kind
+        if key in rt.order_kind and rt.order_kind[key] is None:
+            return None                                    # conflicted earlier: stays unknown
+        known = rt.order_kind.get(key)
+        if incoming is None or incoming == known:
+            return known
+        if known is None:
+            rt.order_kind[key] = incoming
+            return incoming
+        rt.order_kind[key] = None
+        log.error("%s: order_kind_conflict on %s (%s then %s); counted as unknown", rt.adapter_id, key, known,
+                  incoming)
+        self._episodes.active(f"order_kind_conflict:{key}", HIGH, f"order_kind_conflict: {rt.adapter_id}",
+                              f"order {dto.broker_order_id}: the broker sources disagree on its type ({known} / "
+                              f"{incoming}); it counts as an order of unknown type")
+        return None
 
     def _accept_entity(self, rt: AdapterRuntime, dto: StatefulDTO, source: Source, *, observed_seq: int,
-                       local_ms: int, watermark: int | None, stream: StreamKind, history: bool = False) -> bool:
+                       local_ms: int, watermark: int | None, stream: StreamKind, origin: Origin,
+                       history: bool = False) -> bool:
         """Validate, label and publish one stateful DTO. True if it reached the bus. `history`: a downtime
-        catch-up row; a finished order / CLOSED position from it subscribes no price (it needs none)."""
+        catch-up row; a finished order / CLOSED position from it subscribes no price (it needs none). `origin`:
+        the path that read the row (design PR8)."""
+        return self._accept_detail(rt, dto, source, observed_seq=observed_seq, local_ms=local_ms,
+                                   watermark=watermark, stream=stream, origin=origin, history=history).published
+
+    def _accept_detail(self, rt: AdapterRuntime, dto: StatefulDTO, source: Source, *, observed_seq: int,
+                       local_ms: int, watermark: int | None, stream: StreamKind, origin: Origin,
+                       history: bool = False) -> _Accepted:
+        """`_accept_entity` with what happened: the labelled row and the in-memory version decision (IN-4)."""
+        if self._optional_payload is not None and not self._optional_payload():
+            dto = without_optional_payload(dto)            # pre-0015 schema (S38f): the pre-0015 row shape
         bad = self._invalid(rt, dto)
         if bad is not None:
             log.error("%s: %s %s parked: %s", rt.adapter_id, bad[0], type(dto).__name__, bad[1])
             self._park(rt, dto, bad[0], stream, bad[1])     # the raw row, as received
-            return False
+            return _Accepted(False)
         decl = rt.decl(_entity_type(dto))
-        labelled: StatefulDTO = self._label(rt, dto, source, observed_seq, local_ms, watermark)
+        if source == "STREAM" and decl.has_broker_time and not dto.broker_updated_at_ms:
+            # K4 (dto-contracts.md §2): a stream row of a broker-time type without its broker time has no legal
+            # label: the watermark labels only REST rows and a local clock never goes in the broker-time slot (a 0
+            # would sort below every stored version, so a real change would drop as stale). Refused like a lost
+            # frame: its stream's gap opens and the RESYNCING REST pass reads the entity again (fail closed).
+            self._frame_lost(rt, stream, f"{type(dto).__name__} {dto.entity_key} stream row without its broker "
+                                         "time")
+            return _Accepted(False)
+        labelled: StatefulDTO = self._label(rt, dto, source, observed_seq, local_ms, watermark, origin)
         if decl.has_broker_seq and labelled.broker_seq is None:
             # Nothing to inherit: a null broker_seq sorts below every stored revision, so the store would drop a
             # real change as stale. Lost like a dropped frame instead: its stream's gap opens (fail closed).
             self._frame_lost(rt, stream, f"{type(dto).__name__} {dto.entity_key} has no broker_seq and none to "
                                          "inherit")
-            return False
+            return _Accepted(False, labelled)
         received = self._clock_ms()
         if decl.has_broker_time and dto.broker_updated_at_ms and is_future_timestamp(
                 dto.broker_updated_at_ms, received):
             ahead = dto.broker_updated_at_ms - received
             log.error("%s: future_timestamp %s (%d ms ahead)", rt.adapter_id, labelled.entity_key, ahead)
             self._park(rt, labelled, FUTURE_TIMESTAMP, stream, f"{ahead} ms ahead of receipt")
-            return False
+            return _Accepted(False, labelled)
         if source == "STREAM" and decl.has_broker_time and dto.broker_updated_at_ms:
             rt.watermark_ms = max(rt.watermark_ms or 0, dto.broker_updated_at_ms)
 
+        decision: Decision
         if isinstance(labelled, OrderDTO):
             if self._require_client_order_id and not labelled.client_order_id:
                 self._park(rt, labelled, MISSING_CLIENT_ORDER_ID, stream)
-                return False
+                return _Accepted(False, labelled)
             prev_o = rt.orders.get(labelled.entity_key)
-            newer = prev_o is None or decide(prev_o, labelled) in (Decision.APPLY, Decision.NOOP_ADVANCE)
+            decision = Decision.APPLY if prev_o is None else decide(prev_o, labelled)
+            newer = decision in (Decision.APPLY, Decision.NOOP_ADVANCE)
             if newer and prev_o is not None and not is_legal_transition(prev_o.status, labelled.status):
                 self._park(rt, labelled, ILLEGAL_TRANSITION, stream,
                            f"{prev_o.status.value} -> {labelled.status.value}")
-                return False
+                return _Accepted(False, labelled)
             if newer and source == "STREAM" and prev_o is not None and _order_executed(prev_o, labelled):
                 self._execution_evidence(rt, labelled.symbol, local_ms)
             if not self._publish(rt, labelled, stream):
-                return False
+                return _Accepted(False, labelled)
             if newer:
                 rt.orders.put(labelled.entity_key, labelled)
                 if not (history and labelled.status.terminal):
                     self._want_symbol(rt, labelled.symbol)
         elif isinstance(labelled, PositionDTO):
             prev_p = rt.positions.get(labelled.entity_key)
-            newer = prev_p is None or decide(prev_p, labelled) in (Decision.APPLY, Decision.NOOP_ADVANCE)
+            decision = Decision.APPLY if prev_p is None else decide(prev_p, labelled)
+            newer = decision in (Decision.APPLY, Decision.NOOP_ADVANCE)
             if newer and prev_p is not None and prev_p.status == "CLOSED" and labelled.status == "OPEN":
                 self._park(rt, labelled, ILLEGAL_TRANSITION, stream, "CLOSED -> OPEN")
-                return False
+                return _Accepted(False, labelled)
             if newer and source == "STREAM" and prev_p is not None and _position_executed(prev_p, labelled):
                 self._execution_evidence(rt, labelled.symbol, local_ms)
             if not self._publish(rt, labelled, stream):
-                return False
+                return _Accepted(False, labelled)
             if newer:
                 rt.positions.put(labelled.entity_key, labelled)
                 if not (history and labelled.status != "OPEN"):
                     self._want_symbol(rt, labelled.symbol)
         else:
             prev_a = rt.accounts.get(labelled.account_id)
-            newer = prev_a is None or decide(prev_a, labelled) in (Decision.APPLY, Decision.NOOP_ADVANCE)
+            decision = Decision.APPLY if prev_a is None else decide(prev_a, labelled)
+            newer = decision in (Decision.APPLY, Decision.NOOP_ADVANCE)
             if not self._publish(rt, labelled, stream):
-                return False
+                return _Accepted(False, labelled)
             self._account_owner[labelled.account_id] = rt.adapter_id
             if newer:
                 new_ccy = labelled.currency not in self._account_ccys(rt)
@@ -807,7 +1131,7 @@ class IngestionOrchestrator:
                     self._refresh_crosses(rt)    # held symbols may need a pnl_ccy -> this currency cross
         if newer and labelled.broker_seq is not None:
             rt.broker_seq[labelled.entity_key] = labelled.broker_seq
-        return True
+        return _Accepted(True, labelled, decision)
 
     def _publish(self, rt: AdapterRuntime, dto: StatefulDTO, stream: StreamKind) -> bool:
         try:
@@ -857,11 +1181,18 @@ class IngestionOrchestrator:
         if rt.clean_wanted_ms and tick.symbol in rt.clean_wanted_ms:
             self._clean_evidence(rt, tick)
         self._price_evidence(rt, tick)
+        if (rt.md_subscribed or rt.md_tick_symbols or rt.md_retired) and self._md_only(rt, tick.symbol):
+            return                           # a tick-only symbol: the market-data layer's (hook), never the topic
         if self.backpressure_overflow:
-            rt.dropped_prices += 1           # drop price frames at the parser
+            self._price_dropped(rt, tick.symbol)   # drop price frames at the parser
             return
         if self.bus.publish_price_nowait(replace(tick, seq_id=self.hlc.next())) is PricePut.DROPPED:
-            rt.dropped_prices += 1
+            self._price_dropped(rt, tick.symbol)
+
+    @staticmethod
+    def _price_dropped(rt: AdapterRuntime, symbol: str) -> None:
+        rt.dropped_prices += 1
+        rt.dropped_prices_by_symbol[symbol] = rt.dropped_prices_by_symbol.get(symbol, 0) + 1
 
     def _clean_threshold(self, adapter_id: str, symbol: str) -> Decimal | None:
         if self._clean_spread is None:
@@ -972,7 +1303,7 @@ class IngestionOrchestrator:
         def rest(dto: StatefulDTO, stream: StreamKind, seq: int = send_seq, local: int = send_ms,
                  wm: int | None = watermark) -> bool:
             return tracked(stream, lambda: self._accept_entity(rt, dto, "REST", observed_seq=seq, local_ms=local,
-                                                               watermark=wm, stream=stream))
+                                                               watermark=wm, stream=stream, origin="snapshot"))
 
         rep.orders = sum(rest(o, "orders") for o in open_orders)
         rep.positions = sum(rest(p, "orders") for p in positions)
@@ -1045,10 +1376,15 @@ class IngestionOrchestrator:
 
     @staticmethod
     def _seed_broker_seq(rt: AdapterRuntime, stored: StatefulDTO) -> None:
-        """The stored row's broker_seq becomes the entity's last seen one (inherited across a restart)."""
-        if stored.broker_seq is not None and stored.adapter_id == rt.adapter_id:
-            key = stored.entity_key
+        """The stored row's broker_seq becomes the entity's last seen one, and a stored order's known kind its
+        known kind (both inherited across a restart; design PR1)."""
+        if stored.adapter_id != rt.adapter_id:
+            return
+        key = stored.entity_key
+        if stored.broker_seq is not None:
             rt.broker_seq[key] = max(rt.broker_seq.get(key, stored.broker_seq), stored.broker_seq)
+        if isinstance(stored, OrderDTO) and stored.order_kind is not None:
+            rt.order_kind.setdefault(key, stored.order_kind)
 
     def _reconcile_after_commit(self, rt: AdapterRuntime, send_seq: int, bpass: BarrierPass | None) -> None:
         """Clear the pass's gaps only once the consumers have committed every row it published
@@ -1104,6 +1440,8 @@ class IngestionOrchestrator:
         `instruments`, then the Redis instrument: keys). A failed save does not fail SNAPSHOTTING: it is
         kept and retried from the STREAMING step."""
         specs = await rt.adapter.fetch_instruments()
+        if self._optional_payload is not None and not self._optional_payload():
+            specs = [without_optional_payload(s) for s in specs]    # pre-0015 schema (S38f)
         rt.instruments = {s.symbol: s for s in specs}
         rt.cross_cache.clear()
         self._refresh_crosses(rt)
@@ -1132,13 +1470,19 @@ class IngestionOrchestrator:
 
     # ================================================================== DLQ worker / Oversee relays
     async def reread_entity(self, adapter_id: str, event_type: Literal["ORDER", "POSITION", "ACCOUNT"],
-                            entity_id: str) -> StatefulDTO | None:
-        """Check-before-retry (tier-persistence.md §5): read the broker's row for that id, version it
-        at its own read and publish it. Returns the fresh row, or None if the broker has none."""
+                            entity_id: str, origin: Origin = "dlq") -> RereadResult:
+        """Read the broker's row for that id, version it at its own read and publish it (design PR8, IN-4).
+
+        Callers: the DLQ check-before-retry (tier-persistence.md §5; the integrity bridge maps the result back to
+        its `StatefulDTO | None` contract), origin `dlq`; the account refreshes of src/runtime/session.py, origin
+        `snapshot`. Returns the status, the labelled row, its version string and the request's send time
+        (`rest_sent_ms`, cleared before the read, so it names only this read's first request). Broker errors
+        propagate unchanged (the callers' failure handling is as before)."""
         rt = self._runtimes[adapter_id]
         send_seq, send_ms, wm = self.hlc.next(), self._clock_ms(), rt.watermark_ms
         fresh: StatefulDTO | None
         stream: StreamKind = "orders"
+        clear_rest_sent_ms()
         if event_type == "ORDER":
             fresh = await rt.adapter.fetch_order_status(entity_id)
         elif event_type == "POSITION":
@@ -1147,10 +1491,62 @@ class IngestionOrchestrator:
             stream = "account"
             accounts, _ = await rt.adapter.fetch_account_snapshot()
             fresh = next((a for a in accounts if a.account_id == entity_id), None)
-        if fresh is not None:
-            self._accept_entity(rt, fresh, "REST", observed_seq=send_seq, local_ms=send_ms, watermark=wm,
-                                stream=stream)
-        return fresh
+        sent = rest_sent_ms()
+        if fresh is None:
+            return RereadResult(RereadStatus.NOT_FOUND, sent_ms=sent)
+        return self._reread_row(rt, fresh, origin, send_seq, send_ms, wm, stream, sent)
+
+    def _reread_row(self, rt: AdapterRuntime, fresh: StatefulDTO, origin: Origin, send_seq: int, send_ms: int,
+                    wm: int | None, stream: StreamKind, sent: int | None) -> RereadResult:
+        """Publish one re-read row through the normal REST path and say what happened."""
+        acc = self._accept_detail(rt, fresh, "REST", observed_seq=send_seq, local_ms=send_ms, watermark=wm,
+                                  stream=stream, origin=origin)
+        if not acc.published or acc.labelled is None or acc.decision is None:
+            return RereadResult(RereadStatus.TRANSIENT, fresh,
+                                None if acc.labelled is None else version_str(acc.labelled), sent)
+        return RereadResult(_STATUS_OF[acc.decision], acc.labelled, version_str(acc.labelled), sent)
+
+    async def history_execution_time(self, adapter_id: str, order_id: str, since_ms: int,
+                                     until_ms: int) -> ExecutionTimeResult:
+        """The broker's execution time of entry order `order_id` from its trade history (plan S39b, go-live gate
+        `entry_time_source`; the ARM upgrades an `ESTIMATED` entry time to `BROKER` with it). One read-only
+        `fetch_history(since_ms, until_ms)` (StoneX: `order/tradehistory` with `ExecutedDateTimeUtc` as the FILLED
+        row's broker time, then the open positions and active stop / limit orders) at `RestPriority.RECONCILE` on the
+        adapter's one REST budget. Nothing is published, versioned or written: only the times of the entry order's
+        opening fills are returned (a reduce-only row is never an entry). Broker errors propagate (the caller retries
+        later); an adapter without history answers no times and `complete` False."""
+        rt = self._runtimes[adapter_id]
+        with rest_priority(RestPriority.RECONCILE):
+            history = await rt.adapter.fetch_history(since_ms, until_ms)
+        times = sorted({o.broker_updated_at_ms for o in history.orders
+                        if o.broker_order_id == order_id and not o.is_reduce_only
+                        and o.status in _FILL_STATUSES and o.broker_updated_at_ms > 0})
+        return ExecutionTimeResult(adapter_id, order_id, tuple(times), history.complete)
+
+    async def reread_stop_orders(self, adapter_id: str, origin: Origin = "stop_read") -> StopReadResult:
+        """Design PR9 (R11-M20): ONE stop-order list read of the adapter (`fetch_active_stop_orders`: StoneX
+        `activestoplimitorders` per trading account, cTrader the open positions' stop fields), at REST class BARS.
+        Every listed row is versioned at the read's send time and published row by row like any REST row (origin
+        `stop_read`), so Oversee, the ARM and `S_at_T` see one level. An entity absent from the list is never
+        closed, re-read or touched: the list is not the whole book. Broker errors propagate (BARS cap refusals
+        included, as `TransientBrokerError`); an adapter without the read answers `supported=False`. Read-only."""
+        rt = self._runtimes[adapter_id]
+        send_seq, send_ms, wm = self.hlc.next(), self._clock_ms(), rt.watermark_ms
+        clear_rest_sent_ms()
+        with rest_priority(RestPriority.BARS):
+            listed = await rt.adapter.fetch_active_stop_orders()
+        sent = rest_sent_ms()
+        if not listed.supported:
+            return StopReadResult(adapter_id, supported=False, sent_ms=sent)
+        rows: list[RereadResult] = []
+        skipped = 0
+        listed_rows: list[OrderDTO | PositionDTO] = [*listed.orders, *listed.positions]
+        for dto in listed_rows:
+            if dto.adapter_id != adapter_id:
+                skipped += 1
+                continue
+            rows.append(self._reread_row(rt, dto, origin, send_seq, send_ms, wm, "orders", sent))
+        return StopReadResult(adapter_id, supported=True, rows=tuple(rows), sent_ms=sent, skipped=skipped)
 
     def resubmit_cash_flow(self, cf: CashFlowDTO) -> bool:
         """Check-before-retry re-submission of a cash flow the broker confirmed by transaction_id
@@ -1282,8 +1678,11 @@ class IngestionOrchestrator:
                 return False
             if historic and isinstance(dto, PositionDTO):
                 dto = _keep_known_entry(dto, rt.positions.get(dto.entity_key))
+            # The history rows are `history` versions; the by-id rechecks read the present (`snapshot`, PR8).
+            origin: Origin = "history" if historic else "snapshot"
             return capture("orders", lambda: self._accept_entity(
-                rt, dto, "REST", observed_seq=seq, local_ms=local, watermark=wm, stream="orders", history=True))
+                rt, dto, "REST", observed_seq=seq, local_ms=local, watermark=wm, stream="orders", origin=origin,
+                history=True))
 
         def oldest_first(rows: tuple[object, ...]) -> list[object]:
             """The rows with each entity's versions re-ordered oldest first (broker revision, then broker time) in
@@ -1566,6 +1965,75 @@ class IngestionOrchestrator:
             rt.tick_wanted_ms[s] = now
         return syms
 
+    # ------------------------------------------------------------------ tick-only symbols (design PR5)
+    def set_md_tick_symbols(self, adapter_id: str, symbols: Iterable[str]) -> None:
+        """Replace the adapter's tick-only symbol set (the market-data layer's `XTNL_TICK_SYMBOLS`, parsed and
+        checked by its caller). A separate set: never merged into `tick_symbols` / `pending_symbols`. New symbols
+        are queued for their own ensure_ticks() once the prices stream runs. A removed one stays subscribed (there
+        is no read-only unsubscribe here, and the adapters subscribe every market they ever had again at each stream
+        start), so it moves to `md_retired`: it stays tick-only (its ticks never published, its ERROR never the
+        prices gap) for the life of this runtime unless it is held, needed or wanted again."""
+        rt = self._runtimes[adapter_id]
+        new = frozenset(s.strip() for s in symbols if s and s.strip())
+        rt.md_retired |= (rt.md_subscribed | rt.md_tick_symbols) - new
+        rt.md_retired -= new
+        rt.md_tick_symbols = new
+        rt.md_pending = set(rt.md_tick_symbols - rt.md_subscribed - rt.tick_symbols) if "prices" in rt.tasks \
+            else set()
+        if rt.md_pending:
+            rt.wake.set()
+
+    def md_tick_symbols(self, adapter_id: str) -> frozenset[str]:
+        return self._runtimes[adapter_id].md_tick_symbols
+
+    def is_md_only(self, adapter_id: str, symbol: str) -> bool:
+        """The symbol is subscribed (or wanted) only as a tick-only symbol: no held order / position or cross
+        needs it, so it never decides SM10's adapter OPEN, the stale-price or clean-mid watch or the price topic."""
+        rt = self._runtimes.get(adapter_id)
+        return rt is not None and self._md_only(rt, symbol)
+
+    @staticmethod
+    def _md_only(rt: AdapterRuntime, symbol: str) -> bool:
+        return (symbol in rt.md_subscribed or symbol in rt.md_tick_symbols or symbol in rt.md_retired) \
+            and symbol not in rt.tick_symbols and symbol not in rt.pending_symbols
+
+    def _stream_symbols(self, rt: AdapterRuntime) -> list[str]:
+        """What a (re)started prices stream subscribes: the required symbols plus the tick-only ones, or only the
+        (empty) required set when the stream asked for no required symbol (`start_missing_streams`)."""
+        required = set(self.required_tick_symbols(rt.adapter_id))
+        return sorted(required | rt.md_tick_symbols if rt.price_required_asked else required)
+
+    async def flush_md_symbols(self, adapter_id: str) -> list[str]:
+        """While STREAMING: ensure_ticks() for newly wanted tick-only symbols, in a call of their own (never
+        together with the required symbols), rate-limited. Raises only `SessionExpiredError` (the session is
+        gone, handled like the required path) and cancellation: any other failure is logged and retried after
+        `MD_ENSURE_RETRY_MS`, so a bad tick-only symbol never touches ingestion."""
+        rt = self._runtimes[adapter_id]
+        now = self._clock_ms()
+        if not rt.md_pending or rt.conn.state is not ConnState.STREAMING \
+                or now - rt.last_md_ensure_ms < ENSURE_TICKS_MIN_INTERVAL_MS \
+                or (rt.md_ensure_failed_ms and now - rt.md_ensure_failed_ms < MD_ENSURE_RETRY_MS):
+            return []
+        rt.md_pending -= rt.tick_symbols | rt.md_subscribed
+        syms = sorted(rt.md_pending & rt.md_tick_symbols)
+        rt.md_pending = set(syms)
+        if not syms:
+            return []
+        rt.last_md_ensure_ms = now
+        try:
+            await rt.adapter.ensure_ticks(syms)
+        except SessionExpiredError:
+            raise                            # not a bad symbol: the caller loses the session (AUTHENTICATING)
+        except Exception as exc:
+            rt.md_ensure_failed_ms = now
+            log.warning("%s: ensure_ticks for %d tick-only symbol(s) failed (retried): %s", adapter_id, len(syms),
+                        redact_urls(str(exc) or type(exc).__name__)[:200])
+            return []
+        rt.md_ensure_failed_ms = 0
+        rt.md_subscribed.update(syms)
+        rt.md_pending.difference_update(syms)
+        return syms
+
     # ================================================================== stream pumps
     def _pump_factories(self, rt: AdapterRuntime) -> dict[PumpName, tuple[StreamKind,
                                                                          Callable[[], AsyncIterator[object]]]]:
@@ -1573,7 +2041,7 @@ class IngestionOrchestrator:
         out: dict[PumpName, tuple[StreamKind, Callable[[], AsyncIterator[object]]]] = {
             "orders": ("orders", ad.stream_order_updates),
             "account": ("account", ad.stream_account),
-            "prices": ("prices", lambda: ad.stream_ticks(self.required_tick_symbols(rt.adapter_id))),
+            "prices": ("prices", lambda: ad.stream_ticks(self._stream_symbols(rt))),
         }
         if type(ad).stream_positions is not BrokerAdapter.stream_positions:
             out["positions"] = ("orders", ad.stream_positions)   # positions share the orders health key
@@ -1590,8 +2058,20 @@ class IngestionOrchestrator:
             if task is not None and not task.done():
                 task.cancel()
             if stream == "prices":
+                self._close_price_subs(rt, self._clock_ms())   # the old prices subscription is torn down
                 rt.tick_symbols = set(self.required_tick_symbols(adapter_id))
                 rt.pending_symbols -= rt.tick_symbols
+                rt.price_stream_failed = False
+                rt.price_required_asked = bool(rt.tick_symbols)
+                if rt.price_required_asked:
+                    rt.md_subscribed = set(rt.md_tick_symbols)     # asked for by the new stream itself
+                    rt.md_pending.clear()
+                else:
+                    # No required symbol: the tick-only ones get their own ensure_ticks() once STREAMING, so a
+                    # bad one can never fail the stream start or keep it from counting as subscribed.
+                    rt.md_subscribed = set()
+                    rt.md_pending = set(rt.md_tick_symbols)
+                rt.md_ensure_failed_ms = 0
                 now = self._clock_ms()
                 for s in rt.tick_symbols:
                     rt.tick_wanted_ms[s] = now      # a (re)subscribed symbol gets the full stale-price grace
@@ -1601,6 +2081,15 @@ class IngestionOrchestrator:
             rt.tasks[name] = asyncio.create_task(self._pump(rt, stream, factory),
                                                  name=f"pump:{adapter_id}:{name}")
             started.append(name)
+            if stream == "prices" and not rt.price_required_asked and (rt.md_tick_symbols or rt.md_retired):
+                # Nothing required asked for: the empty set is trivially subscribed (what StoneX reports itself
+                # for an empty subscription). The adapter still subscribes the tick-only markets it kept, and
+                # without this their acks alone would decide the stream (one bad market: SM4 BACKOFF forever).
+                # With no tick-only symbol at all (flags off) the adapter's own SUBSCRIBED decides, as before.
+                sub = rt.subs["prices"]
+                sub.subscribed = True
+                sub.subscribed_seq = self.hlc.next()
+                rt.wake.set()
         return started
 
     async def _pump(self, rt: AdapterRuntime, stream: StreamKind,
@@ -1609,6 +2098,8 @@ class IngestionOrchestrator:
             async for item in factory():
                 # Unexpected item types are not dropped here: handle_stream_item opens the stream's gap.
                 self.handle_stream_item(rt.adapter_id, stream, item)  # type: ignore[arg-type]
+            if stream == "prices":
+                self._close_price_subs(rt, self._clock_ms())
             rt.subs[stream].subscribed = False
             self._open_gap(rt, stream, "stream ended")
         except asyncio.CancelledError:
@@ -1968,6 +2459,13 @@ class IngestionOrchestrator:
         except (BrokerError, OSError, TimeoutError) as exc:
             # The symbols stay pending (retried, rate-limited); the clean-mid watch pages if this persists.
             log.warning("%s: ensure_ticks failed: %r", rt.adapter_id, exc)
+        if rt.md_pending:
+            try:
+                await self.flush_md_symbols(rt.adapter_id)   # tick-only symbols: a bad one never blocks the above
+            except SessionExpiredError:
+                self._lose_all(rt, "session expired (tick-only ensure_ticks)")
+                rt.auth_lost = True
+                return
         if rt.unsaved_instruments and now - rt.instrument_save_failed_ms >= INSTRUMENT_SAVE_RETRY_MS:
             await self._save_instruments(rt)
         if self._account_poll_due(rt, now):
@@ -2053,7 +2551,7 @@ class IngestionOrchestrator:
         self._episodes.clear(key)
         for a in accounts:
             self._accept_entity(rt, a, "REST", observed_seq=send_seq, local_ms=send_ms, watermark=wm,
-                                stream="account")
+                                stream="account", origin="snapshot")
         for lv in lives:
             self._on_live(rt, lv)
         return True

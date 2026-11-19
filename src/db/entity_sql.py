@@ -26,7 +26,7 @@ COL_TYPES: Final[dict[str, str]] = {
     "symbol": "text", "side": "text", "status": "text", "entry_price": "numeric", "stop_loss": "numeric",
     "take_profit": "numeric", "ordered_units": "numeric", "remaining_units": "numeric",
     "instrument_unknown": "boolean", "raw_qty": "numeric", "is_reduce_only": "boolean",
-    "linked_position_id": "text", "position_id": "text", "units": "numeric",
+    "linked_position_id": "text", "order_kind": "text", "position_id": "text", "units": "numeric",
     "opened_by_client_order_id": "text", "accrued_swap": "numeric", "commission": "numeric",
     "currency": "text", "balance": "numeric", "realised_pnl_today": "numeric",
     "broker_seq": "bigint", "broker_updated_at_ms": "bigint", "observed_seq": "bigint", "source": "text",
@@ -130,7 +130,7 @@ ORDERS: Final = EntityTable(
     key_cols=("adapter_id", "broker_order_id"),
     payload_cols=("client_order_id", "account_id", "symbol", "side", "status", "entry_price", "stop_loss",
                   "take_profit", "ordered_units", "remaining_units", "instrument_unknown", "raw_qty",
-                  "is_reduce_only", "linked_position_id"),
+                  "is_reduce_only", "linked_position_id", "order_kind"),   # order_kind: 0015 (PR1)
     change_cols=("status", "ordered_units", "remaining_units"),
 )
 POSITIONS: Final = EntityTable(

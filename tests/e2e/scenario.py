@@ -180,7 +180,7 @@ async def run_scenario(session: EngineSession, adapter: MockBrokerAdapter, fx: M
     stale = next(p for p in fx.positions if p.position_id == "P-EU-1")       # REST row, 1 s older
     assert stale.units == Decimal(20000)
     adapter.set_position(stale)
-    fresh = await session.orchestrator.reread_entity(ADAPTER, "POSITION", "P-EU-1")
+    fresh = (await session.orchestrator.reread_entity(ADAPTER, "POSITION", "P-EU-1", origin="snapshot")).dto
     assert isinstance(fresh, PositionDTO) and fresh.units == Decimal(20000)
     await eventually(lambda: _true(_consumers_idle(session)), "consumers idle after the stale REST read")
     after = await row(db, eu_key)

@@ -5,8 +5,15 @@ One `run_once()` (the runtime calls it from a supervised task, every few hours):
 
 1. **Create partitions ahead**: the current month and the next `months_ahead` months of `event_log`,
    `account_snapshots`, `oversee_events`, `events_dlq_history` (HLC ranges, shift 20) and
-   `notification_outbox` (ms ranges), through `xtnl_ensure_month_partition` (0001), so rows never land in
-   the default partition.
+   `notification_outbox`, `arm_decisions`, `arm_decision_handles` (ms ranges, 0017), through
+   `xtnl_ensure_month_partition` (0001), so rows never land in the default partition. The ARM tables
+   (`OPTIONAL_PARENTS`) are skipped, and reported in `absent`, while migration 0017 is not applied (one
+   `to_regclass` read at the start of the run): the task runs whether or not the ARM is enabled, and a missing 0017
+   must not fill `errors` (whose single page key would then hide every later real error).
+1a. **DEFAULT partitions stay empty** (design §C1): the DEFAULT partition of each `DEFAULT_WATCHED` table (the two
+   ARM tables, whose inserts always target a month that exists) is counted, bounded at `DEFAULT_COUNT_CAP` rows; a
+   non-empty one is reported in `default_not_empty` / `default_rows` and the runtime pages
+   (`LifecycleRunner.pages`, key `default`).
 1b. **DLQ history** (operations.md §11, "DLQ history by seq_id range"): `RESOLVED` `events_dlq` rows whose
    resolution is older than `dlq_keep_days` and that no active row names as its lineage origin are moved,
    in batches, to `events_dlq_history` (0009) in one fenced statement (`DELETE ... RETURNING` feeding the
@@ -25,14 +32,25 @@ One `run_once()` (the runtime calls it from a supervised task, every few hours):
 3. **Retention** (90 days hot): a monthly partition whose whole month ended more than `hot_days` ago is
    detached only after it has been exported and verified (a `partition_archive` row whose
    `row_count` still matches; `xtnl_detach_archived_partition`, 0008). Without that row it is reported
-   as awaiting archive (the runtime pages). Audit tables are never detached: `oversee_events` is only
-   created ahead. Dropping a detached table is an operator action.
+   as awaiting archive (the runtime pages). Audit tables are never detached: `oversee_events`, `arm_decisions`
+   and `arm_decision_handles` are only created ahead (kept hot, never exported, detached or dropped). Dropping a detached table is an operator action.
 4. **Outbox retention**: `outbox_events` rows older than `hot_days` are deleted in batches (nothing relays
    them in Phase 1, so "deleted after relay" becomes "deleted after the hot window").
+5. **Expired ARM notices** (design PR4, §B8; plan S29): unsent kind `arm` rows of `notification_outbox` past their
+   `expires_at_ms` are finished undelivered (`expired`) in batches, each body replaced by
+   `src.db.arm_outbox_store.finished_body` (notice id, key, decision ids, outcome codes), so an expired notice keeps no
+   order-state field even while the arm-relay is not running (the ARM off, or a takeover). The immediate ping has no
+   expiry and is never touched. Runs whether or not the ARM is enabled (0016 is a core migration). Only rows expired
+   more than `arm_expiry_grace_ms` (1 h) ago, so the arm-relay always finishes (and pages) first; a POST / LATE
+   `ADJUST` notice finished here is reported (`arm_expired_adjust`) and paged by `LifecycleRunner.pages` (§B8 Pages).
 
 Every statement is fenced in the statement itself (`SELECT f(...) WHERE <fence>`, `DELETE ... AND <fence>`)
 in its own READ COMMITTED transaction with `lock_timeout` 2 s. A failing statement is reported and the
 rest still run; a lost fence (`EpochMismatch`) propagates (the runtime hard-exits).
+
+`PgPartitionMaintenance.ensure_months(parent, months)` is the public form of step 1 for one parent and a given list
+of months (RT-M9, plan S10): `optional-bootstrap` ensures the ARM tables' current and next month through it before the
+ARM's first write (S23 adds them to `PARTITIONED`; S31 calls it on the engine (owner) pool).
 """
 from __future__ import annotations
 
@@ -51,6 +69,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import IO, Final, Protocol
 
+from src.db.arm_outbox_store import (
+    SQL_ARM_OUTBOX_EXPIRE,
+    SQL_ARM_OUTBOX_EXPIRED,
+    finished_body,
+    notice_key,
+    pages_when_expired,
+)
 from src.db.epoch import EngineDb
 from src.db.fence import FENCE, EpochMismatch
 
@@ -59,9 +84,16 @@ log = logging.getLogger(__name__)
 #: parent table -> range-key shift (20: HLC seq_id / sweep_id; 0: plain ms).
 PARTITIONED: Final[Mapping[str, int]] = MappingProxyType({
     "event_log": 20, "account_snapshots": 20, "oversee_events": 20, "notification_outbox": 0,
-    "events_dlq_history": 20})
-#: Audit tables kept per compliance (operations.md §11): created ahead, never detached by the engine.
-AUDIT_TABLES: Final = frozenset({"oversee_events"})
+    "events_dlq_history": 20, "arm_decisions": 0, "arm_decision_handles": 0})
+#: Audit tables kept per compliance (operations.md §11; design §C1 for the ARM decisions): created ahead, never
+#: exported, detached or dropped by the engine.
+AUDIT_TABLES: Final = frozenset({"oversee_events", "arm_decisions", "arm_decision_handles"})
+#: Tables whose DEFAULT partition must stay empty (design §C1): a row there pages (step 1a).
+DEFAULT_WATCHED: Final[tuple[str, ...]] = ("arm_decisions", "arm_decision_handles")
+#: Parents created by an optional migration (0017): skipped while absent instead of reported as errors.
+OPTIONAL_PARENTS: Final[tuple[str, ...]] = ("arm_decisions", "arm_decision_handles")
+#: Rows counted per DEFAULT partition at most (the count is a signal, not an inventory).
+DEFAULT_COUNT_CAP: Final = 1000
 _PART_NAME: Final = re.compile(r"^(?P<parent>[a-z_]+)_p(?P<y>\d{4})(?P<m>\d{2})$")
 
 SQL_LOCK_TIMEOUT: Final = "SET LOCAL lock_timeout = '2s'"
@@ -106,6 +138,19 @@ SQL_DLQ_BUMPS_PRUNE: Final = (
     "WHERE b.bumped_at_ms < $2::bigint AND NOT EXISTS (SELECT 1 FROM events_dlq d WHERE d.dlq_id = b.origin_dlq_id) "
     f"ORDER BY b.payload_hash LIMIT $3::int FOR UPDATE SKIP LOCKED) AND {FENCE}"
 )
+
+
+def default_rows_sql(tables: Sequence[str]) -> str:
+    """Rows (up to DEFAULT_COUNT_CAP) in the DEFAULT partition of each of `tables`, one column each, in order."""
+    return "SELECT " + ", ".join(
+        f"(SELECT count(*) FROM (SELECT 1 FROM {t}_default LIMIT {DEFAULT_COUNT_CAP}) s{i})"
+        for i, t in enumerate(tables))
+
+
+#: Rows (up to DEFAULT_COUNT_CAP) in each watched DEFAULT partition, one column per DEFAULT_WATCHED table, in order.
+SQL_DEFAULT_ROWS: Final = default_rows_sql(DEFAULT_WATCHED)
+#: The parents of $1 that do not exist (an optional migration not applied); a read.
+SQL_ABSENT_PARENTS: Final = "SELECT p FROM unnest($1::text[]) AS p WHERE to_regclass(p) IS NULL ORDER BY p"
 SQL_ARCHIVED_NAMES: Final = "SELECT partition_name FROM partition_archive WHERE partition_name = ANY($1::text[])"
 SQL_ARCHIVE_RECORD: Final = (
     "INSERT INTO partition_archive (partition_name, parent_table, row_count, checksum, archive_uri, verified_at_ms, "
@@ -133,6 +178,9 @@ class LifecycleConfig:
     dlq_keep_days: int = 7          # RESOLVED rows stay in events_dlq this long (payload_hash dedupe, triage)
     dlq_batch: int = 2_000
     dlq_max_batches: int = 20
+    arm_expiry_batch: int = 500
+    arm_expiry_max_batches: int = 20
+    arm_expiry_grace_ms: int = 3_600_000   # step 5 waits this long past expiry: the arm-relay finishes (and pages) first
 
 
 @dataclass
@@ -145,6 +193,11 @@ class LifecycleReport:
     outbox_deleted: int = 0
     dlq_moved: int = 0                                         # events_dlq rows moved to events_dlq_history
     dlq_bumps_pruned: int = 0                                  # dlq_lineage_bumps rows of moved origins deleted
+    default_not_empty: list[str] = field(default_factory=list)  # watched DEFAULT partitions holding rows
+    default_rows: int = 0                                      # rows found there (each capped at DEFAULT_COUNT_CAP)
+    absent: list[str] = field(default_factory=list)            # OPTIONAL_PARENTS not created yet (0017 not applied)
+    arm_expired: int = 0                                       # unsent ARM notices finished as expired (step 5)
+    arm_expired_adjust: list[int] = field(default_factory=list)  # their notice ids that page (POST / LATE ADJUST)
     errors: list[str] = field(default_factory=list)
 
 
@@ -418,7 +471,9 @@ class PgPartitionMaintenance:
 
     async def run_once(self, now_ms: int) -> LifecycleReport:
         rep = LifecycleReport()
+        await self._absent_parents(rep)
         await self._ensure_ahead(now_ms, rep)
+        await self._default_partitions(rep)
         await self._dlq_history(now_ms, rep)
         if self.exporter is not None:
             listed = await self._list(rep)
@@ -426,6 +481,7 @@ class PgPartitionMaintenance:
                 await self.exporter.run_once(now_ms, listed, rep)
         await self._retention(now_ms, rep)
         await self._outbox(now_ms, rep)
+        await self._arm_expiry(now_ms, rep)
         return rep
 
     async def _list(self, rep: LifecycleReport) -> list[tuple[str, str]] | None:
@@ -438,10 +494,54 @@ class PgPartitionMaintenance:
             return None
         return [(str(r[0]), str(r[1])) for r in rows]
 
+    async def _absent_parents(self, rep: LifecycleReport) -> None:
+        """Which OPTIONAL_PARENTS do not exist yet; a failed read assumes all exist (the next steps then report)."""
+        try:
+            async with self._db.source.acquire() as conn:
+                rows = await conn.fetch(SQL_ABSENT_PARENTS, list(OPTIONAL_PARENTS))
+        except Exception:
+            return
+        rep.absent = [str(r[0]) for r in rows if str(r[0]) in OPTIONAL_PARENTS]
+
     async def _ensure_ahead(self, now_ms: int, rep: LifecycleReport) -> None:
         for month in months_to_ensure(now_ms, self.cfg.months_ahead):
             for parent, shift in PARTITIONED.items():
-                await self._ensure(parent, month, shift, rep)
+                if parent not in rep.absent:
+                    await self._ensure(parent, month, shift, rep)
+
+    async def _default_partitions(self, rep: LifecycleReport) -> None:
+        """Step 1a: count the rows in each watched DEFAULT partition (bounded); a non-empty one is reported."""
+        watched = tuple(t for t in DEFAULT_WATCHED if t not in rep.absent)
+        if not watched:
+            return
+        sql = SQL_DEFAULT_ROWS if watched == DEFAULT_WATCHED else default_rows_sql(watched)
+        try:
+            async with self._db.source.acquire() as conn:
+                row = await conn.fetchrow(sql)
+        except Exception as exc:
+            rep.errors.append(f"default partitions: {type(exc).__name__}: {exc}")
+            return
+        if row is None:
+            return
+        for parent, count in zip(watched, tuple(row), strict=False):
+            n = int(count or 0)
+            if n > 0:
+                rep.default_not_empty.append(f"{parent}_default")
+                rep.default_rows += n
+
+    async def ensure_months(self, parent: str, months: Sequence[date]) -> LifecycleReport:
+        """Create the month partitions of `parent` for `months` (each taken at its month start, once) through the same
+        fenced, lock-timed `xtnl_ensure_month_partition` call the lifecycle job uses (RT-M9). S31's `optional-bootstrap`
+        ensures the ARM tables' current and next month through it (0017 creates months -1..2 with its own loop; the
+        lifecycle job keeps creating months ahead). An unknown parent raises ValueError; a month that cannot be
+        created is reported in `errors` (the others are still tried); a lost fence raises EpochMismatch."""
+        shift = PARTITIONED.get(parent)
+        if shift is None:
+            raise ValueError(f"{parent!r} is not a partitioned table")
+        rep = LifecycleReport()
+        for month in sorted({month_start(m) for m in months}):
+            await self._ensure(parent, month, shift, rep)
+        return rep
 
     async def _ensure(self, parent: str, month: date, shift: int, rep: LifecycleReport) -> bool:
         name = f"{parent}_p{month:%Y%m}"
@@ -547,6 +647,47 @@ class PgPartitionMaintenance:
                 return
 
 
+    async def _arm_expiry(self, now_ms: int, rep: LifecycleReport) -> None:
+        """Step 5: finish expired unsent ARM notices with their bodies scrubbed (`finished_body`).
+
+        Only rows expired more than `arm_expiry_grace_ms` ago: the arm-relay finishes a row at its expiry and pages
+        an expired POST / LATE `ADJUST` notice (§B8), so this step only catches rows the relay did not reach (the ARM
+        off, the relay stalled). Such a row that would have paged is reported (`arm_expired_adjust`, notice ids only)
+        and `LifecycleRunner.pages` pages it, so the page never depends on which of the two finished the row.
+
+        Skipped while 0017's tables are absent (`rep.absent`, plan S38f): migrations above the accepted level are
+        held back, so the 0016 outbox columns may be missing too, and without the ARM schema no ARM notice exists."""
+        if rep.absent:
+            return
+        cutoff = now_ms - max(0, self.cfg.arm_expiry_grace_ms)
+        for _ in range(self.cfg.arm_expiry_max_batches):
+            try:
+                async with self._db.source.acquire() as conn:
+                    rows = await conn.fetch(SQL_ARM_OUTBOX_EXPIRED, cutoff, self.cfg.arm_expiry_batch)
+                if not rows:
+                    return
+                ids = [int(r[0]) for r in rows]
+                created = [int(r[1]) for r in rows]
+                texts = [str(r[2]) for r in rows]
+                bodies = [finished_body(t, "expired") for t in texts]
+                async with self._db.transaction() as tx:
+                    await tx.execute(SQL_LOCK_TIMEOUT)
+                    n = await tx.write(SQL_ARM_OUTBOX_EXPIRE, now_ms, ids, created, bodies)
+            except EpochMismatch:
+                raise
+            except Exception as exc:
+                rep.errors.append(f"arm notice expiry: {type(exc).__name__}")
+                return
+            rep.arm_expired += n
+            if n > 0:
+                for text in texts:
+                    key = notice_key(text)
+                    if key is not None and pages_when_expired(text):
+                        rep.arm_expired_adjust.append(key.notice_id)
+            if len(rows) < self.cfg.arm_expiry_batch:
+                return
+
+
 class PartitionMaintenance(Protocol):
     async def run_once(self, now_ms: int) -> LifecycleReport: ...
 
@@ -577,6 +718,18 @@ class LifecycleRunner:
         if rep.count_mismatch:
             current["mismatch"] = ("high", "lifecycle: export row count mismatch (not detached)",
                                    ", ".join(rep.count_mismatch))
+        if rep.default_not_empty:
+            current["default"] = ("high", "lifecycle: DEFAULT partition not empty",
+                                  f"{', '.join(rep.default_not_empty)}: {rep.default_rows} row(s) inserted where no "
+                                  "month partition existed")
+        if rep.arm_expired_adjust:
+            ids = sorted(set(rep.arm_expired_adjust))
+            shown = ", ".join(f"#{i}" for i in ids[:50]) + (f" (+{len(ids) - 50} more)" if len(ids) > 50 else "")
+            # Keyed by the ids: each new set pages; the same rows are never finished twice.
+            current[f"arm_expired:{ids[0]}-{ids[-1]}:{len(ids)}"] = (
+                "warning", "ARM notices expired undelivered",
+                f"ARM notice {shown}: an ADJUST notice expired before any delivery completed and was finished by "
+                "housekeeping (the arm-relay did not reach it; see arm decisions)")
         for key, page in current.items():
             if key not in self.paged:
                 out.append(page)
@@ -584,7 +737,7 @@ class LifecycleRunner:
         return out
 
 
-__all__ = ["ARCHIVE_DIR_ENV", "AUDIT_TABLES", "ArchiveFile", "ArchiveVerifyError", "ExportConfig", "LifecycleConfig",
-           "LifecycleReport", "LifecycleRunner", "PARTITIONED", "PartitionExporter", "PartitionMaintenance",
+__all__ = ["ARCHIVE_DIR_ENV", "AUDIT_TABLES", "ArchiveFile", "DEFAULT_COUNT_CAP", "DEFAULT_WATCHED", "ArchiveVerifyError", "ExportConfig", "LifecycleConfig",
+           "LifecycleReport", "LifecycleRunner", "OPTIONAL_PARENTS", "PARTITIONED", "PartitionExporter", "PartitionMaintenance",
            "PgPartitionMaintenance", "add_months", "detachable", "month_start", "months_to_ensure", "partition_month",
            "past_hot_window", "verify_archive"]

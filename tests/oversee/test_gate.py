@@ -15,7 +15,7 @@ GOOD = GateContext(
     now_ms=NOW, redis_boot_id="run1:7", redis_run_id="run1", node_epoch=7, engine_epoch=7, lease_valid=True,
     halt_state=(HaltLevel.NONE, 3), max_halt_event_id=3, settle_until_ms=NOW - 1, reconciled_at_ms=NOW - 500,
     reconciled_epoch=7, latest_open_ms=NOW - 1000, open_stream_health=False, stale_mark_symbols=frozenset(),
-    has_unknown_result=False, last_pass_ms=NOW - 1000, catchup_verified=True,
+    has_unknown_result=False, last_pass_ms=NOW - 1000, catchup_verified=True, account_adapter_id="stonex",
 )
 INC = Action("A1", "stonex", risk_increasing=True, symbol="EURUSD")
 RED = Action("A1", "stonex", risk_increasing=False, symbol="EURUSD")
@@ -60,6 +60,8 @@ DENIALS: list[tuple[dict[str, Any], str]] = [
     (dict(has_unknown_result=True), "unknown_result"),
     (dict(last_pass_ms=None), "sweep_not_current"),
     (dict(last_pass_ms=NOW - 3000), "sweep_not_current"),
+    (dict(account_adapter_id=None), "account_adapter_unknown"),            # K6: unresolved account adapter
+    (dict(account_adapter_id="pepperstone"), "adapter_mismatch"),         # K6: the action names another adapter
 ]
 
 
@@ -80,3 +82,12 @@ async def test_reader_error_timeout_or_no_reader_denies() -> None:
     assert not await ActionGate(Reader(ConnectionError("redis down"))).allow(RED)
     assert not await ActionGate(Reader(GOOD, delay=0.2), timeout_s=0.01).allow(RED)
     assert not await ActionGate(None).allow(RED)
+
+
+@pytest.mark.parametrize("change,reason", [
+    (dict(account_adapter_id=None), "account_adapter_unknown"), (dict(account_adapter_id="pepperstone"), "adapter_mismatch")])
+def test_k6_adapter_conditions_deny_risk_reducing_too(change: dict[str, Any], reason: str) -> None:
+    """K6: an action whose adapter is not the account's own (or an account with no adapter) is denied whatever its
+    direction: its adapter-scoped inputs would describe another adapter's streams."""
+    verdict = evaluate_gate(replace(GOOD, **change), RED)
+    assert not verdict.allowed and verdict.reason == reason

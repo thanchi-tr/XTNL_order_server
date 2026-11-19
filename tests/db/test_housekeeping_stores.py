@@ -160,17 +160,21 @@ async def test_run_once_creates_ahead_detaches_archived_and_trims_the_outbox(con
         ("event_log", "event_log_default"), ("event_log", "event_log_p202607"),
         ("account_snapshots", "account_snapshots_p202607"), ("notification_outbox", "notification_outbox_p202606"),
         ("event_log", "event_log_p202611")])
-    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 15)
+    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 21)
     conn.returns(LC.SQL_DETACH_ARCHIVED, ("detached",), ("not_archived",), ("count_mismatch",))
     conn.status_for(LC.SQL_OUTBOX_RETENTION, "DELETE 3", "DELETE 1")
     job = LC.PgPartitionMaintenance(db, LC.LifecycleConfig(outbox_batch=3))
     rep = await job.run_once(now)
     ensured = conn.args_of(LC.SQL_ENSURE_PARTITION)
-    assert len(ensured) == 3 * 5 and (7, "oversee_events", date(2027, 1, 1), 20) in ensured
+    assert len(ensured) == 3 * 7 and (7, "oversee_events", date(2027, 1, 1), 20) in ensured
     assert (7, "events_dlq_history", date(2026, 11, 1), 20) in ensured
     assert (7, "notification_outbox", date(2026, 11, 1), 0) in ensured
+    for arm in ("arm_decisions", "arm_decision_handles"):          # 0017: ms ranges, created ahead (S23)
+        assert [a[2] for a in ensured if a[1] == arm] == [date(2026, 11, 1), date(2026, 12, 1), date(2027, 1, 1)]
+        assert all(a[3] == 0 for a in ensured if a[1] == arm)
     (listed,) = conn.args_of(LC.SQL_LIST_PARTITIONS)
     assert "oversee_events" not in listed[0]                     # audit table: never detached
+    assert "arm_decisions" not in listed[0] and "arm_decision_handles" not in listed[0]
     assert [a[1:3] for a in conn.args_of(LC.SQL_DETACH_ARCHIVED)] == [
         ("event_log", "event_log_p202607"), ("account_snapshots", "account_snapshots_p202607"),
         ("notification_outbox", "notification_outbox_p202606")]     # the hot November one is untouched
@@ -182,12 +186,75 @@ async def test_run_once_creates_ahead_detaches_archived_and_trims_the_outbox(con
 
 async def test_a_failing_statement_is_reported_and_a_lost_fence_propagates(conn: FakeConn, db: EngineDb) -> None:
     conn.fail(LC.SQL_ENSURE_PARTITION, RuntimeError("rows in default partition"))
-    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 14)
+    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 20)
     rep = await LC.PgPartitionMaintenance(db).run_once(ms(2026, 11, 13))
-    assert len(rep.ensured) == 14 and rep.errors and "rows in default partition" in rep.errors[0]
+    assert len(rep.ensured) == 20 and rep.errors and "rows in default partition" in rep.errors[0]
     conn.stored_epoch = 99
     with pytest.raises(EpochMismatch):
         await LC.PgPartitionMaintenance(db).run_once(ms(2026, 11, 13))
+
+
+def test_arm_tables_are_partitioned_audit_tables_never_exported_or_detached() -> None:
+    """Design §C1 / plan S23: both ARM tables are created ahead (shift 0, ms ranges) and kept hot."""
+    for arm in ("arm_decisions", "arm_decision_handles"):
+        assert LC.PARTITIONED[arm] == 0 and arm in LC.AUDIT_TABLES and not LC.detachable(arm)
+        assert arm in LC.DEFAULT_WATCHED
+    assert len(LC.PARTITIONED) == 7
+
+
+async def test_default_partition_rows_are_counted_and_paged(conn: FakeConn, db: EngineDb) -> None:
+    """A row in a watched DEFAULT partition (an insert with no month partition) is reported and pages once."""
+    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 21)
+    conn.returns(LC.SQL_DEFAULT_ROWS, (3, 0))
+    rep = await LC.PgPartitionMaintenance(db).run_once(ms(2026, 11, 13))
+    assert rep.default_not_empty == ["arm_decisions_default"] and rep.default_rows == 3
+    assert conn.sql.index(LC.SQL_DEFAULT_ROWS) > max(i for i, s in enumerate(conn.sql) if s == LC.SQL_ENSURE_PARTITION)
+    runner = LC.LifecycleRunner()
+    pages = runner.pages(rep)
+    assert [(p[0], p[1]) for p in pages] == [("high", "lifecycle: DEFAULT partition not empty")]
+    assert "arm_decisions_default: 3 row(s)" in pages[0][2]
+    assert runner.pages(rep) == []                                  # paged once per condition
+    assert FENCE not in LC.SQL_DEFAULT_ROWS and "LIMIT 1000" in LC.SQL_DEFAULT_ROWS   # a bounded read
+    assert "arm_decision_handles_default" in LC.SQL_DEFAULT_ROWS
+
+
+async def test_default_partition_check_empty_and_failing(conn: FakeConn, db: EngineDb) -> None:
+    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 21)
+    conn.returns(LC.SQL_DEFAULT_ROWS, (0, 0))
+    rep = await LC.PgPartitionMaintenance(db).run_once(ms(2026, 11, 13))
+    assert rep.default_not_empty == [] and rep.default_rows == 0 and rep.errors == []
+    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 21)
+    conn.fail(LC.SQL_DEFAULT_ROWS, RuntimeError("relation does not exist"))
+    rep = await LC.PgPartitionMaintenance(db).run_once(ms(2026, 11, 13))
+    assert any(e.startswith("default partitions: RuntimeError") for e in rep.errors)
+
+
+async def test_arm_parents_missing_are_skipped_not_errors(conn: FakeConn, db: EngineDb) -> None:
+    """0017 not applied (e.g. the migrate DSN lacked CREATEROLE): the lifecycle task, which runs whether or not the ARM
+    is enabled, skips the ARM parents instead of filling `errors` (whose one page key would hide later real errors)."""
+    conn.returns_all(LC.SQL_ABSENT_PARENTS, [("arm_decision_handles",), ("arm_decisions",)])
+    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 15)
+    rep = await LC.PgPartitionMaintenance(db).run_once(ms(2026, 11, 13))
+    assert conn.args_of(LC.SQL_ABSENT_PARENTS) == [(list(LC.OPTIONAL_PARENTS),)]
+    assert sorted(rep.absent) == ["arm_decision_handles", "arm_decisions"] and rep.errors == []
+    ensured = conn.args_of(LC.SQL_ENSURE_PARTITION)
+    assert len(ensured) == 3 * 5 and not [a for a in ensured if str(a[1]).startswith("arm_")]
+    assert LC.SQL_DEFAULT_ROWS not in conn.sql
+    assert FENCE not in LC.SQL_ABSENT_PARENTS and LC.SQL_ABSENT_PARENTS.startswith("SELECT ")
+    assert set(LC.OPTIONAL_PARENTS) <= set(LC.PARTITIONED)
+    # one of the two missing: only the present one is counted
+    conn.returns_all(LC.SQL_ABSENT_PARENTS, [("arm_decision_handles",)])
+    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 18)
+    sql = LC.default_rows_sql(("arm_decisions",))
+    conn.returns(sql, (2,))
+    rep = await LC.PgPartitionMaintenance(db).run_once(ms(2026, 11, 13))
+    assert rep.absent == ["arm_decision_handles"] and rep.default_not_empty == ["arm_decisions_default"]
+    assert rep.default_rows == 2 and "arm_decision_handles" not in sql
+    # a failing presence read assumes every parent exists (the next steps report the real error)
+    conn.fail(LC.SQL_ABSENT_PARENTS, RuntimeError("down"))
+    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 21)
+    rep = await LC.PgPartitionMaintenance(db).run_once(ms(2026, 11, 13))
+    assert rep.absent == [] and len(rep.ensured) == 21
 
 
 def test_lifecycle_runner_schedules_and_pages_each_condition_once() -> None:
@@ -221,7 +288,7 @@ async def test_export_writes_verified_gzip_jsonl_records_it_then_detaches(conn: 
     declare = LC.SQL_EXPORT_DECLARE.format(name="event_log_p202607")
     conn.returns_all(page, [('{"seq_id": 1}',), ('{"seq_id": 2}',)], [('{"seq_id": 3}',)])
     conn.status_for(LC.SQL_ARCHIVE_RECORD, "INSERT 0 1")
-    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 15)
+    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 21)
     conn.returns(LC.SQL_DETACH_ARCHIVED, ("detached",), ("detached",))
     job = LC.PgPartitionMaintenance(db, exporter=exporter(db, tmp_path))
     rep = await job.run_once(now)
@@ -268,7 +335,7 @@ async def test_failed_export_records_nothing_so_nothing_is_detached(conn: FakeCo
     conn.returns_all(LC.SQL_ARCHIVED_NAMES, [("account_snapshots_p202607",)])
     page = LC.SQL_EXPORT_FETCH.format(n=2)
     conn.fail(page, RuntimeError("statement timeout"))
-    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 15)
+    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 21)
     conn.returns(LC.SQL_DETACH_ARCHIVED, ("not_archived",), ("detached",))
     rep = await LC.PgPartitionMaintenance(db, exporter=exporter(db, tmp_path)).run_once(ms(2026, 11, 13))
     assert conn.args_of(LC.SQL_ARCHIVE_RECORD) == []
@@ -414,7 +481,7 @@ async def test_dlq_history_creates_the_months_it_needs_then_moves_resolved_rows_
     """operations.md s11: RESOLVED events_dlq rows past the keep window move to events_dlq_history (partitioned
     by seq_id range, exported / detached like event_log); their month partitions are created first."""
     now = ms(2026, 11, 13)
-    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 16)
+    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 22)
     conn.returns_all(LC.SQL_DLQ_HISTORY_MONTHS, [(date(2026, 8, 1),)])
     conn.status_for(LC.SQL_DLQ_HISTORY_MOVE, "INSERT 0 2", "INSERT 0 1")
     job = LC.PgPartitionMaintenance(db, LC.LifecycleConfig(dlq_batch=2))
@@ -443,7 +510,7 @@ async def test_dlq_history_stops_when_its_month_cannot_be_created(conn: FakeConn
     """A month partition that cannot be created (rows already in the default partition) stops the move, so no
     further row lands in events_dlq_history_default."""
     conn.returns_all(LC.SQL_DLQ_HISTORY_MONTHS, [(date(2026, 8, 1),)])
-    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 15)
+    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 21)
     job = LC.PgPartitionMaintenance(db)
     real = job._ensure
 
@@ -480,7 +547,7 @@ async def test_dlq_lineage_bumps_of_moved_origins_are_pruned_after_the_move(conn
     """dlq_lineage_bumps (0009) gets one row per deterministic re-park; once the origin has left events_dlq and
     the keep window passed, the dedupe row is deleted (fenced, batched), so the table stays bounded."""
     now = ms(2026, 11, 13)
-    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 15)
+    conn.returns(LC.SQL_ENSURE_PARTITION, *[("p",)] * 21)
     conn.status_for(LC.SQL_DLQ_HISTORY_MOVE, "INSERT 0 0")
     conn.status_for(LC.SQL_DLQ_BUMPS_PRUNE, "DELETE 2", "DELETE 1")
     rep = await LC.PgPartitionMaintenance(db, LC.LifecycleConfig(dlq_batch=2)).run_once(now)

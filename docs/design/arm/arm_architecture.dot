@@ -1,0 +1,82 @@
+// Market data layer + ARM: architecture, design v11.2. Render: dot -Gdpi=130 -Tpng arm_architecture.dot -o arm_architecture.png
+digraph ARM {
+  graph [rankdir=TB, fontname="Segoe UI", fontsize=20, labelloc=t, nodesep=0.45, ranksep=0.55, pad=0.4, newrank=true,
+         label="Market data layer + Automated Risk Manager (ARM): Phase 1 architecture\nAdvice only, built behind XTNL_MD_ENABLED / XTNL_ARM_ENABLED (both off by default).\nMarket prices live only in Redis (redis-md); PostgreSQL holds no ticks, bars or indicators.", bgcolor="white"];
+  node  [fontname="Segoe UI", fontsize=11, shape=box, style="rounded,filled", fillcolor="#ffffff", color="#5b6b7f", penwidth=1.2];
+  edge  [fontname="Segoe UI", fontsize=9, color="#5b6b7f", arrowsize=0.7];
+
+  subgraph cluster_broker {
+    label="StoneX (read-only)"; style="rounded,filled"; fillcolor="#eef3f8"; color="#9fb3c8"; fontsize=12;
+    sx_prices [label="PRICES stream\n(Lightstreamer MERGE)"];
+    sx_orders [label="ORDERS stream\n(orders, stop children)"];
+    sx_bars   [label="Price-bar read\n1m / 15m, bid + ask (P3 probe)"];
+  }
+
+  subgraph cluster_ingest {
+    label="Ingestion (existing; never blocks)"; style="rounded,filled"; fillcolor="#f2f5f9"; color="#9fb3c8"; fontsize=12;
+    orch  [label="Ingestion orchestrator\n(sole publisher)"];
+    hook  [label="Pure tick hook (no I/O, own circuit)\ntick ring + forming 1m bar + quote\n(calendar hook unchanged)"];
+    relay [label="Read-only relay, priority BARS\nfetch_price_bars (P3)"];
+  }
+
+  subgraph cluster_md {
+    label="src/marketdata  (Part A)"; style="rounded,filled"; fillcolor="#eaf6fb"; color="#6fb3d2"; fontsize=12;
+    mdw   [label="md-writer\nticks -> TICK 1m bars -> roll-ups (5m-1h)\nindicator updates, events"];
+    mdb   [label="md-bars\nbroker bars: warm-up, gap repair,\nfinal close (broker-time evidence)"];
+    ind   [label="Indicator engine\nATR (v1); SMA, EMA, RSI ... later\ndemand-driven, versioned, deterministic"];
+    port  [label="MarketDataPort\nquote | forming_bar | bars | indicator\nregister | on_bar_closed | series_status", fillcolor="#d6eef8"];
+  }
+
+  rmd [label="redis-md  (dedicated Redis; AOF; ACL; not wiped at leader change)\nmd:ticks (2 h)  |  md:bars TICK 1m 7 d, 5m-1h 90 d, BROKER 15m 1 y  |  md:forming\nmd:ind + checkpoints  |  md:demand leases  |  md:meta  |  md:events  |  md:writer + md:boot",
+       shape=cylinder, fillcolor="#e3f1f8", color="#4f97bd"];
+
+  subgraph cluster_arm {
+    label="src/riskmgr  (Part B: ARM, leader-only, supervised)"; style="rounded,filled"; fillcolor="#fff8e6"; color="#e0b450"; fontsize=12;
+    boot    [label="optional-bootstrap (resident)\nstarted by start_optional_services()\nafter LEADER; builds clients, registers\noperator_requests handlers, adds tasks", fillcolor="#f4f4f4"];
+    tracker [label="arm-tracker\narm / update positions (CAS)\nentry time, S0, pinned semantics\nregisters ATR spec"];
+    cfg     [label="arm-config (src/armconfig)\nSupabase poll; accepted docs only\npre-registers ATR demand"];
+    clock   [label="arm  (BarClock)\nPRE at T - 40 s  |  POST on StoneX final bar\ncursor replay from own ack (A13)", fillcolor="#ffe9b8"];
+    pipe    [label="Evaluation pipeline\npre-guards -> declared guards -> strategy\n-> post-guards\nkind (a): break_even_on_risk_close"];
+    sink    [label="ARM_SINKS: decision sink + notice sink\none fenced tx per event,\nexactly-once notice"];
+    arelay  [label="arm-relay\narm_email / arm_push only"];
+  }
+
+  subgraph cluster_pg {
+    label="PostgreSQL (truth for orders and decisions; no market data)"; style="rounded,filled"; fillcolor="#eef7ee"; color="#8fbf8f"; fontsize=12;
+    pg_state [label="positions_state, orders_state\nstream_health, event_log (origin)"];
+    pg_arm   [label="arm_positions, arm_decisions\n(outcomes, R values, inputs_digest)\narm_notices, outbox (kind = arm)"];
+    pg_ctl   [label="arm_controls, arm_accepted (ops CLI)\narm_status, arm_config_cache / audit"];
+  }
+
+  oversee [label="Oversee RiskSweep (existing)\nP1: break-even stops stay visible", fillcolor="#e8eef5"];
+  supa [label="Supabase (schema arm)\nstrategies, assignments, route_policy\nlocal accept required", fillcolor="#f2eefa", color="#b09ad6"];
+  user [label="You (email / push)\none notice per event; FAILED pings\nbypass digest and quiet modes (B14)", fillcolor="#e6f4ea", color="#5fa36f"];
+  ph2  [label="Phase 2 order actioner\nseparate design; not built", style="rounded,dashed", color="#c0504d", fontcolor="#c0504d"];
+  future [label="Future automated strategies\n(entry / exit signals)\nsame port, same indicators", style="rounded,dashed", color="#4f97bd", fontcolor="#2f6f91"];
+
+  sx_prices -> orch; sx_orders -> orch;
+  orch -> hook [label="every tick"];
+  orch -> pg_state [label="committed state"];
+  pg_state -> oversee;
+  sx_bars -> relay [label="read only"];
+  hook -> mdw [label="drain every 250 ms"];
+  relay -> mdb [dir=back, label="request bars"];
+  mdw -> rmd; mdb -> rmd; ind -> rmd [dir=both];
+  mdw -> ind [label="bar_closed"];
+  rmd -> port;
+  port -> clock [label="bars, ATR,\nquote, quality"];
+  port -> future [style=dashed, color="#4f97bd"];
+  tracker -> port [style=dotted, label="register spec"];
+  pg_state -> tracker [label="snapshot / 2 s"];
+  supa -> cfg [label="poll 120 s, verify-full TLS"];
+  cfg -> pg_ctl; pg_ctl -> tracker [label="accepted doc"];
+  tracker -> clock [label="armed positions"];
+  boot -> tracker [style=dotted, label="adds tasks"];
+  clock -> pipe -> sink -> pg_arm -> arelay -> user;
+  sink -> ph2 [style=dashed, color="#c0504d", label="contract only"];
+
+  {rank=same; sx_prices; sx_orders; sx_bars; supa}
+  {rank=same; user; ph2}
+  {rank=same; mdw; mdb}
+  {rank=same; pg_state; oversee}
+}

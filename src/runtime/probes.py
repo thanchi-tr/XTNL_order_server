@@ -16,7 +16,7 @@ import socket
 import ssl
 import subprocess
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -240,6 +240,9 @@ class NodeHealthProbe:
         # set by the wiring: the leader's own SM4 view (adapter -> STREAMING) and market-open view
         self.leader_streaming: Callable[[], Mapping[str, bool]] | None = None
         self.market_open: Callable[[str], bool | None] | None = None
+        # set by the wiring once the optional services run (S32): this node's registry tokens (`KIND:VERSION`) for
+        # the health record; None (the default, S10) publishes an empty registry
+        self.registry_tokens: Callable[[], Iterable[str]] | None = None
 
     async def _guard(self, what: str, aw: Awaitable[bool]) -> bool:
         try:
@@ -329,6 +332,18 @@ class NodeHealthProbe:
             log.info("spill-file stat failed: %s", type(exc).__name__)
         return self._spill_last
 
+    def _registry(self) -> tuple[str, ...]:
+        """The sorted, de-duplicated registry tokens (pure, in memory). A raising source publishes none (logged with the
+        error type only), so a registry fault never fails a hard check."""
+        source = self.registry_tokens
+        if source is None:
+            return ()
+        try:
+            return tuple(sorted({str(t) for t in source() if t}))
+        except Exception as exc:
+            log.info("health registry tokens failed: %s", type(exc).__name__)
+            return ()
+
     async def probe(self, now_ms: int) -> HealthRecord:
         pg_ok, redis_ok, chrony, primary, tls, spill = await asyncio.gather(
             self._guard("postgres", primary_writable(self._pg)),
@@ -336,7 +351,7 @@ class NodeHealthProbe:
             self._chrony_ms(), self._hosts_primary(), self._broker_tls(), self._spill_bytes())
         return HealthRecord(self.node_id, now_ms, "", pg_writable=pg_ok, etcd_reachable=True,
                             redis_writable=redis_ok, chrony_offset_ms=chrony, broker_tls=tls,
-                            hosts_patroni_primary=primary, spill_bytes=spill)
+                            hosts_patroni_primary=primary, spill_bytes=spill, registry=self._registry())
 
 
 class StandbyRedisFlush:

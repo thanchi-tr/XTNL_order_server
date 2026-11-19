@@ -1,0 +1,41 @@
+// SM11: ARM state per position (resource STOP_LEVEL, owner position), design v11.2. Render: dot -Gdpi=130 -Tpng arm_state_machine.dot -o arm_state_machine.png
+digraph SM11 {
+  graph [rankdir=LR, fontname="Segoe UI", fontsize=20, labelloc=t, pad=0.4, nodesep=0.6, ranksep=0.9,
+         label="SM11: ARM state per (adapter, position, resource, owner) (stop level)\nSupabase changes never alter an armed position", bgcolor="white"];
+  node [fontname="Segoe UI", fontsize=12, shape=box, style="rounded,filled", fillcolor="#ffffff", color="#5b6b7f", penwidth=1.3];
+  edge [fontname="Segoe UI", fontsize=10, color="#5b6b7f", arrowsize=0.7];
+
+  start [shape=point, width=0.15];
+  DISCOVERED [fillcolor="#eef3f8"];
+  UNASSIGNED [fillcolor="#f4f4f4", color="#8c8c8c", fontcolor="#555555", label="UNASSIGNED / UNSUPPORTED\n(one 'not managed' notice;\nUNSUPPORTED also pages once)"];
+  ARMED [fillcolor="#fff3d6"];
+  TRACKING [fillcolor="#ffe9b8", label="TRACKING\n(PRE + POST every bar;\n2 final POST FAULTs in a row\nwhile OPEN -> page)"];
+  ADVICE [fillcolor="#ffd9a0", label="ADVICE_OUTSTANDING\n(move stop to break-even)"];
+  DONE [fillcolor="#d9f0dc", label="RELEASED (STRATEGY_COMPLETE)\nonly by a bar-end (POST) check:\ntrigger met AND every stop\nat or beyond break-even"];
+  SUSPENDED [fillcolor="#f8e0e0", label="SUSPENDED\n(re-paged every 6 h;\nneeds local re-arm)"];
+  anyst [shape=note, fillcolor="#f4f4f4", color="#8c8c8c", fontcolor="#555555",
+         label="From any state:\nposition closed  ->  CLOSED (terminal)\nops: disarm  ->  DISARMED (terminal)"];
+
+  start -> DISCOVERED [label="OPEN position seen"];
+  DISCOVERED -> UNASSIGNED [label="no assignment, or\ncannot be served", style=dashed, color="#8c8c8c"];
+  DISCOVERED -> ARMED [label="fresh image, entry known,\nstop, accepted assignment"];
+  ARMED -> TRACKING [label="first POST\n(any outcome)"];
+  TRACKING -> ADVICE [label="ADJUST"];
+  ADVICE -> ADVICE [label="better target"];
+  ADVICE -> TRACKING [label="POST without ADJUST\n(withdrawn, or PRE_NOT_CONFIRMED;\nstays managed)"];
+  TRACKING -> DONE [label="POST: confirmed\nand at break-even"];
+  ADVICE -> DONE [label="POST: confirmed\nand at break-even"];
+  DONE -> TRACKING [label="stop moved back\n(only if rearm_on_loosen)", style=dashed];
+  TRACKING -> SUSPENDED [label="3 strategy errors |\npinned version missing |\nunits increase (not a partial\nfill of the entry order)", color="#c0504d", fontcolor="#c0504d"];
+  SUSPENDED -> ARMED [label="ops: re-arm"];
+  FAILED [fillcolor="#f4c7c3", color="#c0504d", label="FAILED (B14)\nerror budget exceeded:\nno advice, immediate ping;\ningestion + Oversee keep running"];
+  anyfail [shape=note, fillcolor="#fbe9e7", color="#c0504d", fontcolor="#7a2e2b",
+           label="From any non-terminal state:\na covering FAILED scope (series, adapter,\nstrategy version or ARM)  ->  FAILED\n(stores prior_state)"];
+  prior [shape=box, style="rounded,dashed", color="#8c8c8c", fontcolor="#555555",
+         label="prior_state\n(the stored state, any)"];
+  anyfail -> FAILED [label="SCOPE_FAILED", style=dashed, color="#c0504d", fontcolor="#c0504d"];
+  FAILED -> FAILED [label="SUSPEND\n(prior_state := SUSPENDED)", color="#c0504d", fontcolor="#c0504d"];
+  FAILED -> prior [label="back to prior_state (any):\nno open FAILED scope covers it\n(ops clear after fix)", style=dashed];
+  SUSPENDED -> FAILED [label="re-arm while a\nscope is FAILED\n(prior_state := ARMED)", style=dashed, color="#c0504d", fontcolor="#c0504d"];
+  {rank=same; DONE; anyst}
+}

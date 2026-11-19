@@ -34,7 +34,7 @@ from typing import Any, Final
 import redis.asyncio as aioredis
 
 from src.cache.client import create_redis
-from src.db.pg import AsyncpgSource
+from src.db.pg import AsyncpgSource, with_schema_compat
 from src.observability.http import Request, Response
 from src.dashboard.views import DEFAULT_FRESH_MS, DashboardViews, LeaderTerm
 
@@ -132,7 +132,11 @@ async def create_read_only_source(dsn: str, *, max_size: int = 4) -> AsyncpgSour
     asyncpg = importlib.import_module("asyncpg")
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=max_size, timeout=3.0,
                                      server_settings=dict(READ_ONLY_SETTINGS), init=verify_read_only_connection)
-    return AsyncpgSource(pool)
+    try:
+        return await with_schema_compat(pool)   # S38f: a pre-0015 schema reads its old column list
+    except BaseException:
+        await pool.close()
+        raise
 
 
 def _wall_ms() -> int:

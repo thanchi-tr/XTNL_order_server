@@ -183,6 +183,8 @@ def _parse_trades(rows: Rows, out: HistoryMapping) -> list[_Trade]:
 
 def _trade_order(t: _Trade, lookup: SpecLookup, *, reduce_only: bool, linked: str | None,
                  adapter_id: str) -> OrderDTO:
+    """A trade-history row -> FILLED OrderDTO. The row states no stop / limit type, so ``order_kind`` stays None
+    (design PR1); a filled stop child keeps its known kind through the orchestrator's inheritance (S04)."""
     spec = lookup(t.market_id)
     qty = to_decimal(get_ci(t.row, "OriginalQuantity")) or to_decimal(get_ci(t.row, "Quantity", "Qauantity"))
     u = to_units(spec, qty)
@@ -393,6 +395,7 @@ def map_stop_limit_history(rows: Rows, *, since_ms: int, until_ms: int, lookup: 
         normalised = {**row,
                       "Status": get_ci(row, "Status", "StatusId", "OrderStatusId"),
                       "Quantity": get_ci(row, "Quantity", "OriginalQuantity", "Qauantity"),
+                      "Type": get_ci(row, "Type", "TypeId", "OrderTypeId"),     # IN-1: the history says TypeId
                       "LastChangedDateTimeUtc": ts}
         try:
             dto = map_stop_limit_order(normalised, account_id=client, lookup=lookup,

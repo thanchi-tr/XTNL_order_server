@@ -7,8 +7,9 @@ from typing import Any
 
 import pytest
 
-from src.deadman_receiver.evaluate import (PAYLOAD_FIELDS, BeatError, Evaluator, Thresholds, parse_beat)
-from src.runtime.deadman import AdapterBeat, DeadmanPayload
+from src.deadman_receiver.evaluate import (ARM_FAILED_FIELDS, ARM_FAILED_OPTIONAL, OPTIONAL_FIELDS, PAYLOAD_FIELDS, BeatError, Evaluator,
+                                           Thresholds, parse_beat)
+from src.runtime.deadman import OPTIONAL_PAYLOAD_FIELDS, AdapterBeat, ArmFailedBeat, DeadmanPayload
 
 T0 = 1_700_000_000_000
 
@@ -49,7 +50,11 @@ class Feed:
 
 
 def test_payload_fields_match_the_engine_sender() -> None:
-    assert set(PAYLOAD_FIELDS) == {f.name for f in dataclasses.fields(DeadmanPayload)}
+    """S08 (RT-M7, ST-12): required plus optional fields are exactly the engine payload's fields."""
+    assert set(PAYLOAD_FIELDS) | set(OPTIONAL_FIELDS) == {f.name for f in dataclasses.fields(DeadmanPayload)}
+    assert not set(PAYLOAD_FIELDS) & set(OPTIONAL_FIELDS)
+    assert tuple(OPTIONAL_FIELDS) == tuple(OPTIONAL_PAYLOAD_FIELDS)
+    assert {f.name for f in dataclasses.fields(ArmFailedBeat)} == set(ARM_FAILED_FIELDS) | set(ARM_FAILED_OPTIONAL)
     assert {f.name for f in dataclasses.fields(AdapterBeat)} == {"sm4_state", "market_open", "maintenance_until_ms"}
 
 

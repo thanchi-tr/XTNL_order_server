@@ -5,6 +5,8 @@ REST state (orders, positions, accounts, cash flows, instruments) can be changed
 streams replay a script and then either end (finite, the default) or wait for pushed items.
 ``build_fx_fixture()`` gives EURUSD / AUDUSD fixtures with an AUD-denominated account and a
 StoneX-style partially filled parent with an if-done stop child.
+``fetch_price_bars`` (design PR3) serves bars scripted per (symbol, side, timeframe) with ``set_price_bars``,
+including partial (forming) bars, truncated answers, failing reads and undecodable answers.
 """
 from __future__ import annotations
 
@@ -12,13 +14,15 @@ import asyncio
 import collections
 import dataclasses
 import functools
-from collections.abc import AsyncIterator, Iterable, Sequence
+import time
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Generic, TypeVar
 
 from src.adapters.base import (
     AccountStreamItem,
+    ActiveStopOrders,
     BrokerAdapter,
     BrokerError,
     BrokerHistory,
@@ -27,6 +31,7 @@ from src.adapters.base import (
     EntityType,
     MarketSessions,
     OrderStreamItem,
+    PriceBarsDecodeError,
     PriceStreamItem,
     StreamEvent,
     StreamEventKind,
@@ -38,20 +43,26 @@ from src.adapters.base import (
     note_absent,
     note_unmapped,
 )
-from src.adapters.ratelimit import RestBudget, RestPriority, current_rest_priority
+from src.adapters.ratelimit import RestBudget, RestPriority, current_rest_priority, mark_rest_sent
 from src.adapters.sessions import fx_default_sessions, looks_like_fx_pair
 from src.dto import (
     AccountDTO,
     AccountLive,
+    BarSide,
+    BrokerBar,
     CashFlowDTO,
     InstrumentSpec,
     OrderDTO,
+    OrderKind,
     OrderStatus,
     PositionDTO,
+    PriceBarsResponse,
     PriceDTO,
+    bar_request_problem,
 )
 
 T = TypeVar("T")
+BarKey = tuple[str, str, int]   # (symbol, side, timeframe_s)
 
 DEFAULT_VERSIONING: dict[EntityType, VersionDecl] = {
     "ORDER": VersionDecl(has_broker_seq=False, has_broker_time=True),
@@ -137,6 +148,7 @@ class MockBrokerAdapter(BrokerAdapter):
         history_orders: Iterable[OrderDTO] = (),
         history_positions: Iterable[PositionDTO] = (),
         history_retention_ms: int | None = None,
+        wall_ms: Callable[[], int] | None = None,
     ) -> None:
         self.adapter_id = adapter_id
         self.VERSIONING = dict(versioning or DEFAULT_VERSIONING)
@@ -170,6 +182,18 @@ class MockBrokerAdapter(BrokerAdapter):
         self._history_unmapped = 0
         self._history_supported = True
         self.history_requests: list[tuple[int, int]] = []
+        self._wall_ms = wall_ms if wall_ms is not None else (lambda: time.time_ns() // 1_000_000)
+        self._bars: dict[BarKey, list[BrokerBar]] = {}
+        self._bars_cap: dict[BarKey, int | None] = {}
+        self._bars_truncated: dict[BarKey, bool] = {}
+        self._bars_field_names: dict[BarKey, tuple[str, ...]] = {}
+        self._bar_failures: dict[BarKey, collections.deque[BrokerError]] = {}
+        self._bars_supported = True
+        #: Every fetch_price_bars request: (symbol, side, timeframe_s, count, from_ms, to_ms).
+        self.price_bar_requests: list[tuple[str, str, int, int | None, int | None, int | None]] = []
+        self._stop_orders_supported = True
+        self._stop_order_positions = False
+        self.stop_order_reads = 0       # fetch_active_stop_orders calls that read the book
 
     @classmethod
     def from_fixture(cls, fixture: MockFixture, **kwargs: object) -> MockBrokerAdapter:
@@ -254,6 +278,59 @@ class MockBrokerAdapter(BrokerAdapter):
     def set_instrument(self, spec: InstrumentSpec) -> None:
         self._instruments[spec.symbol] = spec
 
+    def set_order_kind(self, broker_order_id: str, kind: OrderKind | None) -> OrderDTO:
+        """Script the broker's order type (design PR1) on an order of the current book: later REST reads serve it
+        with ``order_kind = kind`` (None: the broker states no type). Returns the new row; KeyError when unknown."""
+        order = dataclasses.replace(self._orders[broker_order_id], order_kind=kind)
+        self._orders[broker_order_id] = order
+        return order
+
+    def set_instrument_metadata(self, symbol: str, *, price_increment: Decimal | None = None,
+                                min_stop_distance: Decimal | None = None,
+                                asset_class: str | None = None) -> InstrumentSpec:
+        """Script the PR7 instrument metadata of ``symbol`` (None: the broker states none, so an ARM position on it
+        is UNSUPPORTED). Later ``fetch_instruments`` calls serve it. Returns the new spec; KeyError when unknown."""
+        spec = dataclasses.replace(self._instruments[symbol], price_increment=price_increment,
+                                   min_stop_distance=min_stop_distance, asset_class=asset_class)
+        self._instruments[symbol] = spec
+        return spec
+
+    def set_price_bars(self, symbol: str, side: BarSide, timeframe_s: int, bars: Iterable[BrokerBar], *,
+                       max_bars: int | None = None, truncated: bool = False,
+                       field_names: Sequence[str] = ()) -> None:
+        """Script the bars of one series (design PR3), any order (served oldest first); a bar with
+        ``partial=True`` is the forming one. ``max_bars``: the cap on complete bars per answer (a range answer with
+        more keeps the oldest ``max_bars``, a count answer the newest; either is then truncated). ``truncated``: every
+        answer says it was capped.
+        ``field_names``: the names the scripted answer reports (PR3 probe)."""
+        key: BarKey = (symbol, side, timeframe_s)
+        self._bars[key] = sorted(bars, key=lambda b: b.bucket_start_ms)
+        self._bars_cap[key] = max_bars
+        self._bars_truncated[key] = truncated
+        self._bars_field_names[key] = tuple(field_names)
+
+    def fail_price_bars(self, symbol: str, side: BarSide, timeframe_s: int, error: BrokerError,
+                        times: int = 1) -> None:
+        """The next ``times`` reads of this series raise ``error`` (e.g. ``TransientBrokerError``)."""
+        queue = self._bar_failures.setdefault((symbol, side, timeframe_s), collections.deque())
+        queue.extend([error] * times)
+
+    def undecodable_price_bars(self, symbol: str, side: BarSide, timeframe_s: int, times: int = 1) -> None:
+        """The next ``times`` reads of this series get an answer that cannot be decoded (``PriceBarsDecodeError``)."""
+        self.fail_price_bars(symbol, side, timeframe_s,
+                             PriceBarsDecodeError("mock bars: scripted undecodable answer"), times)
+
+    def set_price_bars_supported(self, supported: bool) -> None:
+        """False: ``fetch_price_bars`` answers like an adapter without the capability (the base default)."""
+        self._bars_supported = supported
+
+    def set_stop_orders_supported(self, supported: bool, *, positions: bool = False) -> None:
+        """``fetch_active_stop_orders`` (design PR9): False answers like an adapter without the read (the base
+        default). ``positions=True`` lists the open positions (cTrader POSITION_FIELD handles) instead of the
+        working stop / limit orders (StoneX CHILD_ORDER handles)."""
+        self._stop_orders_supported = supported
+        self._stop_order_positions = positions
+
     def set_market_sessions(self, sessions: MarketSessions) -> None:
         self._market_sessions[sessions.symbol] = sessions
 
@@ -275,10 +352,13 @@ class MockBrokerAdapter(BrokerAdapter):
         return self._budget
 
     async def _rest(self, method: str) -> None:
-        """A REST read: record the caller's priority and take a token when a budget is attached."""
+        """A REST read: record the caller's priority and take a token when a budget is attached. The send time is
+        stamped (``rest_sent_ms``): by the budget after its token wait, else from the mock's wall clock."""
         self.rest_calls.append((method, current_rest_priority()))
         if self._budget is not None:
             await self._budget.acquire()
+        else:
+            mark_rest_sent(self._wall_ms())
 
     def _enter(self, method: str) -> None:
         self.calls.append(method)
@@ -402,6 +482,63 @@ class MockBrokerAdapter(BrokerAdapter):
             positions=tuple(sorted(positions.values(), key=lambda p: (p.broker_updated_at_ms, p.position_id))),
             complete=not notes, notes=notes.unique(), retryable=notes.retryable, unmapped=read.unmapped)
 
+    @property
+    def price_bars_supported(self) -> bool:
+        return self._bars_supported
+
+    async def fetch_price_bars(self, symbol: str, side: BarSide, timeframe_s: int, *, count: int | None = None,
+                               from_ms: int | None = None, to_ms: int | None = None) -> PriceBarsResponse:
+        """The scripted bars of the series: the newest ``count`` complete bars plus the forming one (like StoneX's
+        ``PriceBars`` count and ``PartialPriceBar``), or those starting in ``[from_ms, to_ms]``. A series never scripted answers with no bars (a complete, empty answer). Records the
+        request and the caller's REST priority."""
+        problem = bar_request_problem(side, timeframe_s, count, from_ms, to_ms)
+        if problem is not None:
+            raise ValueError(f"fetch_price_bars: {problem}")
+        self.price_bar_requests.append((symbol, side, timeframe_s, count, from_ms, to_ms))
+        if not self._bars_supported:
+            self._enter("fetch_price_bars")
+            return PriceBarsResponse.unsupported(self.adapter_id, symbol, side, timeframe_s, count=count,
+                                                 from_ms=from_ms, to_ms=to_ms)
+        await self._rest("fetch_price_bars")
+        self._enter("fetch_price_bars")
+        key: BarKey = (symbol, side, timeframe_s)
+        failures = self._bar_failures.get(key)
+        if failures:
+            raise failures.popleft()
+        series = self._bars.get(key, [])
+        cap = self._bars_cap.get(key)
+        truncated = self._bars_truncated.get(key, False)
+        if count is not None:
+            bars = [b for b in series if not b.partial][-count:]
+            if cap is not None and len(bars) > cap:
+                bars, truncated = bars[-cap:], True
+            forming = [b for b in series if b.partial]
+            bars.extend(forming[-1:])
+        else:
+            assert from_ms is not None and to_ms is not None
+            bars = [b for b in series if from_ms <= b.bucket_start_ms <= to_ms]
+            if cap is not None and len(bars) > cap:
+                bars, truncated = bars[:cap], True
+        return PriceBarsResponse(adapter_id=self.adapter_id, symbol=symbol, side=side, timeframe_s=timeframe_s,
+                                 bars=tuple(bars), truncated=truncated, received_ms=self._wall_ms(), count=count,
+                                 from_ms=from_ms, to_ms=to_ms, field_names=self._bars_field_names.get(key, ()))
+
+    async def fetch_active_stop_orders(self) -> ActiveStopOrders:
+        """One list read (design PR9): every working order of the scripted book with a known STOP / LIMIT kind (an
+        untyped order is no stop / limit order), or with ``set_stop_orders_supported(True, positions=True)`` the
+        open positions. Records the caller's REST priority like every read."""
+        if not self._stop_orders_supported:
+            self._enter("fetch_active_stop_orders")
+            return ActiveStopOrders.unsupported(self.adapter_id)
+        await self._rest("fetch_active_stop_orders")
+        self._enter("fetch_active_stop_orders")
+        self.stop_order_reads += 1
+        if self._stop_order_positions:
+            return ActiveStopOrders(adapter_id=self.adapter_id,
+                                    positions=tuple(p for p in self._positions.values() if p.status == "OPEN"))
+        return ActiveStopOrders(adapter_id=self.adapter_id, orders=tuple(
+            o for o in self._orders.values() if not o.status.terminal and o.order_kind is not None))
+
     async def ensure_ticks(self, symbols: Sequence[str]) -> None:
         self._enter("ensure_ticks")
         self.subscribed_symbols.update(symbols)
@@ -458,14 +595,18 @@ class MockBrokerAdapter(BrokerAdapter):
 
 # --- fixtures --------------------------------------------------------------------------------------
 def fx_spec(symbol: str, *, adapter_id: str = "mock", min_qty: Decimal = Decimal(1000),
-            broker_symbol: str = "") -> InstrumentSpec:
-    """An FX InstrumentSpec in base-currency units (pip 0.0001, 0.01 for JPY quotes)."""
+            broker_symbol: str = "", price_increment: Decimal | None = None,
+            min_stop_distance: Decimal | None = None, asset_class: str | None = None) -> InstrumentSpec:
+    """An FX InstrumentSpec in base-currency units (pip 0.0001, 0.01 for JPY quotes). The PR7 metadata
+    (``price_increment``, ``min_stop_distance``, ``asset_class``) is None unless scripted, so the default fixtures
+    keep their checksums."""
     base, quote = symbol[:3], symbol[3:]
     return InstrumentSpec(
         adapter_id=adapter_id, symbol=symbol, base_ccy=base, quote_ccy=quote, pnl_ccy=quote,
         contract_size=Decimal(1), unit_kind="UNITS",
         point_size=Decimal("0.01") if quote == "JPY" else Decimal("0.0001"),
         min_qty=min_qty, swap_booked_to_balance=True, broker_symbol=broker_symbol or symbol,
+        price_increment=price_increment, min_stop_distance=min_stop_distance, asset_class=asset_class,
     )
 
 

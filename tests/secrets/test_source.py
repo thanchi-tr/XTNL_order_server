@@ -9,6 +9,7 @@ from src.secrets.source import (
     AwsSecretsManager,
     EnvSecrets,
     SecretsError,
+    SecretsUnavailable,
     parse_secret_string,
     secrets_source_from_env,
 )
@@ -106,12 +107,13 @@ def test_auth_error_refreshes_the_aws_credentials_and_retries() -> None:
 def test_read_errors_name_no_values() -> None:
     fake = FakeAws()
     fake.fail_next.append((400, "AccessDeniedException"))
-    with pytest.raises(SecretsError, match="AccessDeniedException"):
+    with pytest.raises(SecretsUnavailable, match="AccessDeniedException"):     # an AWS read failure: retryable
         manager(fake).resolve({})
     fake.secret = '{"STONE_X_PASS": "' + STONEX_SECRET + '"'          # truncated JSON
     with pytest.raises(SecretsError) as info:
         manager(fake).resolve({})
     assert STONEX_SECRET not in str(info.value)
+    assert not isinstance(info.value, SecretsUnavailable), "a malformed secret is a configuration error"
 
 
 def test_parse_secret_string_rejects_non_variables() -> None:

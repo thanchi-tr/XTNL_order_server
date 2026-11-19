@@ -11,7 +11,7 @@ import pytest
 from src.db import halt_store as H
 from src.db.epoch import SQL_COMMIT, SQL_ROLLBACK
 from src.db.operator_requests import (
-    REQUEST_KINDS,
+    CORE_REQUEST_KINDS,
     RequestPayloadError,
     parse_cash_flow_refresh,
     parse_release,
@@ -167,7 +167,7 @@ async def test_refresh_refusals(svc: OpsService, pg: OpsPg) -> None:
 
 
 def test_request_payload_parsers_reject_mismatches() -> None:
-    assert REQUEST_KINDS == {"reset_task", "release_account", "refresh_cash_flows"}
+    assert CORE_REQUEST_KINDS == {"reset_task", "release_account", "refresh_cash_flows"}  # 0017 adds the ARM kinds
     with pytest.raises(RequestPayloadError):
         parse_cash_flow_refresh("ACC", '{"account_id": "OTHER"}')
     with pytest.raises(RequestPayloadError):

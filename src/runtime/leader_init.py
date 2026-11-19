@@ -14,7 +14,14 @@
     7. DLQ start-up barrier
     then leader_terms.reached_leader_at.
 
-Any failure other than a due SAFE_HOLD is a hard exit (`init_failed`). A lost fence (`EpochMismatch`,
+Any failure other than a due SAFE_HOLD is a hard exit (`init_failed`). A stop (K15: SIGTERM, `stop` set) is not a
+failure: taken before step 1 it skips the epoch bump (outcome STOPPED, no term); taken after it, the step in flight is
+cancelled (steps 2-7 and LEADER entry; step 1 itself is never cancelled, its commit must be known) and the outcome
+is STOPPED with `epoch_bump` in the steps, so the caller ends the term through DRAINING (`switchover`). The wait for
+the cancelled step to unwind is capped at `ABORT_CANCEL_S` and at the time left before the 120 s deadline, so a stop
+just before the deadline still ends STOPPED, never `init_failed: deadline`. A step must never swallow
+`CancelledError`; as a guard, once a stop has abandoned the steps every later step boundary raises `CancelledError`, so
+a step that did swallow it can never go on to start SM4, the RiskSweep or mark the term LEADER. A lost fence (`EpochMismatch`,
 from any step, `mark_reached_leader` included: a successor closed this term) is a hard exit with reason
 `fence` (IMPLEMENTATION_PLAN 4.9). The 120 s deadline is
 enforced by the lease-keeper thread (`LeaseKeeper.begin_leader_init`) and, as a second line, by
@@ -28,7 +35,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Protocol
+from typing import Final, Protocol
 
 from src.db.epoch import Epoch
 from src.runtime.exits import ExitFn, hard_exit
@@ -146,6 +153,15 @@ class LeaderInitDeps:
 class InitOutcome(str, Enum):
     LEADER = "LEADER"
     SAFE_HOLD = "SAFE_HOLD"
+    STOPPED = "STOPPED"      # K15: a stop request ended LEADER_INIT; `term_started` tells whether step 1 committed
+
+
+ABORT_CANCEL_S: Final = 1.0
+"""K15: how long a stop waits for the cancelled LEADER_INIT step to unwind before the term is ended anyway."""
+
+DEADLINE_MARGIN_S: Final = 0.05
+"""K15: the unwind wait ends at least this long before the LEADER_INIT deadline, so the outer `wait_for` never fires
+on a stop that is already being handled."""
 
 
 @dataclass
@@ -156,6 +172,11 @@ class InitReport:
     ruleset_version: int | None = None
     sod: SodOutcome | None = None
     fence: FenceOutcome | None = None
+
+    @property
+    def term_started(self) -> bool:
+        """Step 1 committed: this node's leader_terms row exists (it must be ended with an end reason)."""
+        return "epoch_bump" in self.steps
 
 
 class LeaderInitFailed(RuntimeError):
@@ -182,18 +203,26 @@ def _wall_ms() -> int:
 
 class LeaderInit:
     def __init__(self, deps: LeaderInitDeps, *, exit_fn: ExitFn = hard_exit, deadline_s: float = 120.0,
-                 clock_ms: Callable[[], int] = _wall_ms) -> None:
+                 clock_ms: Callable[[], int] = _wall_ms, stop: asyncio.Event | None = None,
+                 abort_cancel_s: float = ABORT_CANCEL_S) -> None:
         self._d = deps
         self._exit = exit_fn
         self._deadline_s = deadline_s
         self._clock_ms = clock_ms
+        self._stop = stop
+        self._abort_cancel_s = abort_cancel_s
+        self._started_at = 0.0
+        self._abandoned = False     # K15: a stop ended LEADER_INIT; the steps coroutine must not go on
+
 
     async def run(self, epoch: Epoch, node_id: str) -> InitReport | None:
-        """Run LEADER_INIT. Returns the report (LEADER or SAFE_HOLD); on any failure calls the exit
+        """Run LEADER_INIT. Returns the report (LEADER, SAFE_HOLD or STOPPED); on any failure calls the exit
         function with `init_failed` and returns None (production never returns)."""
         report = InitReport(InitOutcome.LEADER)
+        self._started_at = asyncio.get_running_loop().time()
+        self._abandoned = False
         try:
-            await asyncio.wait_for(self._steps(epoch, node_id, report), self._deadline_s)
+            await asyncio.wait_for(self._run(epoch, node_id, report), self._deadline_s)
         except TimeoutError:
             log.critical("LEADER_INIT passed its %.0f s deadline after %s", self._deadline_s, report.steps)
             self._exit("init_failed: deadline")
@@ -208,46 +237,129 @@ class LeaderInit:
             return None
         return report
 
-    async def _steps(self, epoch: Epoch, node_id: str, report: InitReport) -> None:
-        d = self._d
-        fence = await d.fencer.bump_and_fence(epoch, node_id, self._clock_ms())
+    def _stop_requested(self) -> bool:
+        return self._stop is not None and self._stop.is_set()
+
+    def _stopped(self, report: InitReport, where: str) -> None:
+        report.outcome = InitOutcome.STOPPED
+        log.warning("LEADER_INIT stopped %s (after %s)%s", where, report.steps,
+                    "; the term is ended through DRAINING" if report.term_started else "; no term was started")
+
+    async def _run(self, epoch: Epoch, node_id: str, report: InitReport) -> None:
+        if self._stop_requested():                  # K15: before the epoch bump: no term at all
+            self._stopped(report, "before the epoch bump")
+            return
+        await self._step1(epoch, node_id, report)   # never cancelled by a stop: its commit must be known
+        if report.outcome is InitOutcome.SAFE_HOLD:
+            return
+        if self._stop_requested():
+            self._stopped(report, "at a step boundary")
+            return
+        stop = self._stop
+        if stop is None:
+            await self._steps(epoch, report)
+            return
+        rest = asyncio.ensure_future(self._steps(epoch, report))
+        waiter = asyncio.ensure_future(stop.wait())
+        try:
+            await asyncio.wait({rest, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:                       # the deadline / an outer cancel: the steps go with it
+            rest.cancel()
+            waiter.cancel()
+            raise
+        waiter.cancel()
+        if rest.done():
+            rest.result()                           # finished by itself: LEADER, or its failure as before
+            return
+        # K15: a stop during steps 2-7 / LEADER entry. The step in flight is cancelled at its next await (the term
+        # ends now, so nothing it would finish is needed; its writes are fenced transactions and the engine Redis is
+        # flushed at STANDBY entry), bounded by `abort_cancel_s`, never by the step's own length (SM8: up to 100 s),
+        # and by the time left before the LEADER_INIT deadline: a stop just before it still ends STOPPED (the outer
+        # `wait_for` firing during this wait would turn it into `init_failed: deadline`).
+        self._abandoned = True
+        rest.cancel()
+        left = self._deadline_s - (asyncio.get_running_loop().time() - self._started_at) - DEADLINE_MARGIN_S
+        wait_s = min(self._abort_cancel_s, left)
+        done: set[asyncio.Future[None]] = set()
+        if wait_s > 0:
+            done, _ = await asyncio.wait({rest}, timeout=wait_s)
+        if not done:
+            log.error("LEADER_INIT step did not unwind within %.2f s of the stop; ending the term anyway",
+                      max(wait_s, 0.0))
+            rest.add_done_callback(_retrieve)
+        elif not rest.cancelled():
+            exc = rest.exception()
+            if exc is not None and is_fence_loss(exc):
+                raise exc                           # a successor took over: the hard exit `fence`, as before
+            if exc is not None:
+                log.warning("LEADER_INIT step ended with %r while stopping", exc)
+        self._stopped(report, "during a step")
+
+    async def _step1(self, epoch: Epoch, node_id: str, report: InitReport) -> None:
+        fence = await self._d.fencer.bump_and_fence(epoch, node_id, self._clock_ms())
         report.fence = fence
         report.steps.append("epoch_bump")
         if fence.safe_hold:
             report.outcome = InitOutcome.SAFE_HOLD
             log.critical("SAFE_HOLD due at LEADER_INIT: %s; term aborted", fence.safe_hold_reason)
-            return
+
+    def _go_on(self) -> None:
+        """K15 guard: no LEADER_INIT step (dependencies must re-raise `CancelledError`, never swallow it) may start
+        once a stop has abandoned the steps, so a step that did swallow the cancel cannot go on to start SM4 or the
+        RiskSweep, or mark the term LEADER, after the term ended."""
+        if self._abandoned:
+            raise asyncio.CancelledError("LEADER_INIT stopped")
+
+    async def _steps(self, epoch: Epoch, report: InitReport) -> None:
+        """Steps 2-7 and LEADER entry (after step 1 committed). Each step boundary checks `_go_on()`."""
+        d = self._d
+        self._go_on()
         d.hlc.reseed(await d.seq.max_seq_id())
         report.steps.append("hlc_reseed")
+        self._go_on()
         await d.redis.flushdb()
         report.steps.append("flushdb")
         if d.rules is not None:
+            self._go_on()
             report.ruleset_version = await d.rules.load_ruleset(self._clock_ms())
             report.steps.append("ruleset")
+        self._go_on()
         sod = await d.sod.catch_up(self._clock_ms())
         report.sod = sod
         if sod.partial_session:
             d.flags.flag("partial_session", "sod catch-up wrote a partial_session row; MaxDailyLossRule capped at SOFT")
         report.steps.append("sod_catch_up")
+        self._go_on()
         report.calendar_version = await d.calendar.init_calendar(self._clock_ms())
         report.steps.append("calendar")
+        self._go_on()
         async with asyncio.TaskGroup() as tg:      # step 6: SM4 in parallel with SM8; sweep at once
             tg.create_task(self._start_sm4(report))
             tg.create_task(self._run_sm8(report))
             tg.create_task(self._start_sweep(report))
+        self._go_on()
         await d.dlq.startup_barrier()
         report.steps.append("dlq_barrier")
+        self._go_on()
         await d.terms.mark_reached_leader(epoch, self._clock_ms())
         report.steps.append("reached_leader")
 
     async def _start_sm4(self, report: InitReport) -> None:
+        self._go_on()
         await self._d.ingestion.start_adapters()
         report.steps.append("sm4_started")
 
     async def _run_sm8(self, report: InitReport) -> None:
+        self._go_on()
         await self._d.sm8.bootstrap()
         report.steps.append("sm8_ready")
 
     async def _start_sweep(self, report: InitReport) -> None:
+        self._go_on()
         await self._d.risksweep.start_risksweep()
         report.steps.append("risksweep_started")
+
+
+def _retrieve(fut: asyncio.Future[None]) -> None:
+    if not fut.cancelled():
+        fut.exception()

@@ -10,6 +10,14 @@ Service:
 * XTNL_RECEIVER_PATH         the heartbeat path (default /xtnl/heartbeat, the path of XTNL_DEADMAN_URL).
 * XTNL_RECEIVER_TEST_PAGE_UTC  HH:MM of the daily test page (default 22:00 UTC = morning in Melbourne).
 * XTNL_RECEIVER_REPAGE_S     re-page interval while a condition stays active (default 900, 60..86400).
+* XTNL_RECEIVER_CERTS        K5: name=path list of the certificates on this Melbourne host the receiver watches
+                             (e.g. dashboard-redis-client=/etc/xtnl/dashboard/redis-client.crt): each pages
+                             `cert:<name>` when unreadable or within 30 days of expiry. Its own TLS certificate is
+                             always watched (`deadman-receiver`).
+
+Rotation without restart (K10): with aws-sm, the bearer tokens (every tick) and the paging channel credentials
+(every `CHANNEL_REFRESH_S`) follow the cached secret; the TLS certificate / key files are re-loaded in place when
+they change (checked every `CERT_CHECK_S`). The listen address, path and channel kinds still need a restart.
 
 Secrets source (operations.md §13 "rotation without restart"; IMPLEMENTATION_PLAN 8.2): XTNL_SECRETS_SOURCE
 = env (default) | aws-sm with XTNL_SECRETS_ID / XTNL_SECRETS_REGION (`src.secrets.source`). With aws-sm the secret's
@@ -38,6 +46,7 @@ from src.deadman_receiver.tokens import (
     token_set,
 )
 from src.notifications.settings import NotificationSettings, PushSettings, SesSettings, SmtpSettings, is_loopback
+from src.observability.certs import parse_name_list
 from src.secrets.source import REGION_VAR, SOURCE_VAR, SecretsError, SecretsSource, secrets_source_from_env
 
 PREFIX: Final = "XTNL_RECEIVER_"
@@ -47,6 +56,7 @@ TLS_KEY_VAR: Final = "XTNL_RECEIVER_TLS_KEY"
 PATH_VAR: Final = "XTNL_RECEIVER_PATH"
 TEST_PAGE_VAR: Final = "XTNL_RECEIVER_TEST_PAGE_UTC"
 REPAGE_VAR: Final = "XTNL_RECEIVER_REPAGE_S"
+CERTS_VAR: Final = "XTNL_RECEIVER_CERTS"
 #: The channel variables: XTNL_RECEIVER_<X> is read as the engine's XTNL_<X> by src.notifications.settings.
 CHANNEL_VARS: Final = (
     "XTNL_RECEIVER_ALERT_EMAIL_TO",
@@ -85,6 +95,7 @@ class ReceiverSettings:
     issues: tuple[str, ...] = ()
     token_next: str | None = field(default=None, repr=False)
     token_overlap_s: int = 1_800
+    certs: tuple[tuple[str, str], ...] = ()     # K5: (name, path) of the watched Melbourne certificates
 
     @property
     def tls(self) -> bool:
@@ -121,11 +132,14 @@ class ReceiverSettings:
         if channels.email is None and channels.push is None:
             errors.append("no paging channel outside eu-west-2 is configured (XTNL_RECEIVER_SES_* / "
                           "XTNL_RECEIVER_SMTP_* / XTNL_RECEIVER_PUSH_*)")
+        certs = dict(parse_name_list(_get(e, CERTS_VAR)))
+        if cert is not None:
+            certs.setdefault("deadman-receiver", cert)
         if errors:
             raise ReceiverConfigError("; ".join(errors))
         assert token is not None
         return cls(host, port, token, channels, cert, key, path, test_page, repage, channels.issues, token_next,
-                   overlap)
+                   overlap, tuple(sorted(certs.items())))
 
 
 def receiver_secrets_source(env: Mapping[str, str] | None = None) -> SecretsSource:

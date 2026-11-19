@@ -64,7 +64,7 @@ class OperatorRequest:
     """One pending `operator_requests` row for this leader's epoch (IMPLEMENTATION_PLAN 4.6 / 4.9)."""
 
     request_id: int
-    kind: str           # 'reset_task' | 'release_account' | 'refresh_cash_flows' (src/db/operator_requests.py)
+    kind: str           # a core kind (src/db/operator_requests.py CORE_REQUEST_KINDS) or a registered one
     target: str         # the task name, or the account id
     operator: str       # operator_audit.operator of the request
     payload: object = None   # operator_requests.payload (jsonb as text or a mapping); parsed per kind
@@ -73,7 +73,12 @@ class OperatorRequest:
 class OperatorRequestQueue(Protocol):
     """In-process operator requests (`python -m src.ops task reset`), scoped to the epoch they were made in."""
 
-    async def pending(self, epoch_token: int) -> Sequence[OperatorRequest]: ...
+    async def pending(self, epoch_token: int, kinds: Collection[str],
+                      exclude: Collection[int] = ()) -> Sequence[OperatorRequest]:
+        """This epoch's unconsumed requests whose kind is in `kinds` (the core kinds plus the registered ones;
+        design §B13, RT-M10) and whose id is not in `exclude` (the session's accepted, unanswered requests, so
+        they take no slot of the limit), oldest first, at most 50."""
+        ...
 
     async def consume(self, epoch_token: int, request_id: int, result: str) -> None:
         """Mark the request consumed by this epoch (fenced; a request already consumed is left alone)."""
@@ -120,6 +125,12 @@ class LeaderPorts:
     gate_reader: Callable[[GateInputs], GateContextReader]
     sod: SodLedger
     close: Callable[[], Awaitable[None]]
+    # Drops the term pool's connections without waiting (never awaits): what EngineSession.aclose calls when
+    # `close` has not finished inside drain_aclose_s (design RT-M6). None: nothing to drop (in-memory ports).
+    terminate: Callable[[], None] | None = None
+    # S31 (design §B14, R11-M11): wall time of the term pool's last successful fenced commit, the "engine PostgreSQL
+    # down" input of the ARM's error budget (`PgHealthPortImpl`). None: not tracked (in-memory ports).
+    last_fenced_commit_ms: Callable[[], int | None] | None = None
 
 
 PortsFactory = Callable[[Epoch], LeaderPorts]

@@ -3,6 +3,7 @@
 
     STARTING -> STANDBY -> CANDIDATE -> LEADER_INIT -> LEADER -> DRAINING -> STANDBY
     any -> FENCED (the process is killed and restarts at STARTING); STANDBY <-> SAFE_HOLD
+    a stop during LEADER_INIT (K15): LEADER_INIT -> DRAINING once step 1 committed, else LEADER_INIT -> STANDBY
 
 Everything here is pure (callers pass `now_ms` and the views); the node controller performs the I/O.
 """
@@ -49,7 +50,9 @@ ALLOWED: Final[Mapping[NodeRole, frozenset[NodeRole]]] = {
     R.STARTING: frozenset({R.STANDBY, R.SAFE_HOLD, R.FENCED}),
     R.STANDBY: frozenset({R.CANDIDATE, R.SAFE_HOLD, R.FENCED}),
     R.CANDIDATE: frozenset({R.LEADER_INIT, R.STANDBY, R.SAFE_HOLD, R.FENCED}),
-    R.LEADER_INIT: frozenset({R.LEADER, R.SAFE_HOLD, R.FENCED}),
+    # K15: a stop during LEADER_INIT ends a started term through DRAINING, or goes back to STANDBY when it came
+    # before the epoch bump (no term).
+    R.LEADER_INIT: frozenset({R.LEADER, R.DRAINING, R.STANDBY, R.SAFE_HOLD, R.FENCED}),
     R.LEADER: frozenset({R.DRAINING, R.FENCED}),
     R.DRAINING: frozenset({R.STANDBY, R.FENCED}),
     R.SAFE_HOLD: frozenset({R.STANDBY, R.FENCED}),
@@ -110,11 +113,13 @@ def learn_backoff(own_terms: Sequence[TermRow], now_ms: int) -> Backoff | None:
 
 
 def safe_hold_due(terms: Sequence[TermRow], now_ms: int, last_resume_at: int | None) -> str | None:
-    """Pure mirror of the SQL check in `src/db/leader.py`: 3 abnormal ends within 15 min, or more than
-    6 epoch changes within 30 min; only terms after the last operator resume count."""
+    """Pure mirror of the SQL check in `src/db/leader.py`: 3 terms that started and ended abnormally within
+    15 min, or more than 6 epoch changes within 30 min; only terms after the last operator resume count. A term
+    left open by a kill and closed later by its successor started outside the window, so it is no flap."""
     floor = last_resume_at or 0
+    window_start = now_ms - ABNORMAL_WINDOW_MS
     abnormal = sum(1 for t in terms if t.end_reason in ABNORMAL and t.ended_at is not None
-                   and t.ended_at >= now_ms - ABNORMAL_WINDOW_MS and t.ended_at > floor)
+                   and t.ended_at >= window_start and t.started_at >= window_start and t.ended_at > floor)
     if abnormal >= ABNORMAL_LIMIT:
         return f"{abnormal} abnormal term ends within 15 min"
     changes = sum(1 for t in terms if t.started_at >= now_ms - EPOCH_WINDOW_MS and t.started_at > floor)

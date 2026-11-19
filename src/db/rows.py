@@ -192,7 +192,7 @@ def sod_from_row(r: Row) -> SodMark | None:
 ORDER_COLS: Final = (
     "client_order_id, broker_order_id, account_id, adapter_id, symbol, side, status, entry_price, stop_loss, "
     "take_profit, ordered_units, remaining_units, instrument_unknown, raw_qty, is_reduce_only, linked_position_id, "
-    "broker_updated_at_ms, broker_seq, source, observed_seq, seq_id"
+    "broker_updated_at_ms, broker_seq, source, observed_seq, seq_id, order_kind"
 )
 
 
@@ -204,7 +204,7 @@ def order_from_row(r: Row) -> OrderDTO:
         ordered_units=_opt_dec(r[10]), remaining_units=_opt_dec(r[11]), instrument_unknown=bool(r[12]),
         raw_qty=_opt_dec(r[13]), is_reduce_only=bool(r[14]), linked_position_id=None if r[15] is None else str(r[15]),
         broker_updated_at_ms=int(r[16]), broker_seq=_opt_int(r[17]), source=cast(Any, str(r[18])),
-        observed_seq=int(r[19]), seq_id=int(r[20]),
+        observed_seq=int(r[19]), seq_id=int(r[20]), order_kind=cast(Any, None if r[21] is None else str(r[21])),
     )
 
 
@@ -243,7 +243,7 @@ def account_from_row(r: Row) -> AccountDTO:
 
 INSTRUMENT_COLS: Final = (
     "adapter_id, symbol, base_ccy, quote_ccy, pnl_ccy, contract_size, unit_kind, point_size, min_qty, "
-    "swap_booked_to_balance, broker_symbol"
+    "swap_booked_to_balance, broker_symbol, price_increment, min_stop_distance, asset_class"
 )
 
 
@@ -251,7 +251,8 @@ def instrument_from_row(r: Row) -> InstrumentSpec:
     return InstrumentSpec(adapter_id=str(r[0]), symbol=str(r[1]), base_ccy=str(r[2]), quote_ccy=str(r[3]),
                           pnl_ccy=str(r[4]), contract_size=_dec(r[5]), unit_kind=cast(Any, str(r[6])),
                           point_size=_dec(r[7]), min_qty=_dec(r[8]), swap_booked_to_balance=bool(r[9]),
-                          broker_symbol=str(r[10] or ""))
+                          broker_symbol=str(r[10] or ""), price_increment=_opt_dec(r[11]),
+                          min_stop_distance=_opt_dec(r[12]), asset_class=None if r[13] is None else str(r[13]))
 
 
 CASH_FLOW_COLS: Final = (

@@ -248,7 +248,9 @@ def test_etcd_cluster_status_reads_every_endpoint_by_member_name() -> None:
 def test_disk_and_missing_certs(tmp_path: Path) -> None:
     got = by_name(T.disk_samples([str(tmp_path), str(tmp_path / "missing")]))
     assert list(got) == [("xtnl_disk_used_ratio", (("mount", str(tmp_path)),))]
-    assert T.cert_samples({"ca": str(tmp_path / "none.crt")}, 0.0) == []           # unreadable: absent
+    # K5: an unreadable certificate is reported (readable 0), its expiry absent
+    assert [(x.name, x.value, x.labels) for x in T.cert_samples({"ca": str(tmp_path / "none.crt")}, 0.0)] == [
+        ("xtnl_cert_readable", 0.0, {"cert": "ca"})]
     assert T.certs_from_env({"XTNL_ETCD_CERT": "/c", "XTNL_ETCD_CA": "/ca"}) == {"etcd-client": "/c", "ca": "/ca"}
     assert T.certs_from_env({"XTNL_METRICS_CERTS": "pg-server=/p, ca=/x"}) == {"pg-server": "/p", "ca": "/x"}
 
@@ -263,6 +265,9 @@ class Controller:
 class TermSession:
     def __init__(self) -> None:
         self.calls: list[bool] = []
+
+    def start_optional_services(self) -> None:          # LeaderSession (S09); never called by telemetry
+        raise AssertionError("telemetry never starts optional services")
 
     def metrics_samples(self, *, leader: bool) -> list[Sample]:
         self.calls.append(leader)
@@ -304,3 +309,62 @@ def test_both_nodes_risksweep_failure_pages() -> None:
 def test_exposition_json_roundtrip_is_not_needed_but_values_are_finite() -> None:
     samples = T.role_samples(NodeRole.STANDBY)
     assert json.loads(json.dumps([s.value for s in samples]))
+
+
+def test_rest_requests_by_priority_include_bars_under_the_contract() -> None:
+    """S06 (design PR11): the new BARS class is one more `priority` label value of the same series; the labels
+    come from the priority names, so the other classes keep their label values."""
+    from src.adapters.ratelimit import RestBudget, RestPriority
+    from src.observability.metrics import MetricsRegistry
+    from src.runtime.session import adapter_metric_samples
+
+    class _Adapter:
+        token_issued_at_ms = None
+        token_expires_at_ms = None
+
+        def __init__(self, budget: RestBudget) -> None:
+            self.rest_budget = budget
+
+    budget = RestBudget("stonex", rate_per_s=5, burst=10, monotonic=lambda: 0.0)
+    budget.spend(RestPriority.BARS)
+    samples = adapter_metric_samples("stonex", _Adapter(budget), 0)  # type: ignore[arg-type]
+    labels = sorted(s.labels["priority"] for s in samples if s.name == "xtnl_rest_requests_total")
+    assert labels == ["bars", "cash_flows", "dlq", "poll", "reconcile"]
+    reg = MetricsRegistry("n1")
+    reg.register("term", lambda: samples)
+    text = reg.render()
+    assert reg.dropped == 0
+    assert 'xtnl_rest_requests_total{node="n1",adapter="stonex",priority="bars"} 1' in text
+    assert 'xtnl_rest_requests_total{node="n1",adapter="stonex",priority="dlq"} 0' in text
+    for line in text.splitlines():
+        if not line.startswith("#"):
+            assert line.split("{", 1)[0] in CONTRACT
+
+
+def test_optional_service_series_render_under_the_contract() -> None:
+    """S32: the market-data and ARM series (`src/runtime/optional_plan.py`) are contract rows with their labels:
+    they render with nothing dropped, and a series with a stray label (a value smuggled in a label) is dropped."""
+    from src.observability.metrics import MetricsRegistry
+
+    samples = [
+        Sample("xtnl_md_series", 3, {"state": "LIVE"}),
+        Sample("xtnl_md_indicators", 1, {"state": "ready"}),
+        Sample("xtnl_md_aof_wait_timeouts_total", 0),
+        Sample("xtnl_md_events_total", 7, {"component": "writer", "event": "flushes"}),
+        Sample("xtnl_arm_failed_scopes", 0),
+        Sample("xtnl_arm_failed_global", 0),
+        Sample("xtnl_arm_oldest_undelivered_notice_age_seconds", 1.5),
+        Sample("xtnl_arm_events_total", 2, {"component": "failed", "event": "entered"}),
+    ]
+    reg = MetricsRegistry("n1")
+    reg.register("term", lambda: samples)
+    text = reg.render()
+    assert reg.dropped == 0
+    for line in text.splitlines():
+        if not line.startswith("#"):
+            assert line.split("{", 1)[0] in CONTRACT
+    assert 'xtnl_md_series{node="n1",state="LIVE"} 3' in text
+    bad = MetricsRegistry("n1")
+    bad.register("term", lambda: [Sample("xtnl_arm_failed_scopes", 1, {"symbol": "X"})])
+    bad.render()
+    assert bad.dropped == 1

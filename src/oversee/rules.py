@@ -17,17 +17,20 @@ from src.oversee.dayroll import latest_roll_ms, trading_day_for_roll
 from src.oversee.risk import (
     HUNDRED,
     ZERO,
+    STOP_KIND_INCONSISTENT,
     EquityMark,
+    Mark,
     MarkBook,
     MarkQuality,
     RiskUnknown,
-    effective_stop,
+    effective_stop_detail,
     equity_mark,
     needs_stop,
     net_transfers_today,
     opening_units,
     pct_of,
     risk,
+    select_mark,
 )
 from src.oversee.snapshot import AccountSnapshot
 from src.oversee.types import Cap, Level, Result, RuleOutcome, StateKey, Subject, SubjectType, SymbolKey, Unknown
@@ -60,6 +63,7 @@ class EvalContext:
         try:
             if self.snap.account is None:
                 raise RiskUnknown("risk_unknown", "no account row")
+            # K11 (§5): the unexplained increase is excluded on a pnl_unverified day too (fail closed).
             return equity_mark(self.snap.account.balance, self.snap.account.currency, self.snap.positions,
                                self.book, self.snap.cash_flows, self.snap.sod)
         except RiskUnknown as exc:
@@ -124,6 +128,20 @@ def band_result(value_pct: Decimal, cfg: BandRuleConfig, margin: Decimal, reason
     level = band_level(value_pct, cfg.flag_above_pct, cfg.halt_above_pct, Level.SOFT_HALT)
     release = band_level(value_pct, cfg.flag_above_pct * k, cfg.halt_above_pct * k, Level.SOFT_HALT)
     return Result(level, reason, Cap.SOFT if stale else Cap.NONE, value_pct, release, stale)
+
+
+def stop_mark(ctx: EvalContext, e: OrderDTO | PositionDTO) -> Mark | None:
+    """The pass's MarkBook mark for e's symbol (liquidation side of e), for the PR1 triggerable-side test;
+    None when no mid was ever seen. Read without recording a stale symbol: the stop test only judges the
+    side and never changes which symbols the other rules and the gate see as stale. A CLEAN mark is the
+    mid (the bid / ask only once LIQUIDATION), so the side is judged at the mid while a clean quote is fresh:
+    a stop between the bid / ask and the mid reads consistent a little late (the safe direction)."""
+    book = ctx.book
+    try:
+        return select_mark((e.adapter_id, e.symbol), book.quotes.get((e.adapter_id, e.symbol)), book.now_ms,
+                           book.stale_mark_ms, e.side)
+    except RiskUnknown:
+        return None
 
 
 def _live_entities(ctx: EvalContext) -> list[OrderDTO | PositionDTO]:
@@ -208,7 +226,8 @@ class MaxAggregateOpenRiskRule:
 
 @dataclass
 class MissingStopLossRule:
-    """SOFT_HALT once now - stop_watch.effective_stop_missing_since_ms >= grace_ms (§6)."""
+    """SOFT_HALT once now - stop_watch.effective_stop_missing_since_ms >= grace_ms (§6). A stop whose
+    `effective_stop_detail()` carries `stop_kind_inconsistent` is UNKNOWN (design PR1)."""
 
     cfg: MissingStopConfig
     rule_id: str = "missing_stop_loss"
@@ -227,7 +246,14 @@ class MissingStopLossRule:
         snap = ctx.snap
         if not needs_stop(e, snap.positions, snap.orders):
             return Result(Level.PASS, "no_stop_needed")
-        if effective_stop(e, snap.positions, snap.orders) is not None:
+        detail = effective_stop_detail(e, snap.positions, snap.orders, stop_mark(ctx, e))
+        if detail is not None:
+            if STOP_KIND_INCONSISTENT in detail.caveats:
+                # A STOP child on its non-triggerable side of the mark: touched and awaiting its fill, or a
+                # mislabelled take-profit. UNKNOWN goes through the durable unknown_since / unknown_grace_ms
+                # (30 s), then a capped SOFT state (§2); no new timer, no new column (design PR1, R11-M07).
+                # Only the children that raised the caveat, never a correctly placed one; ids, no prices.
+                return Unknown(STOP_KIND_INCONSISTENT, f"stop child {','.join(detail.inconsistent_ids)}")
             return Result(Level.PASS, "stop_present")
         since = snap.stop_watch.get((subject.subject_type, subject.subject_id))
         if since is not None and ctx.now_ms - since >= self.cfg.grace_ms:
@@ -238,8 +264,10 @@ class MissingStopLossRule:
 @dataclass
 class MaxDailyLossRule:
     """(equity_mark - sod_equity - net_transfers_today) / sod_equity < -limit -> HARD_HALT; subject
-    (account, trading_day); capped at SOFT on partial_session, stale inputs, the balance / position
-    skew window or a pending cash-flow request (§2, §6)."""
+    (account, trading_day); capped at SOFT only for the reasons the rules list: a partial_session start of day,
+    stale inputs and the balance / position skew window (§2, §6; the integrity-incident / fence cap is applied to
+    every rule by the registry). A pending cash-flow request is no cap (K12): it would let a hung request hold a
+    real daily loss below HARD."""
 
     cfg: DailyLossConfig
     release_margin: Decimal
@@ -263,8 +291,6 @@ class MaxDailyLossRule:
         if (change is not None and (bal is None or change > bal)
                 and ctx.now_ms - change < self.balance_skew_ms(snap.adapter_id)):
             out.append("balance_skew")
-        if snap.cash_flow_request_pending:
-            out.append("cash_flow_request_pending")
         return out
 
     def evaluate(self, ctx: EvalContext, subject: Subject) -> RuleOutcome:
@@ -458,4 +484,4 @@ def stale_symbols(evals: dict[StateKey, Evaluation], ctx: EvalContext) -> frozen
 __all__ = ["EvalContext", "Rule", "RuleRegistry", "Evaluation", "MaxPositionRiskRule",
            "MaxAggregateOpenRiskRule", "MissingStopLossRule", "MaxDailyLossRule", "MarginUsageRule",
            "StaleAccountImageRule", "StaleMarkRule", "band_level", "band_result", "run_rule", "stale_symbols",
-           "INPUT_FLAG_RULES", "STALE_ACCOUNT_IMAGE", "STALE_MARK"]
+           "stop_mark", "INPUT_FLAG_RULES", "STALE_ACCOUNT_IMAGE", "STALE_MARK"]

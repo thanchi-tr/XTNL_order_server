@@ -11,6 +11,10 @@
 # lock_timeout 2 s (a lost lock wait or deadlock is rolled back and retried 5 times with back-off, so no
 # Restart= is needed), under a session advisory lock (concurrent runs serialise), and refuses a changed
 # applied file (MigrationDrift). It prints only the redacted DSN.
+#
+# Accepted level (plan S38f): only migrations up to XTNL_MIGRATIONS_ACCEPTED_UPTO (default 14; set it in
+# /etc/xtnl/engine.env or /etc/xtnl/migrate.env, both read below) are applied. Later ones are held back, named in
+# one journal line, and the job still exits 0. Raise the setting only after the user has reviewed them.
 
 [Unit]
 Description=XTNL PostgreSQL schema migrations (operator job, before a switchover)

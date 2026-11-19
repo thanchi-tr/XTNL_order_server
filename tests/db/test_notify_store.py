@@ -7,7 +7,7 @@ from src.db import notify_store as N
 from src.db.epoch import EngineDb
 from src.db.oversee_errors import SweepFenced
 from src.notifications.relay import RelayOutboxStore
-from src.oversee.notify import OutboxRow, episode_key
+from src.oversee.notify import ARM_OUTBOX_KIND, OutboxRow, episode_key
 from src.oversee.types import Level
 from tests.db.conftest import EPOCH, FakeConn
 
@@ -61,8 +61,16 @@ async def test_oldest_undelivered(db: EngineDb, conn: FakeConn) -> None:
 
 
 def test_existing_statements_unchanged_for_the_dispatcher() -> None:
-    assert "sent_at_ms IS NULL" in N.SQL_OUTBOX_PENDING
-    assert "ARRAY['email', 'mobile_push']" in N.SQL_OUTBOX_INSERT
+    """S08 (PR4): the Oversee relay's pending, due and oldest-unsent reads skip ARM notices; the insert and the
+    escalated read are unchanged (the 0016 CHECK keeps `+escalated` and email / mobile_push out of ARM rows)."""
+    for sql in (N.SQL_OUTBOX_PENDING, N.SQL_OUTBOX_DUE, N.SQL_OUTBOX_OLDEST_UNSENT):
+        assert "WHERE sent_at_ms IS NULL AND kind <> 'arm'" in sql, sql
+    assert f"kind <> '{ARM_OUTBOX_KIND}'" in N.SQL_OUTBOX_PENDING
+    assert "ARRAY['email', 'mobile_push']" in N.SQL_OUTBOX_INSERT and "ELSE ARRAY['email'] END" in N.SQL_OUTBOX_INSERT
+    assert "arm" not in N.SQL_OUTBOX_INSERT and "arm" not in N.SQL_OUTBOX_ESCALATED
+    assert "WHERE $1::text = ANY(channels) AND created_at_ms >= $2::bigint" in N.SQL_OUTBOX_ESCALATED
+    for sql in (N.SQL_OUTBOX_MARK, N.SQL_OUTBOX_RESCHEDULE, N.SQL_OUTBOX_FINISH):
+        assert "arm" not in sql
 
 
 async def test_due_decodes_sm6_retry_state(db: EngineDb, conn: FakeConn) -> None:

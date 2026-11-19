@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import fakeredis
@@ -199,15 +201,26 @@ async def test_a_writable_or_superuser_role_is_refused_at_connect() -> None:
 async def test_the_pool_runs_the_role_check_on_every_new_connection(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, Any] = {}
 
+    class FakeRaw:
+        async def fetchrow(self, sql: str, *args: object) -> tuple[bool, int]:
+            seen["schema_read"] = sql             # S38f: the 0015 schema detection at pool creation
+            return (True, 6)
+
+    class FakePool:
+        @asynccontextmanager
+        async def acquire(self) -> AsyncIterator[FakeRaw]:
+            yield FakeRaw()
+
     class FakeAsyncpg:
         @staticmethod
         async def create_pool(dsn: str, **kw: Any) -> object:
             seen.update(kw)
-            return object()
+            return FakePool()
 
     real_import = S.importlib.import_module
     monkeypatch.setattr(S.importlib, "import_module",
                         lambda name: FakeAsyncpg if name == "asyncpg" else real_import(name))
     await S.create_read_only_source("postgresql://u@h/db")
     assert seen["init"] is S.verify_read_only_connection
+    assert "pg_attribute" in seen["schema_read"]
     assert seen["server_settings"]["default_transaction_read_only"] == "on"

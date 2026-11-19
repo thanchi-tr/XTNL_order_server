@@ -54,7 +54,7 @@ Timing chain that every file must respect (asserted by `tests/deploy/test_deploy
 | self-fence | 12 s without renewal | `src/runtime/lease.py` |
 | etcd lease | TTL 15 s, renew 1 s | `src/runtime/lease.py` |
 | etcd raft | heartbeat 250 ms, election 2500 ms | `etcd.conf.yml` |
-| DRAINING deadline | 10 s (systemd `TimeoutStopSec=20`) | `lease.py`, unit |
+| DRAINING deadline | 10 s (systemd `TimeoutStopSec=35`: a stop during the LEADER_INIT step-1 commit, up to ~20 s sync-standby stall, + 1 s step unwind + 10 s DRAINING, K15) | `lease.py`, `leader_init.py`, unit |
 | Patroni | ttl 15, loop_wait 5, retry_timeout 5 | `patroni.yml` |
 | `idle_in_transaction_session_timeout` | 10 s (5 s statement_timeout + 10 s <= MAX_TXN_MS 15 s) | `patroni.yml`, `src/integrity/worker.py` |
 

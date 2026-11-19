@@ -19,21 +19,39 @@ HTTP (its own listener, so the page server stays GET / HEAD only): `POST <path>`
 Content-Length (validated by the dead-man receiver's own parser): 204 accepted, 400 malformed, 401 bad token,
 409 older than the beat already held, 411 / 413 no or too large a body. Plain http only on a loopback address.
 Nothing here writes PostgreSQL or Redis; the token is never logged.
+
+Rotation without restart (operations.md §13; K10): the listener re-reads the file every `RELOAD_S` (and soon after a
+request with an unknown token) and accepts `token`, an optional `token_next`, and a replaced token for
+`token_overlap_s` (default 1800 s) after it first saw it replaced (the receiver's `TokenRing`), so the engine's
+XTNL_HEARTBEAT_COPY_TOKEN (re-read from its secret every 5 min, at once after a 401) can be rotated without a refused
+copy: put the new token in `token_next`, switch the engine's secret, then promote it to `token`. A file that becomes
+unreadable or invalid keeps the last valid tokens (logged). A renewed `tls_cert` / `tls_key` pair is loaded into the
+listener in place (`ReloadingServerTls`). A changed `token_overlap_s` applies from the next re-read (to tokens replaced
+from then on). `listen`, `path`, `max_age_ms` and the `tls_cert` / `tls_key` paths take a restart: a re-read that
+finds one of them changed logs a warning naming the key(s), once per change.
 """
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import logging
 import ssl
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
 from src.deadman_receiver.evaluate import MAX_BODY_BYTES, BeatError, parse_beat
+from src.deadman_receiver.tokens import (
+    DEFAULT_OVERLAP_S,
+    MAX_OVERLAP_S,
+    MIN_OVERLAP_S,
+    TokenError,
+    TokenRing,
+    TokenSet,
+)
+from src.observability.certs import ReloadingServerTls
 from src.observability.http import parse_addr
 
 log = logging.getLogger(__name__)
@@ -48,6 +66,7 @@ BODY_TIMEOUT_S: Final = 10.0
 REQUEST_TIMEOUT_S: Final = 20.0           # the whole request (request line, headers, body)
 MAX_HEADER_BYTES: Final = 16_384
 MAX_HEADERS: Final = 64
+RELOAD_S: Final = 30.0                    # K10: heartbeat.json (tokens) and the TLS files are re-read this often
 _LOOPBACK: Final = frozenset({"localhost", "127.0.0.1", "::1"})
 _REASONS: Final = {204: "No Content", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found",
                    405: "Method Not Allowed", 409: "Conflict", 411: "Length Required", 413: "Payload Too Large",
@@ -79,6 +98,8 @@ class HeartbeatListenSettings:
     tls_cert: str | None = None
     tls_key: str | None = None
     max_age_ms: int = DEFAULT_MAX_AGE_MS
+    token_next: str | None = field(default=None, repr=False)
+    token_overlap_s: int = DEFAULT_OVERLAP_S
 
     @property
     def tls(self) -> bool:
@@ -88,7 +109,8 @@ class HeartbeatListenSettings:
     def parse(doc: object) -> HeartbeatListenSettings:
         if not isinstance(doc, dict):
             raise HeartbeatConfigError("heartbeat file must hold a JSON object")
-        unknown = set(doc) - {"listen", "token", "path", "tls_cert", "tls_key", "max_age_ms"}
+        unknown = set(doc) - {"listen", "token", "path", "tls_cert", "tls_key", "max_age_ms", "token_next",
+                              "token_overlap_s"}
         if unknown:
             raise HeartbeatConfigError(f"unknown heartbeat key(s): {', '.join(sorted(map(str, unknown)))}")
 
@@ -122,7 +144,16 @@ class HeartbeatListenSettings:
         max_age = doc.get("max_age_ms", DEFAULT_MAX_AGE_MS)
         if not isinstance(max_age, int) or isinstance(max_age, bool) or not 15_000 <= max_age <= 600_000:
             raise HeartbeatConfigError("heartbeat key max_age_ms must be an integer from 15000 to 600000")
-        return HeartbeatListenSettings(host, port, token, path, cert, key, max_age)
+        token_next = text("token_next")
+        if token_next is not None and len(token_next) < MIN_TOKEN_CHARS:
+            raise HeartbeatConfigError(f"heartbeat key token_next must have at least {MIN_TOKEN_CHARS} characters")
+        overlap = doc.get("token_overlap_s", DEFAULT_OVERLAP_S)
+        if (not isinstance(overlap, int) or isinstance(overlap, bool)
+                or not MIN_OVERLAP_S <= overlap <= MAX_OVERLAP_S):
+            raise HeartbeatConfigError(f"heartbeat key token_overlap_s must be an integer from {MIN_OVERLAP_S} to "
+                                       f"{MAX_OVERLAP_S}")
+        return HeartbeatListenSettings(host, port, token, path, cert, key, max_age,
+                                       None if token_next == token else token_next, overlap)
 
     def check_files(self) -> None:
         """Load the listener's TLS certificate and key now (the unit's `--check-config`, IMPLEMENTATION_PLAN 8.2),
@@ -211,18 +242,104 @@ class HeartbeatBoard:
         return beat, ""
 
 
-class HeartbeatListener:
-    """The POST endpoint feeding a HeartbeatBoard."""
+#: Keys of heartbeat.json read only at start (`HeartbeatListenSettings` field names; `listen` is host + port).
+RESTART_ONLY_FIELDS: Final = ("host", "port", "path", "max_age_ms", "tls_cert", "tls_key")
+_FIELD_KEY: Final = {"host": "listen", "port": "listen"}
 
-    def __init__(self, settings: HeartbeatListenSettings, board: HeartbeatBoard) -> None:
+
+def restart_only_changes(running: HeartbeatListenSettings, fresh: HeartbeatListenSettings) -> list[str]:
+    """The heartbeat.json keys whose re-read value differs from the running one but needs a restart (sorted)."""
+    return sorted({_FIELD_KEY.get(f, f) for f in RESTART_ONLY_FIELDS if getattr(running, f) != getattr(fresh, f)})
+
+
+def _file_tokens(doc: Mapping[str, str]) -> TokenSet:
+    """The ring's parser for the re-read heartbeat file (`watch` hands it the parsed tokens)."""
+    token, nxt = doc.get("token"), doc.get("token_next") or None
+    if not token or len(token) < MIN_TOKEN_CHARS:
+        raise TokenError(f"heartbeat key token must have at least {MIN_TOKEN_CHARS} characters")
+    return TokenSet(token, None if nxt == token else nxt)
+
+
+class HeartbeatListener:
+    """The POST endpoint feeding a HeartbeatBoard. With `settings_file`, `watch()` keeps the tokens and the TLS
+    files current without a restart (K10)."""
+
+    def __init__(self, settings: HeartbeatListenSettings, board: HeartbeatBoard, *,
+                 settings_file: str | Path | None = None, clock_ms: Callable[[], int] = _wall_ms) -> None:
         self._s = settings
         self.board = board
-        self._token = settings.token.encode("utf-8")
+        self._file = None if settings_file is None else Path(settings_file)
+        self._clock = clock_ms
+        self._latest: Mapping[str, str] | Exception = self._doc(settings)
+        self._reread = asyncio.Event()
+        self.tokens = TokenRing(TokenSet(settings.token, settings.token_next), load=self._load,
+                                invalidate=self._reread.set, overlap_ms=settings.token_overlap_s * 1000,
+                                parse=_file_tokens, label="dashboard heartbeat")
+        self._tls: ReloadingServerTls | None = None
+        self._restart_pending: list[str] = []    # restart-only keys changed in the file (warned once per change)
+
+    @staticmethod
+    def _doc(s: HeartbeatListenSettings) -> dict[str, str]:
+        return {"token": s.token, **({"token_next": s.token_next} if s.token_next else {})}
+
+    def _load(self) -> Mapping[str, str]:
+        if isinstance(self._latest, Exception):
+            raise self._latest
+        return self._latest
 
     def authorized(self, header: str | None) -> bool:
-        if not header or not header.startswith("Bearer "):
-            return False
-        return hmac.compare_digest(header[len("Bearer "):].strip().encode("utf-8"), self._token)
+        """Constant-time compare against every accepted token (current, next, a replaced one in its overlap)."""
+        return self.tokens.authorized(header, self._clock())
+
+    async def reload_once(self) -> None:
+        """Re-read the settings file (in a thread) into the token ring, and re-load changed TLS files."""
+        if self._file is not None:
+            path = self._file
+            try:
+                fresh = await asyncio.to_thread(HeartbeatListenSettings.from_file, path)
+                self._latest = (HeartbeatConfigError("heartbeat file missing") if fresh is None
+                                else self._doc(fresh))
+            except HeartbeatConfigError as exc:
+                self._latest = exc
+            else:
+                if fresh is not None:
+                    self._apply_live_keys(fresh)
+        self.tokens.refresh(self._clock())
+        if self._tls is not None:
+            self._tls.reload_if_changed()
+
+    def _apply_live_keys(self, fresh: HeartbeatListenSettings) -> None:
+        """K10: `token_overlap_s` follows the file; a changed restart-only key is logged (key names only)."""
+        overlap_ms = fresh.token_overlap_s * 1000
+        if overlap_ms != self.tokens.overlap_ms:
+            log.info("dashboard heartbeat token_overlap_s now %d s", fresh.token_overlap_s)
+            self.tokens.overlap_ms = overlap_ms
+        changed = restart_only_changes(self._s, fresh)
+        if changed and changed != self._restart_pending:
+            log.warning("dashboard heartbeat key(s) %s changed in the settings file; they take effect only after a "
+                        "restart of the dashboard", ", ".join(changed))
+        self._restart_pending = changed
+
+    @property
+    def restart_pending(self) -> list[str]:
+        """The restart-only keys the last re-read found changed (empty when the file matches the running ones)."""
+        return list(self._restart_pending)
+
+    async def watch(self, stop: asyncio.Event, every_s: float = RELOAD_S) -> None:
+        """Every `every_s`, and soon after a request with an unknown token (the ring throttles that to once a
+        minute), re-read the file. Never raises (a failed read keeps the last valid tokens)."""
+        while not stop.is_set():
+            try:
+                await self.reload_once()
+            except Exception as exc:
+                log.error("dashboard heartbeat settings not re-read: %s", type(exc).__name__)
+            self._reread.clear()
+            waiters = [asyncio.ensure_future(stop.wait()), asyncio.ensure_future(self._reread.wait())]
+            try:
+                await asyncio.wait(waiters, timeout=every_s, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for w in waiters:
+                    w.cancel()
 
     def on_body(self, body: bytes) -> tuple[int, str]:
         try:
@@ -298,10 +415,13 @@ class HeartbeatListener:
         return self.on_body(body)
 
     def ssl_context(self) -> ssl.SSLContext | None:
+        """The listener's TLS context, re-loaded in place by `reload_once` when its files change (K10)."""
         if not self._s.tls:
             return None
         assert self._s.tls_cert is not None and self._s.tls_key is not None
-        return server_tls_context(self._s.tls_cert, self._s.tls_key)
+        if self._tls is None:
+            self._tls = ReloadingServerTls(self._s.tls_cert, self._s.tls_key)
+        return self._tls.context
 
     async def start(self) -> asyncio.Server:
         server = await asyncio.start_server(self.handle, self._s.host, self._s.port, ssl=self.ssl_context(),

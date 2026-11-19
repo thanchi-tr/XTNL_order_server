@@ -700,6 +700,21 @@
        "label_matcher": "^xtnl-engine$",
        "dimensions": [
         [
+         "node",
+         "cert"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_cert_readable$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
          "node"
         ]
        ],
@@ -765,6 +780,196 @@
        ],
        "metric_selectors": [
         "^xtnl_catchup_rows_total$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "state"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_md_series$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "state"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_md_indicators$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_md_aof_wait_timeouts_total$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "component",
+         "event"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_md_events_total$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_md_redis_used_memory_ratio$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_md_shed_step$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "queue"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_md_queue_depth$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "view"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_arm_positions$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_arm_paused$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_arm_failed_scopes$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_arm_failed_global$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_arm_oldest_undelivered_notice_age_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node",
+         "component",
+         "event"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_arm_events_total$"
        ]
       }
      ]

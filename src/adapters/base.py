@@ -3,6 +3,10 @@
 Only fetch_* / stream_* / ensure_ticks are defined, plus connect/close for the session.
 fetch_market_sessions() is optional (default: no broker schedule) and read-only like every fetch_*.
 fetch_history() is optional too (default: an empty BrokerHistory with complete=False, 'history not supported').
+fetch_price_bars() is optional too (default: an empty PriceBarsResponse with supported=False); every adapter that
+implements it reads through its existing read-only transport (design PR3).
+fetch_active_stop_orders() is optional too (default: an empty ActiveStopOrders with supported=False): one read-only
+list read of the stop handles per adapter (design PR9), through the same read-only transport.
 No order mutation method exists on this interface or on any implementation.
 Adapters never import src.db, src.cache, src.pubsub, src.integrity or src.oversee.
 """
@@ -18,7 +22,18 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
 
-from src.dto import AccountDTO, AccountLive, CashFlowDTO, InstrumentSpec, OrderDTO, PositionDTO, PriceDTO
+from src.dto import (
+    AccountDTO,
+    AccountLive,
+    BarSide,
+    CashFlowDTO,
+    InstrumentSpec,
+    OrderDTO,
+    PositionDTO,
+    PriceBarsResponse,
+    PriceDTO,
+    bar_request_problem,
+)
 
 if TYPE_CHECKING:
     from src.adapters.ratelimit import RestBudget
@@ -41,12 +56,18 @@ class StreamEventKind(str, Enum):
 
 @dataclass(frozen=True)
 class StreamEvent:
-    """Control frame from an adapter stream (not an entity)."""
+    """Control frame from an adapter stream (not an entity).
+
+    ``market`` (design PR6) names the one market (canonical symbol) a per-market subscription event is about, e.g. a
+    StoneX PRICES subscription's SUBSCRIBED / ERROR; a market without a known instrument is named by the broker's own
+    market id (as in ``dropped_price_frames``), never None. None means the event covers the whole stream (socket
+    loss, a batch subscribe, a GAP)."""
 
     kind: StreamEventKind
     stream: StreamName
     detail: str = ""
     at_ms: int = 0
+    market: str | None = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +183,30 @@ class BrokerHistory:
         retryable: an adapter without the facility answers the same every time."""
         return cls(adapter_id=adapter_id, since_ms=since_ms, until_ms=until_ms, covered_from_ms=until_ms,
                    orders=(), positions=(), complete=False, notes=(note,), retryable=False)
+
+
+STOP_ORDERS_NOT_SUPPORTED = "stop-order list read not supported"
+
+
+@dataclass(frozen=True)
+class ActiveStopOrders:
+    """One read-only list read of an adapter's stop handles (``fetch_active_stop_orders``, design PR9, R11-M20).
+
+    ``orders``: the broker's active stop / limit orders (StoneX ``order/activestoplimitorders`` per trading account:
+    entries and if-done children, CHILD_ORDER handles). ``positions``: open positions whose own stop field is the
+    handle (cTrader, POSITION_FIELD handles). Each row carries its broker version like any REST row; the orchestrator
+    versions and publishes them (``reread_stop_orders``). The list is not the whole book: an entity absent from it is
+    never closed. ``supported`` False: the adapter has no such read (an empty answer that proves nothing)."""
+
+    adapter_id: str
+    orders: tuple[OrderDTO, ...] = ()
+    positions: tuple[PositionDTO, ...] = ()
+    supported: bool = True
+    note: str = ""
+
+    @classmethod
+    def unsupported(cls, adapter_id: str, note: str = STOP_ORDERS_NOT_SUPPORTED) -> ActiveStopOrders:
+        return cls(adapter_id=adapter_id, supported=False, note=note)
 
 
 class HistoryNotes(list[str]):
@@ -327,6 +372,11 @@ class SessionExpiredError(BrokerError):
     """The session token is no longer valid (HTTP 401): re-authenticate."""
 
 
+class PriceBarsDecodeError(BrokerError):
+    """A ``fetch_price_bars`` answer could not be decoded (a bar without a time or a price, a body of the wrong
+    shape). A retry of that read, never a statement about the market; the message names fields, never values."""
+
+
 OrderStreamItem = OrderDTO | PositionDTO | StreamEvent
 AccountStreamItem = AccountDTO | AccountLive | CashFlowDTO | StreamEvent
 PriceStreamItem = PriceDTO | StreamEvent
@@ -416,6 +466,34 @@ class BrokerAdapter(abc.ABC):
         included (the start-up / wake-up catch-up after the engine was off). Cash flows of the window keep
         using ``fetch_cash_flows(since_ms)``. Default: no history facility, an empty incomplete answer."""
         return BrokerHistory.unsupported(self.adapter_id, since_ms, until_ms)
+
+    @property
+    def price_bars_supported(self) -> bool:
+        """Whether ``fetch_price_bars`` is implemented (default: no). Pepperstone is not bar-capable in v1; StoneX
+        is since S39 (after the PR3 probe)."""
+        return False
+
+    async def fetch_price_bars(self, symbol: str, side: BarSide, timeframe_s: int, *, count: int | None = None,
+                               from_ms: int | None = None, to_ms: int | None = None) -> PriceBarsResponse:
+        """Read-only: the broker's own price bars of one series (design PR3), oldest first, in the count form
+        (the ``count`` newest **complete** bars, plus the forming one when the broker returns it: it never counts
+        towards ``count``) or the range form (buckets starting in ``[from_ms, to_ms]``, R11-M15). ``truncated``: the
+        broker capped the answer (or, count form, returned fewer complete bars than asked). A request with neither or both forms raises ``ValueError``
+        (``bar_request_problem``). Errors raise ``BrokerError`` subclasses (``PriceBarsDecodeError`` for an answer
+        that cannot be decoded); the market-data port turns them into values (PR12). Never persisted.
+        Default: no bar facility, an empty answer with ``supported=False``."""
+        problem = bar_request_problem(side, timeframe_s, count, from_ms, to_ms)
+        if problem is not None:
+            raise ValueError(f"fetch_price_bars: {problem}")
+        return PriceBarsResponse.unsupported(self.adapter_id, symbol, side, timeframe_s, count=count,
+                                             from_ms=from_ms, to_ms=to_ms)
+
+    async def fetch_active_stop_orders(self) -> ActiveStopOrders:
+        """Read-only: one list read of the adapter's stop handles (design PR9): every active stop / limit order
+        (StoneX, one ``activestoplimitorders`` GET per trading account) or the open positions' own stop fields
+        (cTrader). Never one call per handle. Errors raise ``BrokerError`` subclasses. Default: no such read, an
+        empty answer with ``supported=False``."""
+        return ActiveStopOrders.unsupported(self.adapter_id)
 
     # --- streams -----------------------------------------------------------------------------
     @abc.abstractmethod

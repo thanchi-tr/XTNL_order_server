@@ -1,0 +1,47 @@
+// One bar: timeline and evaluation pipeline, design v11.3. Render: dot -Gdpi=130 -Tpng arm_bar_pipeline.dot -o arm_bar_pipeline.png
+digraph BAR {
+  graph [rankdir=TB, fontname="Segoe UI", fontsize=20, labelloc=t, pad=0.4, nodesep=0.35, ranksep=0.4, compound=true,
+         label="One 15-minute bar: when the ARM evaluates, and in what order\nKind (a): if (close - entry) > (entry - SL), advise moving SL to break-even", bgcolor="white"];
+  node [fontname="Segoe UI", fontsize=11, shape=box, style="rounded,filled", fillcolor="#ffffff", color="#5b6b7f", penwidth=1.2];
+  edge [fontname="Segoe UI", fontsize=10, color="#5b6b7f", arrowsize=0.7];
+
+  subgraph cluster_time {
+    label="Timeline of bar T (UTC grid, broker time)"; style="rounded,filled"; fillcolor="#f7f9fb"; color="#9fb3c8"; fontsize=12;
+    t0   [label="bar opens\nT - 15 min"];
+    pre  [label="Anchor 1: PRE  at T - 40 s (local, 30-45 s; valid 10 s)\nprovisional heads-up on the live quote\nstop read from T - 55 s (max 30 s old)\nno first-bar test; bar 0 labelled conditional\nnever changes state; never actionable", fillcolor="#ffe9b8"];
+    tend [label="bar ends at T", fillcolor="#eef3f8"];
+    fin  [label="StoneX final bar (waits even if late)\nzero-trust checks: OHLC, slot, side,\nhash; 3 tick-bar mismatches block\ncap: end of next bar (decision_cap)"];
+    post [label="Anchor 2: POST on the bar-end price (the one that counts)\nuses the stop as it was at bar end (S_at_T)\npast decision_cap -> UNRESOLVED; budget exceeded -> FAILED + ping", fillcolor="#ffd9a0"];
+    t0 -> pre -> tend -> fin -> post;
+  }
+
+  subgraph cluster_pipe {
+    label="Evaluation pipeline (engine-owned envelope; first match wins)"; style="rounded,filled"; fillcolor="#fff8e6"; color="#e0b450"; fontsize=12;
+    subgraph cluster_preg {
+      label="Pre-guards (engine)"; style="rounded,dashed"; color="#9fb3c8"; fontsize=11;
+      g1 [label="1. Account image fresh?  2. Stop read fresh (PRE 30 s, POST 15 s)?  3. Stop exists?\n4. Scope not FAILED?  5. Increment known, final close valid?"];
+    }
+    subgraph cluster_strat {
+      label="Declared guards, then strategy (pure, pinned versions)"; style="rounded,dashed"; color="#9fb3c8"; fontsize=11;
+      s6 [label="6. Guard FirstBarGuard (bar 0, POST only)\nreturns PASS | HOLD | PENDING(until) | UNKNOWN\nexact Decimal: (high - low) > 1.318 x ATR14_exact\n(BROKER bar 0 + unquantised canonical ATR)\n->  HOLD this bar, resume next bar\nPENDING past bar 0's POST deadline  ->  unknown_policy (Q3)"];
+      s7 [label="7. favour = sigma(close - entry)     risk = sigma(entry - SL)\nfavour > risk  ->  propose SL = entry"];
+      s6 -> s7;
+    }
+    subgraph cluster_postg {
+      label="Post-guards (engine, always current)"; style="rounded,dashed"; color="#9fb3c8"; fontsize=11;
+      p8 [label="8. Never loosen a stop     9. Round toward profit\n10. Market closed now?  ->  REOPEN notice, retried every 5 s from the open\n(wide opening spread is retried, not final)\n11. Exit quote live?     12. Not through the level"];
+    }
+    adj  [label="ADJUST\n(proposed stop + R values,\nstop orders to move, stop read time)", fillcolor="#d9f0dc", color="#5fa36f"];
+    hold [label="HOLD / INFO / FAULT\n(no move; reason in the notice)", fillcolor="#eeeeee"];
+    g1 -> s6 [lhead=cluster_strat]; s7 -> p8; p8 -> adj;
+    g1 -> hold [style=dotted, color="#999999"]; s7 -> hold [style=dotted, color="#999999"]; p8 -> hold [style=dotted, color="#999999"];
+  }
+
+  commit [label="commit_state (POST only): records whether the bar triggered\nRELEASE only here: trigger met AND every stop >= break-even\nPRE proposed a move, bar end did not confirm -> PRE_NOT_CONFIRMED\nack = (series, bar end, HMAC) stored with the decision"];
+  out [label="One fenced transaction per event (PostgreSQL):\noutcome, quantised R values, input references,\ninputs_digest (no prices) + exactly-once notice\n-> arm-relay -> you", fillcolor="#e6f4ea", color="#5fa36f"];
+  corr [label="Same id, different hash (genuine revision)\n-> new decision (supersedes old); older bar: INFO only\nlatest decided bar: ADJUST re-proposed, post-guards re-run\nmissing data never counts as changed", style="rounded,dashed"];
+
+  post -> g1 [lhead=cluster_pipe, label="each armed position"];
+  pre -> g1 [lhead=cluster_pipe, style=dashed, label="provisional"];
+  adj -> commit; hold -> commit; commit -> out; out -> corr [style=dashed];
+}

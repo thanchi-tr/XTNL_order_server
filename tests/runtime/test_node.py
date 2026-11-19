@@ -25,6 +25,12 @@ class Session:
     rec: InitRecorder
     drained: list[str] = field(default_factory=list)
     links: dict[str, BrokerLink] = field(default_factory=dict)
+    optional_started: int = 0
+    optional_error: Exception | None = None
+    closed: int = 0
+
+    async def aclose(self) -> None:
+        self.closed += 1
 
     def init_deps(self, supervisor: TaskSupervisor) -> LeaderInitDeps:
         return self.rec.deps()
@@ -34,6 +40,11 @@ class Session:
 
     async def drain(self, reason: EndReason) -> None:
         self.drained.append(reason)
+
+    def start_optional_services(self) -> None:
+        self.optional_started += 1
+        if self.optional_error is not None:
+            raise self.optional_error
 
 
 @dataclass
@@ -349,3 +360,133 @@ async def test_standby_spill_drain_runs_only_outside_a_term_and_resumes_after_dr
     c.request_drain("abdicate", exit_after=False)
     await c.step()
     assert c.role is R.STANDBY and spy.events[-1] == "start:STANDBY" and spy.running
+
+
+# --- K1 / K2 (IMPLEMENTATION_PLAN known issues, fixed 2026-11-18) -------------------------------------------------
+def _sigterm_during_epoch_bump(w: World, holder: list[NodeController], *, exit_after: bool = True) -> None:
+    """Deliver request_drain while LEADER_INIT step 1 runs (the role is LEADER_INIT then)."""
+    real = w.init.bump_and_fence
+
+    async def bump(epoch: Epoch, node_id: str, now_ms: int):  # type: ignore[no-untyped-def]
+        assert holder[0].role is R.LEADER_INIT
+        holder[0].request_drain("switchover", exit_after=exit_after)
+        return await real(epoch, node_id, now_ms)
+
+    w.init.bump_and_fence = bump  # type: ignore[method-assign]
+
+
+async def test_k1_sigterm_during_leader_init_that_ends_in_safe_hold_stops_the_node() -> None:
+    """K1: before, request_drain stored the request while LEADER_INIT, but only LEADER consumed it; LEADER_INIT
+    ending in SAFE_HOLD left it unread and the run loop went on until systemd's stop timeout SIGKILLed it."""
+    w = World(init=InitRecorder(safe_hold=True))
+    c = w.controller()
+    _sigterm_during_epoch_bump(w, [c])
+    task = asyncio.create_task(c.run())
+    await asyncio.wait_for(task, 2)
+    assert c.role is R.SAFE_HOLD and c._drain_request is None
+    assert LEADER_KEY not in w.etcd.kv and w.exits.reasons == []
+    assert w.sessions[0].drained == []                # nothing to drain: the term never reached LEADER
+
+
+async def test_k1_switchover_without_exit_during_leader_init_safe_hold_is_dropped_not_kept() -> None:
+    w = World(init=InitRecorder(safe_hold=True))
+    c = w.controller()
+    _sigterm_during_epoch_bump(w, [c], exit_after=False)
+    await c.startup()
+    await c.step()
+    assert c.role is R.SAFE_HOLD and c._drain_request is None
+    await c.step()                                    # the fake cluster has no SAFE_HOLD row: back to STANDBY
+    assert not c._stop.is_set() and R.DRAINING not in roles(c)
+
+
+async def test_k1_sigterm_during_leader_init_that_would_reach_leader_drains_at_once() -> None:
+    """K1, as changed by K15 (2026-11-19): the request no longer waits for LEADER; the started term (step 1 committed)
+    is ended through DRAINING right after the epoch bump, without running the remaining LEADER_INIT steps."""
+    w = World()
+    c = w.controller()
+    _sigterm_during_epoch_bump(w, [c])
+    await c.startup()
+    await c.step()
+    assert R.LEADER not in roles(c) and c._drain_request is None
+    assert roles(c)[-2:] == [R.DRAINING, R.STANDBY] and w.sessions[0].drained == ["switchover"]
+    assert w.init.log == ["epoch_bump"] and c._stop.is_set()
+
+
+async def test_k2_safe_hold_at_leader_init_closes_the_session_before_the_lease_goes() -> None:
+    """K2: the aborted term's EngineSession is closed with aclose (HTTP client, term pool), not left to GC."""
+    w = World(init=InitRecorder(safe_hold=True))
+    c = w.controller()
+    order: list[str] = []
+    real = w.etcd.lease_revoke
+
+    def revoke(lease_id: int, *, timeout_s: float) -> None:
+        order.append(f"revoke:closed={w.sessions[0].closed}")
+        real(lease_id, timeout_s=timeout_s)
+
+    w.etcd.lease_revoke = revoke  # type: ignore[method-assign]
+    await c.startup()
+    await c.step()
+    assert c.role is R.SAFE_HOLD and w.sessions[0].closed == 1 and c.session is None
+    assert order == ["revoke:closed=1"]
+
+
+async def test_k2_a_failing_session_close_still_releases_the_lease() -> None:
+    w = World(init=InitRecorder(safe_hold=True))
+
+    async def boom() -> None:
+        raise RuntimeError("pool close failed")
+
+    def factory(epoch: Epoch) -> Session:
+        s = World.factory(w, epoch)
+        s.aclose = boom  # type: ignore[method-assign]
+        return s
+
+    w.factory = factory  # type: ignore[method-assign]
+    c = w.controller()
+    await c.startup()
+    await c.step()
+    assert c.role is R.SAFE_HOLD and LEADER_KEY not in w.etcd.kv and w.exits.reasons == []
+
+
+# --- K1 / K2 review follow-ups (2026-11-18) -------------------------------------------------------------------------
+async def test_k1_sigterm_while_candidate_releases_the_won_lease_without_leader_init() -> None:
+    """A stop taken while CANDIDATE: the lease won by that campaign is released at once; no LEADER_INIT runs (no
+    epoch bump, no leader_terms row), so systemd's stop timeout never SIGKILLs a slow LEADER_INIT."""
+    w = World()
+    c = w.controller()
+    real = c.keeper.campaign
+
+    def campaign(node_id: str) -> Epoch | None:
+        epoch = real(node_id)
+        assert c.role is R.CANDIDATE
+        c.request_drain("switchover", exit_after=True)          # SIGTERM during the campaign: a non-leader stop
+        return epoch
+
+    c.keeper.campaign = campaign  # type: ignore[method-assign]
+    await asyncio.wait_for(c.run(), 2)
+    assert roles(c) == [R.STANDBY, R.CANDIDATE, R.STANDBY]
+    assert w.sessions == [] and w.init.log == []
+    assert LEADER_KEY not in w.etcd.kv and not c.keeper.holds_lease() and c.keeper.deadline() is None
+    assert w.exits.reasons == []
+
+
+async def test_k2_the_abort_close_prefers_the_sessions_own_budgeted_close() -> None:
+    """K2 follow-up: SAFE_HOLD at LEADER_INIT closes the term with `aclose_for_abort` (the term's drain_aclose_s
+    budget) when the session has one, not with aclose's default timeout."""
+    w = World(init=InitRecorder(safe_hold=True))
+    calls: list[str] = []
+
+    def factory(epoch: Epoch) -> Session:
+        s = World.factory(w, epoch)
+
+        async def abort_close() -> None:
+            calls.append("aclose_for_abort")
+
+        s.aclose_for_abort = abort_close  # type: ignore[attr-defined]
+        return s
+
+    w.factory = factory  # type: ignore[method-assign]
+    c = w.controller()
+    await c.startup()
+    await c.step()
+    assert c.role is R.SAFE_HOLD and calls == ["aclose_for_abort"] and w.sessions[0].closed == 0

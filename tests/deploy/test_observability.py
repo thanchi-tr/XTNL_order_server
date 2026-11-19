@@ -140,13 +140,19 @@ def test_inhibition_is_wired_in_both_backends() -> None:
     assert re.search(r"matchers: \['severity=\"warning\"'\]\n\s+receiver: sns-warning", dep_route), dep_route
     assert {a.severity for a in G.ALERTS if a.depends_on_epoch} <= {"critical", "warning"}
     res: dict[str, Any] = json.loads((OBS / "cloudwatch" / "xtnl-alarms.json").read_text(encoding="utf-8"))["Resources"]
-    composites = [r["Properties"] for r in res.values() if r["Type"] == "AWS::CloudWatch::CompositeAlarm"]
+    all_composites = [r["Properties"] for r in res.values() if r["Type"] == "AWS::CloudWatch::CompositeAlarm"]
+    composites = [c for c in all_composites if c["ActionsSuppressor"] == "xtnl-epoch-change-settling"]
     dep_alarms = {c.name for a in G.ALERTS if a.depends_on_epoch for c in a.cloudwatch()}
     assert {c["AlarmRule"] for c in composites} == {f'ALARM("{n}")' for n in dep_alarms}
-    assert all(c["ActionsSuppressor"] == "xtnl-epoch-change-settling" for c in composites)
-    for r in res.values():   # a dependent base alarm and the settling alarm never notify directly
+    # K5: the per-node certificate alarms notify through a composite suppressed by that node's engine-down alarm
+    suppressed = {c.name: c.suppressed_by for a in G.ALERTS for c in a.cloudwatch() if c.suppressed_by is not None}
+    others = [c for c in all_composites if c["ActionsSuppressor"] != "xtnl-epoch-change-settling"]
+    assert {(c["AlarmRule"], c["ActionsSuppressor"]) for c in others} == {
+        (f'ALARM("{n}")', s) for n, s in suppressed.items()}
+    assert all(s.startswith("xtnl-engine-down-") for s in suppressed.values())
+    for r in res.values():   # a dependent / suppressed base alarm and the settling alarm never notify directly
         p = r["Properties"]
-        if r["Type"] == "AWS::CloudWatch::Alarm" and (p["AlarmName"] in dep_alarms
+        if r["Type"] == "AWS::CloudWatch::Alarm" and (p["AlarmName"] in dep_alarms or p["AlarmName"] in suppressed
                                                        or p["AlarmName"] == "xtnl-epoch-change-settling"):
             assert "AlarmActions" not in p
         elif r["Type"] == "AWS::CloudWatch::Alarm":

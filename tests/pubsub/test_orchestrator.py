@@ -3,18 +3,21 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from dataclasses import replace as dc_replace
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from src.adapters.base import AuthFailedError, StreamEventKind, VersionDecl
-from src.dto import InstrumentSpec, OrderDTO, OrderStatus, PositionDTO
+from src.adapters.mock import MockBrokerAdapter
+from src.adapters.ratelimit import RestPriority, mark_rest_sent
+from src.dto import AccountDTO, InstrumentSpec, OrderDTO, OrderStatus, PositionDTO, version_str
 from src.pubsub import connection as connmod
 from src.pubsub.bus import EventBus
 from src.pubsub.connection import ConnState
 from src.pubsub.hlc import LOGICAL_BITS, HybridLogicalClock
-from src.pubsub.orchestrator import IngestionOrchestrator
+from src.pubsub.orchestrator import IngestionOrchestrator, RereadStatus
 from src.pubsub.spooler import DlqSpooler
 from tests.pubsub.conftest import (
     FakeAdapter,
@@ -433,9 +436,9 @@ async def test_reread_entity_for_dlq_worker(tmp_path: Path, clock: ManualClock) 
     env = make(tmp_path, clock)
     env.adapter.orders_by_id["O9"] = order("O9", t=clock.ms)
     env.adapter.accounts = [account("500")]
-    assert await env.orch.reread_entity("mock", "ORDER", "O9") is not None
-    assert await env.orch.reread_entity("mock", "ACCOUNT", "A1") is not None
-    assert await env.orch.reread_entity("mock", "POSITION", "missing") is None
+    assert (await env.orch.reread_entity("mock", "ORDER", "O9")).found
+    assert (await env.orch.reread_entity("mock", "ACCOUNT", "A1")).found
+    assert not (await env.orch.reread_entity("mock", "POSITION", "missing")).found
     assert env.orders()[0].source == "REST"
     assert len(env.account_items()) == 1
 
@@ -706,3 +709,186 @@ async def test_reconcile_without_parked_rows_still_clears_every_gap(tmp_path: Pa
     env.orders(), env.positions(), env.account_items()
     assert sorted(await env.health_ops()) == [("reconciled", "account"), ("reconciled", "orders"),
                                               ("reconciled", "prices")]
+
+
+# ===================================================================== ARM prerequisites (plan S04: PR1, PR8, PR9)
+def _kind(o: OrderDTO, kind: str | None) -> OrderDTO:
+    return dc_replace(o, order_kind=kind)
+
+
+async def test_stream_then_rest_keeps_the_stop_kind(tmp_path: Path, clock: ManualClock) -> None:
+    """One StoneX child: the stream says STOP, the REST resync row states no type -> still STOP, same content."""
+    env = make(tmp_path, clock)
+    env.item("orders", _kind(order("C1", t=clock.ms - 100, stop="1.0"), "STOP"))
+    [s] = env.orders()
+    env.adapter.open_orders = [order("C1", t=clock.ms - 100, stop="1.0")]
+    await env.orch.run_snapshot("mock")
+    [r] = env.orders()
+    assert s.order_kind == r.order_kind == "STOP" and r.checksum == s.checksum      # a no-op advance, no flip
+    assert (s.origin, r.origin) == ("stream", "snapshot")
+
+
+async def test_rest_then_stream_keeps_the_stop_kind(tmp_path: Path, clock: ManualClock) -> None:
+    env = make(tmp_path, clock)
+    env.adapter.open_orders = [_kind(order("C1", t=clock.ms - 100), "STOP")]
+    await env.orch.run_snapshot("mock")
+    env.orders()
+    env.item("orders", order("C1", OrderStatus.FILLED, t=clock.ms, remaining="0"))  # a fill row without a type
+    [f] = env.orders()
+    assert f.order_kind == "STOP" and f.status is OrderStatus.FILLED
+    assert f.checksum == _kind(order("C1", OrderStatus.FILLED, t=clock.ms, remaining="0"), "STOP").checksum
+
+
+async def test_two_known_kinds_page_once_and_count_as_unknown(tmp_path: Path, clock: ManualClock) -> None:
+    pages: list[tuple[str, str, str]] = []
+    env = make(tmp_path, clock, pager=lambda s, t, b: pages.append((s, t, b)))
+    env.item("orders", _kind(order("C1", t=clock.ms - 300), "STOP"))
+    env.item("orders", _kind(order("C1", t=clock.ms - 200), "LIMIT"))
+    env.item("orders", _kind(order("C1", t=clock.ms - 100), "STOP"))
+    env.item("orders", order("C1", t=clock.ms))
+    kinds = [o.order_kind for o in env.orders()]
+    assert kinds == ["STOP", None, None, None]
+    conflict = [p for p in pages if "order_kind_conflict" in p[1]]
+    assert len(conflict) == 1 and "C1" in conflict[0][2]
+    assert env.orch.runtime("mock").order_kind == {"mock:C1": None}
+
+
+async def test_origin_labels_every_path(tmp_path: Path, clock: ManualClock) -> None:
+    class Stored:
+        async def open_entities(self, adapter_id: str) -> tuple[Sequence[OrderDTO], Sequence[PositionDTO]]:
+            return [order("ABSENT", t=1)], []
+
+    env = make(tmp_path, clock, local_state=Stored())
+    env.item("orders", order("S1", t=clock.ms - 10))
+    assert [o.origin for o in env.orders()] == ["stream"]
+    env.adapter.open_orders = [order("O1", t=clock.ms)]
+    env.adapter.positions = [position("P1", t=clock.ms)]
+    env.adapter.accounts = [account()]
+    env.adapter.orders_by_id["ABSENT"] = order("ABSENT", t=2)                     # the first pass re-reads by id
+    rep = await env.orch.run_snapshot("mock")
+    assert "ABSENT" in rep.reread_orders                                          # (S1 too: none by id)
+    assert {o.broker_order_id: o.origin for o in env.orders()} == {"O1": "snapshot", "ABSENT": "snapshot"}
+    assert [p.origin for p in env.positions()] == ["snapshot"]
+    assert [a.origin for a in env.account_items() if isinstance(a, AccountDTO)] == ["snapshot"]
+    assert await env.orch.poll_account("mock")
+    assert [a.origin for a in env.account_items() if isinstance(a, AccountDTO)] == ["snapshot"]
+    env.adapter.orders_by_id["D1"] = order("D1", t=clock.ms)
+    dlq = await env.orch.reread_entity("mock", "ORDER", "D1")
+    assert dlq.dto is not None and dlq.dto.origin == "dlq"                         # the default origin
+    env.adapter.accounts = [account("10001")]
+    res = await env.orch.reread_entity("mock", "ACCOUNT", "A1", origin="snapshot")
+    assert res.dto is not None and res.dto.origin == "snapshot"
+
+
+async def test_catchup_history_rows_are_history_and_rechecks_snapshot(tmp_path: Path, clock: ManualClock) -> None:
+    mock = MockBrokerAdapter(orders=[order("R1", t=clock.ms - 50)])
+    mock.list_in_history(order("H1", OrderStatus.CANCELLED, t=clock.ms - 1_000))
+    env = make(tmp_path, clock, adapter=mock)  # type: ignore[arg-type]
+    fetch = await env.orch.catchup_fetch("mock", clock.ms - 10_000, clock.ms)
+    res = await env.orch.catchup_submit(fetch, recheck_orders=["R1"])
+    assert res.orders_published == 1 and [o.broker_order_id for o in res.rechecked_orders] == ["R1"]
+    assert {o.broker_order_id: o.origin for o in env.orders()} == {"H1": "history", "R1": "snapshot"}
+
+
+async def test_broker_time_source_and_event_log_broker_time(tmp_path: Path, clock: ManualClock) -> None:
+    """IN-3 / R11-M06: only the broker's own record time is BROKER and reaches event_log.broker_time_ms; an untimed
+    REST row labelled with the stream watermark, and the local-time domain (accounts here), are WATERMARK / NULL."""
+    from src.db.repository import version_labels
+
+    env = make(tmp_path, clock)
+    env.item("orders", order("S1", t=clock.ms - 500))
+    [s] = env.orders()
+    assert s.broker_time_source == "BROKER" and version_labels(s) == ("stream", clock.ms - 500)
+    env.adapter.open_orders = [order("U1", t=0), order("T1", t=clock.ms - 400)]
+    env.adapter.accounts = [account(t=clock.ms - 300)]
+    await env.orch.run_snapshot("mock")
+    got = {o.broker_order_id: o for o in env.orders()}
+    untimed, timed = got["U1"], got["T1"]
+    assert untimed.broker_updated_at_ms == clock.ms - 500                       # the stream watermark
+    assert untimed.broker_time_source == "WATERMARK" and version_labels(untimed) == ("snapshot", None)
+    assert timed.broker_time_source == "BROKER" and version_labels(timed) == ("snapshot", clock.ms - 400)
+    [a] = [x for x in env.account_items() if isinstance(x, AccountDTO)]
+    assert a.broker_time_source == "WATERMARK" and version_labels(a) == ("snapshot", None)
+    assert untimed.checksum == order("U1", t=0).checksum                         # labels never touch the checksum
+
+
+async def test_reread_entity_statuses(tmp_path: Path, clock: ManualClock) -> None:
+    env = make(tmp_path, clock)
+    env.adapter.orders_by_id["O1"] = order("O1", t=clock.ms - 100)
+    first = await env.orch.reread_entity("mock", "ORDER", "O1")
+    assert first.status is RereadStatus.APPLIED and first.found and first.dto is not None
+    assert first.version == version_str(first.dto) and first.dto.source == "REST"
+    assert (await env.orch.reread_entity("mock", "ORDER", "O1")).status is RereadStatus.NOOP
+    env.adapter.orders_by_id["O1"] = order("O1", t=clock.ms - 200, stop="1.0")       # an older broker version
+    assert (await env.orch.reread_entity("mock", "ORDER", "O1")).status is RereadStatus.DROPPED_STALE
+    env.adapter.orders_by_id["O1"] = order("O1", t=clock.ms - 50, stop="1.0")
+    assert (await env.orch.reread_entity("mock", "ORDER", "O1")).status is RereadStatus.APPLIED
+    missing = await env.orch.reread_entity("mock", "POSITION", "nope")
+    assert missing.status is RereadStatus.NOT_FOUND and not missing.found and missing.dto is None
+    bad = order("O2", t=clock.ms)
+    object.__setattr__(bad, "checksum", "0" * 64)                                    # parked: never handed over
+    env.adapter.orders_by_id["O2"] = bad
+    transient = await env.orch.reread_entity("mock", "ORDER", "O2")
+    assert transient.status is RereadStatus.TRANSIENT and transient.found and transient.dto is bad
+    assert transient.version is None and env.ring() == [("O2", "checksum")]
+    assert len(env.orders()) == 4
+
+
+async def test_reread_entity_reports_the_send_time_of_its_own_read(tmp_path: Path, clock: ManualClock) -> None:
+    mock = MockBrokerAdapter(orders=[order("O1", t=clock.ms - 10)], wall_ms=lambda: clock.ms + 7)
+    env = make(tmp_path, clock, adapter=mock)  # type: ignore[arg-type]
+    mark_rest_sent(1)                                   # an older stamp in this context is never reported
+    res = await env.orch.reread_entity("mock", "ORDER", "O1")
+    assert res.sent_ms == clock.ms + 7
+
+
+def _stop_mock(clock: ManualClock) -> MockBrokerAdapter:
+    return MockBrokerAdapter(orders=[_kind(order("S1", t=clock.ms - 100, stop="1.0"), "STOP"),
+                                     _kind(order("S2", t=clock.ms - 100, stop="1.0"), "STOP")],
+                             positions=[position("P1", t=clock.ms - 100)], wall_ms=lambda: clock.ms + 3)
+
+
+async def test_reread_stop_orders_one_list_read_never_closes_an_absent_order(tmp_path: Path,
+                                                                             clock: ManualClock) -> None:
+    mock = _stop_mock(clock)
+    env = make(tmp_path, clock, adapter=mock)  # type: ignore[arg-type]
+    await env.orch.run_snapshot("mock")
+    env.orders(), env.positions(), env.account_items()
+    rt = env.orch.runtime("mock")
+    mock.set_order(_kind(order("S1", t=clock.ms - 10, stop="1.05"), "STOP"))                    # stop moved
+    mock.set_order(_kind(order("S2", OrderStatus.CANCELLED, t=clock.ms - 10), "STOP"))          # not listed
+    mock.calls.clear()
+    mock.rest_calls.clear()
+    res = await env.orch.reread_stop_orders("mock")
+    assert mock.rest_calls == [("fetch_active_stop_orders", RestPriority.BARS)] and mock.stop_order_reads == 1
+    assert "fetch_order_status" not in mock.calls                              # nothing re-read by id
+    assert res.supported and res.sent_ms == clock.ms + 3 and res.skipped == 0
+    [row] = res.rows
+    assert row.status is RereadStatus.APPLIED and row.sent_ms == clock.ms + 3
+    assert row.dto is not None and row.dto.origin == "stop_read" and row.dto.stop_loss == Decimal("1.05")
+    [published] = env.orders()
+    assert published.broker_order_id == "S1" and published.order_kind == "STOP"
+    assert rt.orders["mock:S2"].status is OrderStatus.WORKING                   # absent: never closed
+    assert env.positions() == []
+    again = await env.orch.reread_stop_orders("mock")
+    assert [r.status for r in again.rows] == [RereadStatus.NOOP]
+
+
+async def test_reread_stop_orders_position_handles_and_unsupported(tmp_path: Path, clock: ManualClock) -> None:
+    mock = _stop_mock(clock)
+    env = make(tmp_path, clock, adapter=mock)  # type: ignore[arg-type]
+    mock.set_stop_orders_supported(True, positions=True)
+    res = await env.orch.reread_stop_orders("mock")
+    assert [(r.status, r.dto.origin if r.dto else None) for r in res.rows] == [(RereadStatus.APPLIED, "stop_read")]
+    assert [p.position_id for p in env.positions()] == ["P1"] and env.orders() == []
+    mock.set_stop_orders_supported(False)
+    res = await env.orch.reread_stop_orders("mock")
+    assert not res.supported and res.rows == ()
+    assert env.orders() == [] and env.positions() == []
+
+
+async def test_reread_stop_orders_ignores_another_adapters_rows(tmp_path: Path, clock: ManualClock) -> None:
+    mock = MockBrokerAdapter(orders=[_kind(order("X1", t=clock.ms - 100, adapter_id="other"), "STOP")])
+    env = make(tmp_path, clock, adapter=mock)  # type: ignore[arg-type]
+    res = await env.orch.reread_stop_orders("mock")
+    assert res.skipped == 1 and res.rows == () and env.orders() == []

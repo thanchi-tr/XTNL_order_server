@@ -21,7 +21,11 @@ in the broker's own platform.
 | [partition-archive.md](partition-archive.md) | Lifecycle pages: partitions awaiting export, export count mismatch, disk alerts |
 | [broker-maintenance.md](broker-maintenance.md) | A broker announces maintenance: declare the window (`/etc/xtnl/maintenance.json`, identical on both nodes) |
 | [downtime-catchup.md](downtime-catchup.md) | Single-PC mode: page "downtime catch-up" / "downtime catch-up incomplete", reading `uptime show` / `catchup show` |
+| [single-pc-autostart.md](single-pc-autostart.md) | Single-PC mode: start the engine at log-on (scheduled task `XTNL engine`), start / stop / status, reboot / sleep / update behaviour, removal |
+| [order-server-api.md](order-server-api.md) | Single-PC mode: the read-only HTTPS API for the thesis website (Pine Script order history): credentials, firewall / router / DNS steps you run yourself, Vercel settings, rotation, closing it again |
 | [pinescript-export.md](pinescript-export.md) | Draw the past week's order life cycles on a TradingView chart (`python -m src.ops pinescript`) |
+| [marketdata.md](marketdata.md) | Optional market-data store `redis-md` and its tasks: enable / disable on AWS, the md pages (memory, broker bars, indicators), AOF aside, HMAC key rotation, redis-md password rotation |
+| [arm.md](arm.md) | Optional Automated Risk Manager (advice only): every ARM page with its fix, FAILED pings (probe kinds, the command to run first, clear), configuration, pause / disarm, enable / disable |
 | [off-node-alerts.md](off-node-alerts.md) | Any off-node (Alertmanager / CloudWatch -> SNS) alert; balance-move cash-flow refresh |
 
 Conventions:

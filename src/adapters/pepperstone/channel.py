@@ -19,7 +19,8 @@ from src.adapters.pepperstone.protocol import Frame
 
 class EventChannel:
     def __init__(self, name: str, stream: StreamName, *, maxsize: int, drop_when_full: bool, heartbeat_s: float,
-                 is_live: Callable[[], bool], clock_ms: Callable[[], int]) -> None:
+                 is_live: Callable[[], bool], clock_ms: Callable[[], int],
+                 on_drop: Callable[[Frame], None] | None = None) -> None:
         self.name = name
         self.stream: StreamName = stream
         self._maxsize = maxsize
@@ -35,6 +36,8 @@ class EventChannel:
         self.closed = False
         self.dropped_frames = 0
         self.gaps_opened = 0
+        #: Drop-mode channels: told about each dropped frame (per-market drop counts, design PR6); must not raise.
+        self._on_drop = on_drop
 
     def offer(self, frame: Frame) -> None:
         """Reader side: never blocks, never raises."""
@@ -43,6 +46,11 @@ class EventChannel:
         if len(self._frames) >= self._maxsize:
             if self._drop:
                 self.dropped_frames += 1
+                if self._on_drop is not None:
+                    try:
+                        self._on_drop(frame)
+                    except Exception:  # noqa: BLE001 - a counter must never break the reader
+                        pass
             else:
                 if self._gap_frames == 0:
                     self.gaps_opened += 1
@@ -52,10 +60,12 @@ class EventChannel:
         self._frames.append(frame)
         self._wake.set()
 
-    def put_event(self, kind: StreamEventKind, detail: str = "") -> None:
+    def put_event(self, kind: StreamEventKind, detail: str = "", market: str | None = None) -> None:
+        """``market``: the one canonical symbol a per-market event is about (design PR6); None = the whole
+        stream (the batch spot subscribe, a lost session)."""
         if self.closed:
             return
-        self._control.append(StreamEvent(kind, self.stream, detail, self._clock_ms()))
+        self._control.append(StreamEvent(kind, self.stream, detail, self._clock_ms(), market))
         self._wake.set()
 
     def clear_frames(self) -> None:

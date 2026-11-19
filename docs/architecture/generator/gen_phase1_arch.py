@@ -1,4 +1,4 @@
-"""Generate docs/architecture/phase1_ingestion_arch.drawio (5 pages).
+"""Generate docs/architecture/phase1_ingestion_arch.drawio (6 pages).
 
   1 Architecture    - 5 swimlanes (broker, adapters, bus, Redis/DB/image, Oversee),
                       data flow, pattern stereotypes, lane comments
@@ -8,6 +8,8 @@
                       Redis-loss bootstrap
   4 Use Cases       - actors, boundary, include / extend / generalisation
   5 Deployment      - London live node, Melbourne disaster copy / oversight, latency budget
+  6 Market data & ARM - the optional market-data layer (redis-md) and the advice-only ARM: data
+                      flow, SM12 (market-data series), SM11 (ARM position); plan S37
 
 Readability rules
   * every element carries a coloured KIND tag (interface, class, object ...);
@@ -2801,8 +2803,199 @@ def page_deployment():
     return p
 
 
+# =================================================================== PAGE 6
+def page_marketdata_arm():
+    """Market-data layer, ARM, SM12 and SM11 (design Part A / Part B; plan S37). Optional services: nothing on this page
+    runs unless XTNL_MD_ENABLED=1 (and XTNL_ARM_ENABLED=1 for the ARM row); nothing here sends an order."""
+    p = Page("arm", "6 · Market data & ARM")
+    p.vertex("title",
+             "<font style='font-size:22px'><b>Market-data layer and Automated Risk Manager (optional, advice only)</b>"
+             "</font><br><font style='font-size:12px' color='#555555'>Off by default (XTNL_MD_ENABLED / "
+             "XTNL_ARM_ENABLED); enabling them never affects ingestion, Oversee, the gate or leadership. Market data "
+             "lives only in redis-md, never in PostgreSQL. The ARM advises a human; it never sends, changes or cancels "
+             "an order. Tag colour = element kind (legend at bottom).</font>",
+             40, 16, 2220, 60, title_style())
+    F, FX, FY, FW = "f_arch", 40, 100, 2220
+    p.container(F, "Data flow &mdash; market data (rows 1-2) and the ARM (row 3)", FX, FY, FW, 100,
+                frame_style("#DAE8FC").replace("dashed=1;", ""))
+    W, H = 260, 90
+    XS = [80, 400, 720, 1060, 1400, 1740]
+    RA, RB, RC = 150, 330, 520
+
+    def box(vid, kind, stereo, html, x, y, w=W, tip=None):
+        p.vertex(vid, tag(kind, stereo) + html, x, y, w, H, kstyle(kind), F, tooltip=tip)
+
+    box("a_hook", "class", "Hook", "<b>Orchestrator price hook</b><br>non-blocking ring append per tick",
+        XS[0], RA, tip="IngestionOrchestrator.set_md_hook: a contained, non-blocking call on the price path; an exception "
+                       "or a full ring never slows or stops ingestion (tick-only symbols, PR5, reach only this hook).")
+    box("a_ring", "class", None, "<b>MdHook</b><br>tick rings, TICK 1m bars, ClockSkew", XS[1], RA,
+        tip="Builds TICK bars from tradeable, broker-timed ticks of demanded series; per-market subscription intervals "
+            "decide coverage (quality complete / partial / degraded / blind).")
+    box("a_wr", "active", None, "<b>md-writer</b><br>FLUSH / RETAIN under the writer token, shedding", XS[2], RA,
+        tip="Owns the store: closed-bar queue (6 h bound), writer token md:writer and sentinel md:boot, bootstrap "
+            "(SM12 below), retention, memory shedding in a fixed order, pages at 70 %.")
+    box("a_md", "store", None, "<b>redis-md</b><br>127.0.0.1:6381 &middot; AOF everysec &middot; 1 GB noeviction",
+        XS[3], RA, tip="Separate from the engine Redis (not a duplicate of PostgreSQL, outside SM8 and the integrity "
+                       "worker). ACL: md_writer, md_reader (read-only), md_health; rendered from the secrets source at "
+                       "start (xtnl-redis-md.service, installed but not enabled). PC: compose profile md, port 56382.")
+    box("a_cli", "external", None, "<b>ops CLI</b> (md_reader)<br>md show &middot; md bars &middot; arm replay",
+        XS[5], RA, tip="Read-only views, no values: md show | bars | indicators, arm replay re-verifying stored "
+                       "decisions under the HMAC keyring. Remote readers come through the TLS proxy's 6382 section.")
+    box("b_ad", "interface", "ReadOnlyTransport", "<b>BrokerAdapter</b><br>fetch_price_bars (REST BARS class)",
+        XS[0], RB, tip="A GET through the adapter's ReadOnlyTransport and REST budget (BARS priority, capped per "
+                       "minute); StoneX serves 1m / 15m bid and ask bars since S39 (PR3 probe), Pepperstone none in v1.")
+    box("b_bars", "active", None, "<b>md-bars</b><br>BROKER bars, finality, zero-trust checks, cross-check", XS[2], RB,
+        tip="Reads demanded BROKER series, validates every bar (quarantine on failure), decides finality on broker "
+            "evidence only, cross-checks against TICK bars (D6), backfills and heals gaps in a low-priority lane.")
+    box("b_ind", "active", None, "<b>md-indicators</b><br>ATR on BROKER series, demand", XS[3], RB, w=220,
+        tip="Indicator values (quantised, with lineage) written back to redis-md; FAULTED on a failed computation "
+            "(md rebuild).")
+    box("b_port", "interface", None, "<b>MarketDataPort</b><br>hash-checked reads, as_of, events_since", XS[4], RB,
+        tip="The one read port: every bar's keyed content hash is checked under the retained key ids; a failure is "
+            "DATA_UNAVAILABLE, never a guess.")
+    box("c_trk", "active", None, "<b>arm-tracker</b><br>READ ONLY snapshot; arms OPEN positions", XS[0], RC,
+        tip="Arms an OPEN position with an accepted assignment (fresh image, known entry and stop); writes the "
+            "arm_positions row and the demand leases; answers arm_disarm / arm_repin / arm_rearm.")
+    box("c_clk", "active", None, "<b>BarClock</b><br>PRE / POST on the bar grid; SM11", XS[1], RC,
+        tip="Fires PRE before the bar end and POST once the broker bar is final (up to decision_cap); one fenced "
+            "transaction per event; FAILED scopes hold their positions.")
+    box("c_eval", "class", "Strategy", "<b>PipelineEvaluator</b><br>pure job: envelope, FirstBarGuard, strategy",
+        XS[2], RC, tip="Runs the strategy in a per-version executor with a 250 ms cap; deterministic under replay; "
+                       "the first strategy is kind (a) break-even on risk close.")
+    box("c_pg", "store", None, "<b>PostgreSQL ARM tables</b><br>arm_positions, arm_decisions, arm_failures",
+        XS[3], RC, tip="Ids, outcome codes, order-state levels and keyed hashes only; never a price (design B8, C1). "
+                       "Written by the ARM pool as xtnl_arm, fenced on the engine epoch.")
+    box("c_not", "class", None, "<b>ArmNotices</b><br>ARM outbox rows (kind arm): ids and codes", XS[4], RC,
+        tip="Per-bar notices, extras, the daily TEST and FAILED_CLEARED; the outbox body never carries a value a close "
+            "could be recomputed from.")
+    box("c_rel", "active", None, "<b>arm-relay</b><br>ARM channels (email, push), own credentials", XS[5], RC,
+        tip="Renders favour R at send time from a hash-checked read (omitted if unavailable); never touches Oversee's "
+            "rows; no escalation.")
+    C, M = C_DATA, C_INT
+    e = p.edge
+    e("f1", "a_hook", "a_ring", "ticks", p.right("a_hook", RA + 45), p.left("a_ring", RA + 45), color=C)
+    e("f2", "a_ring", "a_wr", "closed bars", p.right("a_ring", RA + 45), p.left("a_wr", RA + 45), color=C)
+    e("f3", "a_wr", "a_md", "FLUSH", p.right("a_wr", RA + 45), p.left("a_md", RA + 45), color=C)
+    e("f4", "a_md", "a_cli", "md_reader (read-only)", p.right("a_md", RA + 20), p.left("a_cli", RA + 20), color=C)
+    e("f5", "a_md", "b_port", "", p.right("a_md", RA + 70), p.top("b_port", 1530), pts=[(1530, RA + 70)], color=C)
+    e("f6", "b_ad", "b_bars", "broker bars (GET)", p.right("b_ad", RB + 45), p.left("b_bars", RB + 45), color=C)
+    e("f7", "b_bars", "a_wr", "final bars", p.top("b_bars", 850), p.bot("a_wr", 850), color=C)
+    e("f8", "b_ind", "a_md", "values", p.top("b_ind", 1170), p.bot("a_md", 1170), color=C)
+    e("f9", "c_trk", "c_clk", "armed rows", p.right("c_trk", RC + 45), p.left("c_clk", RC + 45), color=M)
+    e("f10", "c_clk", "c_eval", "evaluate", p.right("c_clk", RC + 45), p.left("c_eval", RC + 45), color=M)
+    e("f11", "c_eval", "b_port", "bars, quote", p.right("c_eval", RC + 25), p.bot("b_port", 1450),
+      pts=[(1030, RC + 25), (1030, 470), (1450, 470)], color=M)
+    e("f12", "c_clk", "c_pg", "decision + SM11 (fenced)", p.bot("c_clk", 600), p.bot("c_pg", 1190),
+      pts=[(600, 660), (1190, 660)], color=M)
+    e("f13", "c_clk", "c_not", "notice sink", p.bot("c_clk", 500), p.bot("c_not", 1530),
+      pts=[(500, 690), (1530, 690)], color=M, label_x=0.6)
+    e("f14", "c_not", "c_pg", "outbox insert", p.left("c_not", RC + 45), p.right("c_pg", RC + 45), color=M)
+    e("f15", "c_not", "c_rel", "queued", p.right("c_not", RC + 45), p.left("c_rel", RC + 45), color=M)
+    e("f16", "c_rel", "b_port", "render at send", p.top("c_rel", 1870), p.right("b_port", RB + 45),
+      pts=[(1870, RB + 45)], color=M)
+    gy = 740
+    gh = p.H("g_lock", 80)
+    p.vertex("g_lock", tag("guard", "Lockout") + "<b>Read-only lockout</b><br>src/riskmgr/lockout.py: no sender name, "
+             "no network import in src/riskmgr, src/marketdata, src/armconfig; scanned before the ARM starts",
+             80, gy, 560, gh, kstyle("guard"), F,
+             tooltip="A violation parks the optional services for the term with a page; ReadOnlyTransport stays the "
+                     "hard guarantee for every broker call.")
+    nh = p.H("n_arch", 80)
+    p.vertex("n_arch", tag("note") + "Every arrow is a read or a write inside the engine or to redis-md / PostgreSQL; "
+             "none reaches a broker except md-bars' GET bar reads (and PR9 stop-list reads) through ReadOnlyTransport. "
+             "A redis-md outage marks series GAPPED and holds ARM advice (DATA_UNAVAILABLE, or FAILED under the B14 "
+             "error budget); ingestion and Oversee never wait for it.",
+             700, gy, 1500, nh, kstyle("note"), F)
+    p.cont[F][3] = gy + max(nh, gh) + 20 - FY
+
+    oy = FY + p.cont[F][3] + 40
+    fs = lambda col: frame_style(col).replace("dashed=1;", "")
+
+    def S(vid, html, x, y, w, h, cat, par, tip=None):
+        p.vertex(vid, html, x, y, w, h, state_style(cat), par, tooltip=tip)
+
+    def note(vid, html, x, y, w, par, default=60):
+        h = p.H(vid, default)
+        p.vertex(vid, tag("note") + html, x, y, w, h, kstyle("note"), par)
+        return y + h
+
+    X1, W1, X2, W2 = 40, 1080, 1160, 1100
+    p.container("S12", "SM12 &middot; market-data series (per adapter, symbol, spec, side, source)", X1, oy, W1, 100,
+                fs("#DAE8FC"))
+    p.container("S11", "SM11 &middot; ARM position (per position, resource, owner)", X2, oy, W2, 100, fs("#FCE4EC"))
+    ox, P = X1, "S12"
+    p.vertex("q_ini", "", ox + 20, oy + 78, 24, 24, INIT, P)
+    S("q_empty", sname("EMPTY", "nothing stored"), ox + 90, oy + 60, 150, 60, "normal", P)
+    S("q_back", sname("BACKFILLING", "W + 3 &times; length"), ox + 330, oy + 60, 190, 60, "transient", P,
+      tip="Inside md-bars after LEADER, rate-limited; completes each indicator's warm-up range before publishing a value.")
+    S("q_live", sname("LIVE", "bars final, checked"), ox + 620, oy + 60, 180, 60, "success", P)
+    S("q_gap", sname("GAPPED", "TICK gap stays blind"), ox + 620, oy + 240, 180, 60, "transient", P,
+      tip="Engine down, subscription lost, suspension, outage (a broker outage pages broker_unavailable once and is "
+          "never FAILED).")
+    S("q_fail", sname("FAILED", "B14 series fault"), ox + 330, oy + 240, 190, 60, "failure", P,
+      tip="K consecutive mismatches or invalid buckets, unresolved bars, refetch failures: an immediate ping; cleared "
+          "only by the operator after the cause probe passes.")
+    c = C_CONN
+    e("q1", "q_ini", "q_empty", "", p.right("q_ini"), p.left("q_empty", oy + 90))
+    e("q2", "q_empty", "q_back", "demanded", p.right("q_empty", oy + 90), p.left("q_back", oy + 90), color=c)
+    e("q3", "q_back", "q_live", "[backfilled]", p.right("q_back", oy + 90), p.left("q_live", oy + 90), color=c)
+    e("q4", "q_live", "q_gap", "outage /<br>NO_BOOT", p.bot("q_live", ox + 670), p.top("q_gap", ox + 670), color=c)
+    e("q5", "q_gap", "q_live", "[BROKER<br>backfilled]", p.top("q_gap", ox + 760), p.bot("q_live", ox + 760), color=c)
+    e("q6", "q_back", "q_fail", "[fault]", p.bot("q_back", ox + 380), p.top("q_fail", ox + 380), color=RED)
+    e("q7", "q_gap", "q_fail", "[fault]", p.left("q_gap", oy + 270), p.right("q_fail", oy + 270), color=RED)
+    e("q8", "q_fail", "q_back", "operator<br>clear", p.top("q_fail", ox + 470), p.bot("q_back", ox + 470), color=c)
+    b12 = note("q_note", "Any state goes to FAILED on a B14 series fault. The bootstrap (md-writer, mirrors SM8) runs "
+               "at each term start, on NO_BOOT and on md writer-reset: token, boot lock, every series GAPPED, rollback "
+               "sets reconciled, leases re-registered, md:boot written last. A store that cannot heal (3 failed "
+               "bootstraps) is the ARM-global FAILED. Never part of LEADER_INIT.", ox + 20, oy + 340, W1 - 40, P, 80)
+    ox, P = X2, "S11"
+    p.vertex("r_ini", "", ox + 20, oy + 78, 24, 24, INIT, P)
+    S("r_disc", sname("DISCOVERED", "OPEN, assigned?"), ox + 70, oy + 60, 160, 60, "normal", P)
+    S("r_arm", sname("ARMED", "pinned version"), ox + 300, oy + 60, 150, 60, "normal", P)
+    S("r_trk", sname("TRACKING", "decided each bar"), ox + 530, oy + 60, 170, 60, "success", P)
+    S("r_adv", sname("ADVICE_OUTSTANDING", "final ADJUST sent"), ox + 800, oy + 60, 230, 60, "transient", P,
+      tip="A later final ADJUST with a better target stays here.")
+    S("r_term", sname("CLOSED &middot; DISARMED", "terminal (from any state)"), ox + 70, oy + 240, 160, 60, "terminal", P)
+    S("r_susp", sname("SUSPENDED", "errors / version"), ox + 300, oy + 240, 150, 60, "failure", P)
+    S("r_done", sname("STRATEGY_COMPLETE", "released"), ox + 530, oy + 240, 200, 60, "success", P,
+      tip="Only a bar-end check on the final close (trigger met, every handle at target) releases a position; PRE and "
+          "the tracker never do.")
+    S("r_fail", sname("FAILED", "stores prior_state"), ox + 800, oy + 240, 230, 60, "failure", P)
+    e("r1", "r_ini", "r_disc", "", p.right("r_ini"), p.left("r_disc", oy + 90))
+    e("r2", "r_disc", "r_arm", "[armable]", p.right("r_disc", oy + 90), p.left("r_arm", oy + 90), color=c)
+    e("r3", "r_arm", "r_trk", "first POST", p.right("r_arm", oy + 90), p.left("r_trk", oy + 90), color=c)
+    e("r4", "r_trk", "r_adv", "final ADJUST", p.right("r_trk", oy + 75), p.left("r_adv", oy + 75), color=c)
+    e("r5", "r_adv", "r_trk", "withdrawn / at target", p.left("r_adv", oy + 105), p.right("r_trk", oy + 105), color=c)
+    e("r6", "r_trk", "r_done", "[bar-end:<br>released]", p.bot("r_trk", ox + 580), p.top("r_done", ox + 580), color=c)
+    e("r7", "r_done", "r_trk", "correction /<br>loosened", p.top("r_done", ox + 670), p.bot("r_trk", ox + 670), color=c)
+    e("r8", "r_arm", "r_susp", "3 errors", p.bot("r_arm", ox + 340), p.top("r_susp", ox + 340), color=RED)
+    e("r9", "r_susp", "r_arm", "re-arm", p.top("r_susp", ox + 410), p.bot("r_arm", ox + 410), color=c)
+    e("r10", "r_disc", "r_term", "closed /<br>disarm", p.bot("r_disc", ox + 150), p.top("r_term", ox + 150), color=c)
+    e("r11", "r_adv", "r_fail", "[FAILED<br>scope]", p.bot("r_adv", ox + 860), p.top("r_fail", ox + 860), color=RED)
+    e("r12", "r_fail", "r_adv", "clear /<br>prior_state", p.top("r_fail", ox + 970), p.bot("r_adv", ox + 970), color=c)
+    b11 = note("r_note", "src/riskmgr/sm11.py is the one pure transition table; every other (state, event) pair is "
+               "refused. Any non-terminal state goes to FAILED while a FAILED scope covers the position (prior_state "
+               "restored on the operator clear), to SUSPENDED on 3 strategy errors, a missing pinned version or a units "
+               "increase, and to CLOSED / DISARMED. PRE never changes the state.", ox + 20, oy + 340, W2 - 40, P, 80)
+    rh = max(b11, b12) - oy + 20
+    p.cont["S12"][3] = rh
+    p.cont["S11"][3] = rh
+    ly = oy + rh + 40
+    lend = legend(p, 40, ly, 2220, ["interface", "class", "active", "store", "external", "guard", "note"])
+    p.container("legend_sm", "Legend &mdash; state categories", 40, lend + 20, 2220, 80,
+                "swimlane;startSize=26;html=1;fontSize=12;fontStyle=1;collapsible=0;fillColor=#F5F5F5;"
+                "strokeColor=#999999;swimlaneFillColor=#FFFFFF;align=left;spacingLeft=10;", inset=(0, 26))
+    for i, (cat, txt) in enumerate([("normal", "normal / waiting"), ("transient", "transient / working"),
+                                    ("success", "success / healthy"), ("failure", "failure / blocked"),
+                                    ("terminal", "neutral terminal")]):
+        p.vertex(f"lgs_{cat}", f"<b>{txt}</b>", 60 + i * 230, lend + 56, 200, 34, state_style(cat), "legend_sm")
+    p.w, p.h = 2300, lend + 140
+    return p
+
+
 # =================================================================== build
-pages = [page_architecture(), page_patterns(), page_states(), page_usecases(), page_deployment()]
+pages = [page_architecture(), page_patterns(), page_states(), page_usecases(), page_deployment(),
+         page_marketdata_arm()]
 bad = False
 for pg in pages:
     probs = pg.check()

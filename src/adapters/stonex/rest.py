@@ -9,23 +9,35 @@ The client never retries or re-authenticates by itself: the SM4 owner decides.
 
 Every request takes a token from the adapter's shared RestBudget first (operations.md §15); LogOn and
 log-off spend one without waiting (LogOn sits right behind the synchronous lease check). A throttle
-answer empties the bucket for Retry-After. The default HTTP client sets SO_LINGER(on, 0) and
+answer empties the bucket for Retry-After. Each request's outcome is reported to the bucket by priority
+(answered, or timeout / network error / 5xx; a throttle answer is counted apart), and its send time is stamped
+right before the send, after the token wait and only when the request really leaves (``rest_sent_ms``). The
+default HTTP client sets SO_LINGER(on, 0) and
 TCP_USER_TIMEOUT on every pooled socket (src/adapters/sockets.py).
 """
 from __future__ import annotations
 
+import contextlib
 import logging
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Iterator, Sequence
+from contextvars import ContextVar
 from typing import Any
 
 import httpx
 
 from src.adapters.base import AuthFailedError, BrokerError, SessionExpiredError, TransientBrokerError
-from src.adapters.ratelimit import RestBudget, parse_retry_after
+from src.adapters.ratelimit import (
+    RestBudget,
+    RestPriority,
+    current_rest_priority,
+    mark_rest_sent,
+    parse_retry_after,
+)
 from src.adapters.sockets import reset_http_client
 from src.adapters.stonex.wire import JsonObj, get_ci, get_list, get_obj, to_bool, to_int
 from src.adapters.transport import ReadOnlyTransport
-from src.config import StoneXSettings
+from src.config import ExecutionLockedError, StoneXSettings
 
 log = logging.getLogger(__name__)
 
@@ -38,12 +50,45 @@ ERR_ORDER_NOT_ACCESSIBLE = 80001
 DEFAULT_TIMEOUT_S = 10.0
 
 
+def _note(budget: RestBudget | None, priority: RestPriority, *, ok: bool) -> None:
+    """Report one request's outcome to the adapter's bucket (per-priority outcome counters, R11-M10)."""
+    if budget is not None:
+        budget.note_result(priority, ok)
+
+
+def _system_wall_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
 def _order_id(order_id: str) -> str:
     """Order ids are integers; refuse anything else so no id can alter the path."""
     text = str(order_id).strip()
     if not text.isdigit():
         raise ValueError(f"invalid StoneX order id: {order_id!r}")
     return text
+
+
+def _market_id(market_id: str) -> str:
+    """Market ids are integers; refuse anything else so no id can alter the path."""
+    text = str(market_id).strip()
+    if not text.isdigit():
+        raise ValueError(f"invalid StoneX market id: {market_id!r}")
+    return text
+
+
+_GET_ONLY: ContextVar[bool] = ContextVar("xtnl_stonex_get_only", default=False)
+
+
+@contextlib.contextmanager
+def rest_get_only() -> Iterator[None]:
+    """Inside the block every request of the calling task must be a GET: any other method is refused before it
+    is sent (``ExecutionLockedError``). The PR3 bar reads run inside it, on top of ``ReadOnlyTransport``'s path
+    deny-list, which still applies."""
+    token = _GET_ONLY.set(True)
+    try:
+        yield
+    finally:
+        _GET_ONLY.reset(token)
 
 
 class OrderNotAccessibleError(BrokerError):
@@ -56,17 +101,19 @@ class StoneXRestClient:
     """Session-holding REST reader. Methods return raw (case-tolerant) JSON objects."""
 
     def __init__(self, settings: StoneXSettings, transport: ReadOnlyTransport, *,
-                 budget: RestBudget | None = None) -> None:
+                 budget: RestBudget | None = None, wall_ms: Callable[[], int] = _system_wall_ms) -> None:
         self._s = settings
         self._t = transport
         self._session: str | None = None
         self.budget = budget                  # None = unmetered; StoneXAdapter attaches its own
+        self._wall_ms = wall_ms               # the send stamp's clock when unmetered (a metered send uses the budget's)
 
     @classmethod
     def create(cls, settings: StoneXSettings, *, timeout_s: float = DEFAULT_TIMEOUT_S,
-               http: httpx.AsyncClient | None = None, budget: RestBudget | None = None) -> StoneXRestClient:
+               http: httpx.AsyncClient | None = None, budget: RestBudget | None = None,
+               wall_ms: Callable[[], int] = _system_wall_ms) -> StoneXRestClient:
         client = http if http is not None else reset_http_client(timeout_s)
-        return cls(settings, ReadOnlyTransport(client, env=settings.env), budget=budget)
+        return cls(settings, ReadOnlyTransport(client, env=settings.env), budget=budget, wall_ms=wall_ms)
 
     @property
     def has_session(self) -> bool:
@@ -80,25 +127,35 @@ class StoneXRestClient:
     # --- transport -------------------------------------------------------------------
     async def _send(self, method: str, url: str, *, json: Any = None, params: dict[str, Any] | None = None,
                     logon: bool = False, allow_not_found: bool = False, wait: bool = True) -> JsonObj | None:
+        if _GET_ONLY.get() and method.upper() != "GET":
+            raise ExecutionLockedError(f"only GET requests are allowed here: {method} {_path(url)}")
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
         if not logon and self._session is None:
             raise SessionExpiredError("no StoneX session: log on first")
         budget = self.budget
         if budget is not None:
+            # The token wait comes first; the send is stamped below, once it is sure to leave (IN-5).
             if wait:
-                await budget.acquire()
+                await budget.acquire(stamp=False)
             else:
-                budget.spend()
+                budget.spend(stamp=False)
         if not logon:
             session = self._session
-            if session is None:      # lost while waiting for a token
+            if session is None:      # lost while waiting for a token: nothing is sent, so nothing is stamped
                 raise SessionExpiredError("no StoneX session: log on first")
             headers.update({"UserName": self._s.username, "Session": session})
+        if budget is not None:
+            budget.mark_sent()       # right before the send, on the budget's wall clock
+        else:
+            mark_rest_sent(self._wall_ms())    # unmetered: the client's own (injectable) wall clock
+        priority = current_rest_priority()
         try:
             resp = await self._t.request(method, url, headers=headers, json=json, params=params)
         except httpx.TimeoutException as exc:
+            _note(budget, priority, ok=False)
             raise TransientBrokerError(f"StoneX timeout: {method} {_path(url)}") from exc
         except httpx.TransportError as exc:
+            _note(budget, priority, ok=False)
             raise TransientBrokerError(f"StoneX network error: {method} {_path(url)}: {type(exc).__name__}") from exc
 
         body = _json(resp)
@@ -108,9 +165,15 @@ class StoneXRestClient:
         if err_code is not None and status < 400:
             status = to_int(get_ci(obj, "HttpStatus")) or 400
         message = str(get_ci(obj, "ErrorMessage") or "")[:200]
+        throttled = status == 429 or err_code == ERR_THROTTLED
+        # Outcome per priority (R11-M10): the broker answered unless it failed server-side. A throttle answer is
+        # counted apart (note_throttled): it may be our own doing and is never read as an outage.
+        if not throttled:
+            _note(budget, priority, ok=status < 500)
 
-        if status == 429 or err_code == ERR_THROTTLED:
+        if throttled:
             if budget is not None:
+                budget.note_throttled(priority)
                 budget.throttled(parse_retry_after(resp.headers.get("Retry-After")))
             raise TransientBrokerError(f"StoneX throttled (wait 1 s): {_path(url)}")
         if err_code == ERR_INVALID_CREDENTIALS:
@@ -254,6 +317,23 @@ class StoneXRestClient:
             "MaxResults": max_results, "ClientAccountId": client_account_id,
         })
         return get_list(body, "Markets")
+
+    async def price_bar_history(self, market_id: str, interval: str, span: int, price_bars: int,
+                                price_type: str) -> JsonObj | None:
+        """GET market/{id}/barhistory: the newest ``price_bars`` bars plus the partial one (count form). Confirmed
+        read-only by the PR3 probe (2026-11-17, plan S39; src/adapters/stonex/bars.py)."""
+        return await self._get(f"{self._s.base_url_v1}/market/{_market_id(market_id)}/barhistory", {
+            "interval": interval, "span": span, "PriceBars": price_bars, "priceType": price_type,
+        })
+
+    async def price_bar_history_between(self, market_id: str, interval: str, span: int, from_s: int, to_s: int,
+                                        price_type: str) -> JsonObj | None:
+        """GET market/{id}/barhistorybetween: the bars of ``[from_s, to_s]`` (range form, UTC seconds). Confirmed
+        read-only by the PR3 probe (2026-11-17, plan S39)."""
+        return await self._get(f"{self._s.base_url_v1}/market/{_market_id(market_id)}/barhistorybetween", {
+            "interval": interval, "span": span, "fromTimeStampUTC": from_s, "toTimeStampUTC": to_s,
+            "priceType": price_type,
+        })
 
 
 def _json(resp: httpx.Response) -> Any:

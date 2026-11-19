@@ -91,5 +91,5 @@ async def test_pending_operator_requests_carry_their_payload() -> None:
     conn.returns_all(SQL_OPERATOR_REQUESTS_PENDING,
                      [(9, "refresh_cash_flows", "ACC", "alice", '{"v":1,"account_id":"ACC"}')])
     q = PgOperatorRequests(EngineDb(FakeSource(conn), lambda: DB_EPOCH))
-    assert await q.pending(3) == [OperatorRequest(9, "refresh_cash_flows", "ACC", "alice", '{"v":1,"account_id":"ACC"}')]
+    assert await q.pending(3, {"refresh_cash_flows"}) == [OperatorRequest(9, "refresh_cash_flows", "ACC", "alice", '{"v":1,"account_id":"ACC"}')]
     assert "r.payload" in SQL_OPERATOR_REQUESTS_PENDING

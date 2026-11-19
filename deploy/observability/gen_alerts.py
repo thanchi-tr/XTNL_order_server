@@ -60,7 +60,18 @@ NAMESPACE = "XTNL"
 NODES = ("node-a", "node-b")                       # XTNL_NODE_ID of the two engine nodes
 ETCD_MEMBERS = ("node-a", "node-b", "witness")
 PG_MEMBERS = ("node-a", "node-b")                  # PG_MEMBER_NAME of the two Patroni members
-CERTS = ("etcd-client", "etcd-peer", "pg-server", "patroni-rest", "ca")
+#: K5 (operations.md §13 "Certificate expiry alert at 30 days"): every certificate an engine node serves or presents,
+#: read from its file on that node (XTNL_METRICS_CERTS), plus the certificates served on hosts without an exporter,
+#: read by each engine node over a verifying TLS handshake (XTNL_METRICS_CERT_ENDPOINTS): the witness's etcd member
+#: (client and peer ports) and the Melbourne receiver / dashboard heartbeat listeners. The Melbourne-local client
+#: certificate (the dashboard's Redis client certificate) is watched by the dead-man receiver (XTNL_RECEIVER_CERTS).
+#: Each FILE_CERTS name maps to the file its service actually loads (engine.env.example XTNL_METRICS_CERTS:
+#: /etc/etcd/pki/<ETCD_NAME>{,-peer}.crt, /etc/patroni/pki/<PG_MEMBER_NAME>{,-pg,-etcd-client}.crt, both CAs), so a
+#: renewed served certificate is the one watched.
+FILE_CERTS = ("etcd-client", "etcd-peer", "etcd-server", "pg-server", "patroni-rest", "patroni-etcd-client",
+              "patroni-ca", "redis-proxy", "redis-proxy-client-ca", "ca")
+ENDPOINT_CERTS = ("etcd-witness-server", "etcd-witness-peer", "deadman-receiver", "dashboard-heartbeat")
+CERTS = FILE_CERTS + ENDPOINT_CERTS
 MOUNTS = ("/", "/var/lib/postgresql", "/var/lib/etcd", "/var/lib/redis", "/var/lib/xtnl")
 #: The witness: root volume and its etcd member's own gp3 volume (operations.md §1), watched by the CloudWatch
 #: agent (`agent-witness.json`) as CWAgent `disk_used_percent` {host=WITNESS_HOST, path=<mount>}.
@@ -125,12 +136,28 @@ DEFINED_METRICS: tuple[Metric, ...] = tuple(Metric(n, t, tuple(ls.split())) for 
     ("xtnl_token_age_seconds", "gauge", "node adapter"),
     ("xtnl_token_expires_in_seconds", "gauge", "node adapter"),
     ("xtnl_cert_expires_in_seconds", "gauge", "node cert"),
+    ("xtnl_cert_readable", "gauge", "node cert"),
     # engine uptime + downtime catch-up (migration 0012); no alert uses them yet
     ("xtnl_engine_uptime_seconds", "gauge", "node"),
     ("xtnl_suspended_gaps_total", "counter", "node"),
     ("xtnl_offline_gap_seconds", "gauge", "node"),
     ("xtnl_catchup_runs_total", "counter", "node adapter complete"),
     ("xtnl_catchup_rows_total", "counter", "node adapter kind"),
+    # optional market-data and ARM services (plan S32); absent while the flags are off
+    ("xtnl_md_series", "gauge", "node state"),
+    ("xtnl_md_indicators", "gauge", "node state"),
+    ("xtnl_md_aof_wait_timeouts_total", "counter", "node"),
+    ("xtnl_md_events_total", "counter", "node component event"),
+    # plan S37: the rest of the design §C2 list the term already holds (metrics.md "Design §C2 metric list")
+    ("xtnl_md_redis_used_memory_ratio", "gauge", "node"),
+    ("xtnl_md_shed_step", "gauge", "node"),
+    ("xtnl_md_queue_depth", "gauge", "node queue"),
+    ("xtnl_arm_positions", "gauge", "node view"),
+    ("xtnl_arm_paused", "gauge", "node"),
+    ("xtnl_arm_failed_scopes", "gauge", "node"),
+    ("xtnl_arm_failed_global", "gauge", "node"),
+    ("xtnl_arm_oldest_undelivered_notice_age_seconds", "gauge", "node"),
+    ("xtnl_arm_events_total", "counter", "node component event"),
 ))
 #: Defined in metrics.md, exported from a later backlog item. Empty: the engine exports every defined row
 #: (`xtnl_frames_lost_total`, the last one, since IMPLEMENTATION_PLAN 7.4; dropped here in 8.2). The exporter
@@ -167,6 +194,9 @@ class CwAlarm:
     threshold: float
     periods: int               # consecutive breaching periods (the rule's `for`)
     missing: str = "missing"   # breaching | notBreaching | missing | ignore
+    #: An alarm whose ALARM state means "suppress my notifications" (a composite `-notify` alarm with
+    #: ActionsSuppressor notifies instead of this one); None = notify directly (or via the epoch-settle composite).
+    suppressed_by: str | None = None
 
     def properties(self, severity: str, actions: bool) -> dict[str, Any]:
         queries: list[dict[str, Any]] = [{"Id": k, "MetricStat": v, "ReturnData": False}
@@ -399,6 +429,19 @@ ALERTS: tuple[Alert, ...] = (
        lambda: [CwAlarm(f"xtnl-cert-expiry-{n}-{c}", f"{c} on {n} expires within 30 days",
                         {"m0": stat("xtnl_cert_expires_in_seconds", dims(node=n, cert=c), "Minimum", 300)}, "m0",
                         "LessThanThreshold", 30 * 86400, 1) for n in NODES for c in CERTS]),
+    # K5: a configured certificate the node cannot read (or, for an endpoint, that does not verify: expired,
+    # untrusted, misnamed) is alerted on, and so is a node that exports fewer than the required certificates
+    # (one left out of XTNL_METRICS_CERTS / _ENDPOINTS). CloudWatch: missing data breaches after 15 min, but a node
+    # that is down (planned stop or loss) already raises XtnlEngineDown: each per-cert alarm notifies through a
+    # composite suppressed by xtnl-engine-down-<node>, so a down node is one page, not one per certificate.
+    _a("XtnlCertUnreadable", "unreadable-certificate alert", "warning",
+       f'min by (node, cert) (xtnl_cert_readable) == 0 or (max by (node) (xtnl_exporter_up) unless on (node) '
+       f'count by (node) (xtnl_cert_readable{{cert=~"{"|".join(CERTS)}"}}) >= {len(CERTS)})', "15m",
+       "A TLS certificate is unreadable, does not verify, or is not watched on this node", "xtnl_cert_readable xtnl_exporter_up",
+       lambda: [CwAlarm(f"xtnl-cert-unreadable-{n}-{c}", f"{c} on {n} unreadable, not verifying or not exported",
+                        {"m0": stat("xtnl_cert_readable", dims(node=n, cert=c), "Minimum", 300)}, "m0",
+                        "LessThanThreshold", 1, 3, missing="breaching", suppressed_by=f"xtnl-engine-down-{n}")
+                for n in NODES for c in CERTS]),
     _a("XtnlEventLoopLag", "event-loop lag alert at 100 ms", "warning", "max by (node) (xtnl_event_loop_lag_seconds) > 0.1",
        "30s", "Engine event loop lagging more than 100 ms (watchdog kills at 3 s)", "xtnl_event_loop_lag_seconds",
        lambda: per_node(lambda n: CwAlarm(
@@ -423,6 +466,23 @@ ALERTS: tuple[Alert, ...] = (
        lambda: [any_of("xtnl-feed-pending-old", "Oldest un-acked feed entry > 30 s",
                        "xtnl_feed_oldest_pending_age_seconds", [{"node": n} for n in NODES], combine="MAX",
                        op="GreaterThanThreshold", threshold=30, periods=3, missing="notBreaching")], dep=True),
+    # ---- ARM FAILED backstop (design §B14: needs neither PostgreSQL nor the outbox; absent while the ARM is off) -----
+    _a("XtnlArmFailed", "ARM FAILED scopes (arm_failed_scopes) off-node backstop", "critical",
+       "max(xtnl_arm_failed_scopes) > 0", "1m",
+       "The ARM has a FAILED scope: no advice for its positions until it is cleared (see arm failed show)",
+       "xtnl_arm_failed_scopes",
+       lambda: [any_of("xtnl-arm-failed", "ARM FAILED scopes > 0", "xtnl_arm_failed_scopes",
+                       [{"node": n} for n in NODES], combine="MAX", op="GreaterThanThreshold", threshold=0,
+                       periods=6, missing="notBreaching", fill=0)]),
+    # ---- redis-md memory (design §A2: pages at 70 %; the off-node copy needs no engine page path) ----------------
+    _a("XtnlRedisMdMemoryHigh", "redis-md memory at 70 % of maxmemory (design §A2)", "warning",
+       "max by (node) (xtnl_md_redis_used_memory_ratio) > 0.7", "2m",
+       "redis-md above 70 % of maxmemory (noeviction; md-writer sheds TICK data in its fixed order)",
+       "xtnl_md_redis_used_memory_ratio",
+       lambda: per_node(lambda n: CwAlarm(
+           f"xtnl-redis-md-memory-{n}", f"redis-md on {n} > 70 % of maxmemory",
+           {"m0": stat("xtnl_md_redis_used_memory_ratio", dims(node=n), period=60)}, "m0", "GreaterThanThreshold",
+           0.7, 2, "notBreaching"))),
     _a("XtnlClockOffset", "chrony synced within 50 ms (hard check)", "warning",
        "max by (node) (abs(xtnl_clock_offset_seconds)) > 0.05", "1m",
        "Clock offset above 50 ms: the node fails its hard check", "xtnl_clock_offset_seconds",
@@ -445,7 +505,7 @@ SPEC_COVERAGE: dict[str, tuple[str, ...]] = {
     "leader not on the primary's node > 10 min": ("XtnlLeaderNotOnPrimary",),
     "etcd quota 50 %": ("XtnlEtcdQuota50",),
     "disk 70 / 85 %": ("XtnlDisk70", "XtnlDisk85", "XtnlWitnessDisk70", "XtnlWitnessDisk85"),
-    "certificate expiry": ("XtnlCertExpiry",),
+    "certificate expiry": ("XtnlCertExpiry", "XtnlCertUnreadable"),
     "PITR horizon broken": ("XtnlPitrHorizonBroken",),
     "SAFE_HOLD off-node page": ("XtnlSafeHold",),
     "lease-renew p99 > 500 ms": ("XtnlLeaseRenewSlow",),
@@ -453,6 +513,8 @@ SPEC_COVERAGE: dict[str, tuple[str, ...]] = {
     "Redis memory before the limit": ("XtnlRedisMemoryHigh",),
     "feed lag 50 % of the cap": ("XtnlFeedLengthHigh", "XtnlFeedPendingOld"),
     "inhibition: epoch change, RTO + 30 s": ("XtnlEpochChangeSettling",),
+    "ARM FAILED scopes (design §B14 backstop)": ("XtnlArmFailed",),
+    "redis-md memory 70 % (design §A2)": ("XtnlRedisMdMemoryHigh",),
 }
 
 
@@ -497,8 +559,25 @@ def render_cloudwatch() -> str:
         for cw in a.cloudwatch():
             lid = _logical_id(cw.name)
             assert lid not in resources, lid
-            direct = not a.depends_on_epoch and a.severity != "none"
+            direct = not a.depends_on_epoch and a.severity != "none" and cw.suppressed_by is None
             resources[lid] = {"Type": "AWS::CloudWatch::Alarm", "Properties": cw.properties(a.severity, direct)}
+            if cw.suppressed_by is not None:
+                assert not a.depends_on_epoch, cw.name     # one suppressor per composite
+                topic = {"Ref": "SnsCriticalTopicArn" if a.severity == "critical" else "SnsWarningTopicArn"}
+                resources[lid + "Notify"] = {
+                    "Type": "AWS::CloudWatch::CompositeAlarm",
+                    "DependsOn": [lid, _logical_id(cw.suppressed_by)],
+                    "Properties": {
+                        "AlarmName": cw.name + "-notify",
+                        "AlarmDescription": f"{cw.description} (held back while {cw.suppressed_by} is in ALARM)",
+                        "AlarmRule": f'ALARM("{cw.name}")',
+                        "ActionsSuppressor": cw.suppressed_by,
+                        # the per-cert alarm breaches after 15 min of missing data, long after engine-down (60 s);
+                        # after recovery the first good 300 s datapoint may take up to 5 min to clear it
+                        "ActionsSuppressorWaitPeriod": 60,
+                        "ActionsSuppressorExtensionPeriod": 600,
+                        "AlarmActions": [topic], "OKActions": [topic]}}
+                continue
             if a.depends_on_epoch:
                 topic = {"Ref": "SnsCriticalTopicArn" if a.severity == "critical" else "SnsWarningTopicArn"}
                 resources[lid + "Notify"] = {

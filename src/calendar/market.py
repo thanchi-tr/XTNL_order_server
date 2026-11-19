@@ -31,6 +31,11 @@
   `latest_open_ms` (the gate) still looks at every scheduled symbol: the latest open of any of them is the
   stricter reconcile bound.
 * `mark_session(adapter, symbol)`: the session the RiskSweep marks under (BROKER_MAINTENANCE -> CLOSED).
+* `ignored(adapter, symbol)` (plan S32, S05 open point 6): a symbol the market-data layer alone subscribes (a
+  `XTNL_TICK_SYMBOLS` tick-only symbol) has a stored schedule so the market-data layer can read its session, but it
+  never decides anything here: it is left out of `deciding_sessions` (its fallback included), `latest_open_ms`, the
+  PRE_OPEN readiness check and the maintenance-ended readiness check. None (the default) ignores nothing, so with
+  the optional services off the calendar behaves exactly as before.
 * `seed_quotes(marks, now_ms)`: pre-close reference quotes from `last_clean_marks` at LEADER_INIT.
 * Maintenance windows come from the schedule version (`CalendarSchedule.maintenance`), from
   `declare_maintenance(window)` and from `replace_declared_maintenance(windows)` (a durable source re-read
@@ -48,7 +53,7 @@ from decimal import Decimal
 from typing import Literal
 
 from src.calendar.machine import OPEN_STATES, MarketSession, SessionState, SessionTransition
-from src.calendar.schedule import CalendarSchedule, MaintenanceWindow, ScheduleLoader, SymbolKey
+from src.calendar.schedule import CalendarSchedule, MaintenanceWindow, ScheduleLoader, SymbolKey, SymbolSchedule
 from src.calendar.sessions import opens_between
 from src.pubsub.tradingday import last_roll_ms
 
@@ -94,7 +99,8 @@ class MarketCalendar:
                  on_maintenance: MaintenanceHook | None = None, on_no_sessions: NoSessionsHook | None = None,
                  expected_adapters: Callable[[], Iterable[str]] | None = None,
                  on_maintenance_notice: MaintenanceNoticeHook | None = None,
-                 subscribed_symbols: Callable[[str], Iterable[str]] | None = None) -> None:
+                 subscribed_symbols: Callable[[str], Iterable[str]] | None = None,
+                 ignored: Callable[[str, str], bool] | None = None) -> None:
         self._on_transition: TransitionHook = on_transition or _noop
         self._on_readiness: ReadinessHook = on_readiness or _noop
         self._on_roll: RollHook = on_roll or _noop
@@ -115,6 +121,7 @@ class MarketCalendar:
         self._readiness_deferred: set[str] = set()          # adapters whose roll check waits for a window's end
         self._last_roll: int | None = None
         self._subscribed = subscribed_symbols
+        self._ignored = ignored
 
     # --- lifecycle ---------------------------------------------------------------------------------
     def init_from_schedule(self, schedule: CalendarSchedule, now_ms: int,
@@ -314,7 +321,7 @@ class MarketCalendar:
                 self._on_maintenance(adapter, False, None)
                 rolled = adapter in self._readiness_deferred
                 self._readiness_deferred.discard(adapter)
-                if any(opens_between(s.schedule, since, now_ms) for s in self._for_adapter(adapter)):
+                if any(opens_between(s.schedule, since, now_ms) for s in self._deciding(adapter)):
                     self._on_readiness(adapter, "maintenance ended after an open")
                 elif rolled:
                     self._on_readiness(adapter, "maintenance ended after a roll")
@@ -322,6 +329,8 @@ class MarketCalendar:
     def _check_pre_open(self, now_ms: int) -> None:
         for s in self._sessions.values():
             if s.state in (SessionState.OPEN, SessionState.ROLLOVER) or not s.in_pre_open_window(now_ms):
+                continue
+            if self._is_ignored(s.adapter_id, s.symbol):
                 continue
             nxt = s.next_open_ms(now_ms)
             if nxt is None:
@@ -337,6 +346,27 @@ class MarketCalendar:
 
     def _for_adapter(self, adapter_id: str) -> Iterable[MarketSession]:
         return (s for k, s in self._sessions.items() if k[0] == adapter_id)
+
+    def _is_ignored(self, adapter_id: str, symbol: str) -> bool:
+        """A symbol only the market-data layer subscribes (`ignored`). A raising predicate ignores nothing (logged):
+        the symbol then decides like any scheduled one, as without the market-data layer."""
+        if self._ignored is None:
+            return False
+        try:
+            return bool(self._ignored(adapter_id, symbol))
+        except Exception:
+            log.exception("ignored(%s, %s) failed: the symbol decides like any scheduled one", adapter_id, symbol)
+            return False
+
+    def _deciding(self, adapter_id: str) -> list[MarketSession]:
+        """Every scheduled session of the adapter that may decide something (not `ignored`)."""
+        return [s for s in self._for_adapter(adapter_id) if not self._is_ignored(s.adapter_id, s.symbol)]
+
+    def schedule_of(self, adapter_id: str, symbol: str) -> SymbolSchedule | None:
+        """The versioned schedule of one (adapter, symbol), or None when it is not scheduled (the ARM's bar grid,
+        plan S36b: which 15m buckets are open and when a closed period ends)."""
+        s = self._sessions.get((adapter_id, symbol))
+        return None if s is None else s.schedule
 
     def session_state(self, adapter_id: str, symbol: str) -> SessionState | None:
         s = self._sessions.get((adapter_id, symbol))
@@ -360,7 +390,7 @@ class MarketCalendar:
         every scheduled symbol of the adapter when no provider is wired, the provider raises, or none of the
         subscribed symbols is scheduled (an adapter that never connected subscribes nothing, yet its liveness and
         the dead-man's 'not STREAMING while market open' must still be judged)."""
-        every = list(self._for_adapter(adapter_id))
+        every = self._deciding(adapter_id)
         if self._subscribed is None:
             return every
         try:
@@ -405,7 +435,7 @@ class MarketCalendar:
         OPEN_BY_EVIDENCE (PRE_OPEN at open - 10 min, m11, or CLOSED after 30 min quiet), so the bound never moves
         back to an earlier scheduled open (fail closed: the account must be reconciled after it)."""
         best: int | None = None
-        for s in self._for_adapter(adapter_id):
+        for s in self._deciding(adapter_id):
             cand = s.last_open_ms(now_ms)
             if s.state is SessionState.OPEN_BY_EVIDENCE and s.entered_ms is not None:
                 cand = max(cand or 0, s.entered_ms)

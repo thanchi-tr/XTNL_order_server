@@ -27,6 +27,9 @@ Rules every mutating command follows:
   from the stored row before commit; `ruleset activate` re-validates the stored row and makes it the single
   active row. Both run unfenced under a table lock (not engine state) with the audit row in the same
   transaction.
+* **ARM and market data** (plan S34): `self.arm` (`src/ops/arm.py`) holds the `arm ...` / `md ...` commands; they use
+  the same transactions and audit rows (`audit`, `fenced`, `plain`, `refused` are the public names of the helpers
+  below). `arm_controls` and `arm_accepted` are written only there, unfenced under a table lock like `rulesets`.
 """
 from __future__ import annotations
 
@@ -65,6 +68,7 @@ from src.runtime.etcd import SAFE_HOLD_KEY
 from src.runtime.roles import ClusterState
 
 from src.ops import sql as S
+from src.ops.arm import ArmContext, ArmOps
 from src.ops.etcd import OpsEtcd
 from src.ops.halt import InTxHaltStore, OpsHaltStore, OpsHaltTxn, clear_detail, resolved_transitions
 from src.ops.model import Actor, OpsRefused, OpsUsageError, Report, iso_ms
@@ -110,11 +114,21 @@ class OpsService:
     post-bump backend termination) and an optional etcd client."""
 
     def __init__(self, conn: PgConnection, etcd: OpsEtcd | None = None, *, etcd_timeout_s: float = 2.0,
-                 clock_ms: Callable[[], int] = _ms) -> None:
+                 clock_ms: Callable[[], int] = _ms, arm: ArmContext | None = None) -> None:
         self._conn = conn
         self._etcd = etcd
         self._etcd_timeout = etcd_timeout_s
         self._clock_ms = clock_ms
+        #: The ARM / market-data commands (`src/ops/arm.py`, plan S34) over this connection and its audit rows.
+        self.arm = ArmOps(self, arm or ArmContext(), etcd, etcd_timeout_s=etcd_timeout_s)
+
+    # ------------------------------------------------------------------ shared with src/ops/arm.py
+    @property
+    def conn(self) -> PgConnection:
+        return self._conn
+
+    def clock_ms(self) -> int:
+        return self._clock_ms()
 
     # ------------------------------------------------------------------ transactions and audit
     async def _audit(self, conn: PgConnection | FencedTx, command: str, target: str | None, actor: Actor,
@@ -176,6 +190,12 @@ class OpsService:
             report.command, target, actor, "refused", {"code": refusal.code, "detail": refusal.detail,
                                                         **(detail or {})})
         return report
+
+    # the same helpers under public names for the ARM commands (src/ops/arm.py)
+    audit = _audit
+    fenced = _fenced
+    plain = _plain
+    refused = _refused
 
     # ------------------------------------------------------------------ SAFE_HOLD
     async def safe_hold_status(self) -> Report:

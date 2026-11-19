@@ -17,6 +17,7 @@ from src.adapters.base import (
 )
 from src.adapters.pepperstone import PepperstoneAdapter
 from src.adapters.pepperstone.probe import run as run_probe
+from src.adapters.pepperstone.protocol import Frame
 from src.adapters.pepperstone.tokens import InMemoryTokenStore, TokenPair
 from src.dto import AccountDTO, AccountLive, CashFlowDTO, OrderDTO, OrderStatus, PositionDTO, PriceDTO
 
@@ -427,11 +428,39 @@ async def test_spot_prices(fake: FakeCTrader) -> None:
         await adapter.ensure_ticks(["AUDUSD"])
         assert AUDUSD in fake.spot_subscriptions
         fake.push(2131, {"ctidTraderAccountId": ACCOUNT, "symbolId": AUDUSD, "bid": 65_001, "ask": 65_011})
-        [p4] = await take(ticks, 1)
+        added, p4 = await take(ticks, 2)
+        # design PR6: the symbol added on the live stream reports its own SUBSCRIBED, naming it
+        assert isinstance(added, StreamEvent) and added.kind == StreamEventKind.SUBSCRIBED
+        assert added.market == "AUDUSD"
         assert isinstance(p4, PriceDTO) and p4.symbol == "AUDUSD" and p4.ask == Decimal("0.65011")
+        await adapter.ensure_ticks(["AUDUSD"])                     # already subscribed: no second event
     finally:
         await close_gen(ticks)
         await wait_until(lambda: not fake.spot_subscriptions)    # unsubscribed when the stream ends
+        await adapter.close()
+
+
+async def test_a_refused_kept_spot_never_fails_the_stream_asked_for(fake: FakeCTrader) -> None:
+    """S05 review: a spot kept from an earlier ensure_ticks (e.g. a tick-only symbol) but not asked for now is
+    subscribed again on its own; the broker refusing it is only logged, the stream reports SUBSCRIBED, and
+    `subscribed_price_markets` names only what is really subscribed (no interval for the refused one)."""
+    adapter = await connected(fake)
+
+    def refuse_audusd(sock: Any, frame: dict[str, Any]) -> None:
+        if frame["payloadType"] == 2127 and frame["payload"]["symbolId"] == [AUDUSD]:
+            fake.errors.setdefault(2127, []).append("INVALID_REQUEST")
+
+    fake.on_request = refuse_audusd
+    await adapter.ensure_ticks(["AUDUSD"])            # no price stream yet: only remembered
+    assert adapter.subscribed_price_markets == frozenset()
+    ticks = adapter.stream_ticks(["EURUSD"])
+    try:
+        [sub] = await take(ticks, 1)
+        assert isinstance(sub, StreamEvent) and sub.kind == StreamEventKind.SUBSCRIBED and sub.market is None
+        assert fake.spot_subscriptions == {EURUSD}
+        assert adapter.subscribed_price_markets == frozenset({"EURUSD"})
+    finally:
+        await close_gen(ticks)
         await adapter.close()
 
 
@@ -544,6 +573,28 @@ async def test_order_stream_overflow_opens_a_gap(fake: FakeCTrader) -> None:
         assert isinstance(items[0], StreamEvent) and items[0].kind == StreamEventKind.GAP
         assert [i.broker_order_id for i in items[1:] if isinstance(i, OrderDTO)] == ["1000", "1001"]
     finally:
+        await adapter.close()
+
+
+async def test_price_overflow_is_counted_per_symbol(fake: FakeCTrader) -> None:
+    """design PR6: spot frames dropped for a full price channel are counted per canonical symbol (monotonic,
+    never a gap); a symbol id without a known symbol is keyed by its id."""
+    adapter = await connected(fake, queue_size=2)
+    ticks = adapter.stream_ticks(["EURUSD", "USDJPY"])
+    try:
+        [sub] = await take(ticks, 1)
+        assert isinstance(sub, StreamEvent) and sub.kind == StreamEventKind.SUBSCRIBED
+        for i in range(4):
+            fake.push(2131, {"ctidTraderAccountId": ACCOUNT, "symbolId": EURUSD, "bid": 108_500 + i, "ask": 108_520})
+        fake.push(2131, {"ctidTraderAccountId": ACCOUNT, "symbolId": USDJPY, "bid": 15_512_300, "ask": 15_513_000})
+        await wait_until(lambda: adapter._channels["prices"].dropped_frames == 3)
+        assert adapter.dropped_price_frames == {"EURUSD": 2, "USDJPY": 1}
+        adapter._count_price_drop(Frame(2131, {"symbolId": 999_999}, None))
+        assert adapter.dropped_price_frames == {"EURUSD": 2, "USDJPY": 1, "999999": 1}
+        items = await take(ticks, 2)
+        assert all(isinstance(i, PriceDTO) for i in items)          # no GAP for prices
+    finally:
+        await close_gen(ticks)
         await adapter.close()
 
 

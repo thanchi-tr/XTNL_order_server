@@ -56,6 +56,11 @@ class SecretsError(RuntimeError):
     """The secrets source is misconfigured or could not be read (names only, never values)."""
 
 
+class SecretsUnavailable(SecretsError):
+    """The secret could not be read just now (an AWS, IMDS or network error): retrying may succeed, unlike the
+    configuration errors above (a missing variable, a malformed secret). Names only, never values."""
+
+
 class SecretsSource(Protocol):
     @property
     def kind(self) -> SourceKind: ...
@@ -185,7 +190,7 @@ class AwsSecretsManager:
         try:
             reply = self._client.call("GetSecretValue", {"SecretId": self._secret_id})
         except AwsError as exc:
-            raise SecretsError(f"cannot read the secret: {exc}") from None
+            raise SecretsUnavailable(f"cannot read the secret: {exc}") from None
         text = reply.get("SecretString")
         if not isinstance(text, str):
             raise SecretsError("secret has no SecretString (binary secrets are not supported)")

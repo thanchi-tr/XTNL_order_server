@@ -9,6 +9,14 @@ One off-node page "SAFE_HOLD set". Due when 3 terms end abnormally (`lost`, `ini
 or more than 6 epoch changes happen within 30 min (only terms ended after the last resume count). The row
 `cluster_state.safe_hold = true` is durable and mirrored to etcd `/xtnl/safe_hold`.
 
+On the single PC (`XTNL_SINGLE_PC=1`, [single-pc-autostart.md](single-pc-autostart.md) "SAFE_HOLD on this PC")
+the engine resumes a hold itself after a cool-down, audited as operator `system.single-pc-auto-resume`; this
+runbook applies there once it pages `SAFE_HOLD auto-resume stopped on the single PC` (6 auto-resumes within 24 h).
+That page goes straight to the configured alert channels (there is no leader to relay it); with none configured it
+is a `PAGE[critical]` log line that `deploy\local\status-xtnl.ps1` lists. A resume by you starts a fresh
+auto-resume budget on that PC. The AWS nodes never set the flag (the engine refuses it under systemd): there every
+resume is this runbook's.
+
 ## Checks
 
 ```

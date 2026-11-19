@@ -281,6 +281,17 @@ groups:
           summary: "A TLS certificate expires within 30 days"
           spec: "certificate expiry alert at 30 days"
           runbook: "docs/runbooks/off-node-alerts.md#xtnlcertexpiry"
+      - alert: XtnlCertUnreadable
+        expr: "min by (node, cert) (xtnl_cert_readable) == 0 or (max by (node) (xtnl_exporter_up) unless on (node) count by (node) (xtnl_cert_readable{cert=~\"etcd-client|etcd-peer|etcd-server|pg-server|patroni-rest|patroni-etcd-client|patroni-ca|redis-proxy|redis-proxy-client-ca|ca|etcd-witness-server|etcd-witness-peer|deadman-receiver|dashboard-heartbeat\"}) >= 14)"
+        for: 15m
+        labels:
+          severity: warning
+          team: xtnl
+          depends_on_epoch: "false"
+        annotations:
+          summary: "A TLS certificate is unreadable, does not verify, or is not watched on this node"
+          spec: "unreadable-certificate alert"
+          runbook: "docs/runbooks/off-node-alerts.md#xtnlcertunreadable"
       - alert: XtnlEventLoopLag
         expr: "max by (node) (xtnl_event_loop_lag_seconds) > 0.1"
         for: 30s
@@ -325,6 +336,28 @@ groups:
           summary: "The Oversee feed observer is not acknowledging entries"
           spec: "oldest un-acked feed entry > 30 s"
           runbook: "docs/runbooks/off-node-alerts.md#xtnlfeedpendingold"
+      - alert: XtnlArmFailed
+        expr: "max(xtnl_arm_failed_scopes) > 0"
+        for: 1m
+        labels:
+          severity: critical
+          team: xtnl
+          depends_on_epoch: "false"
+        annotations:
+          summary: "The ARM has a FAILED scope: no advice for its positions until it is cleared (see arm failed show)"
+          spec: "ARM FAILED scopes (arm_failed_scopes) off-node backstop"
+          runbook: "docs/runbooks/off-node-alerts.md#xtnlarmfailed"
+      - alert: XtnlRedisMdMemoryHigh
+        expr: "max by (node) (xtnl_md_redis_used_memory_ratio) > 0.7"
+        for: 2m
+        labels:
+          severity: warning
+          team: xtnl
+          depends_on_epoch: "false"
+        annotations:
+          summary: "redis-md above 70 % of maxmemory (noeviction; md-writer sheds TICK data in its fixed order)"
+          spec: "redis-md memory at 70 % of maxmemory (design §A2)"
+          runbook: "docs/runbooks/off-node-alerts.md#xtnlredismdmemoryhigh"
       - alert: XtnlClockOffset
         expr: "max by (node) (abs(xtnl_clock_offset_seconds)) > 0.05"
         for: 1m

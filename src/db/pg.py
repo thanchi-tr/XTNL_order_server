@@ -27,7 +27,7 @@ import json
 import logging
 import socket
 import sys
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from decimal import Decimal
 from typing import Any, Final, Protocol
@@ -183,21 +183,34 @@ class AsyncpgConnection:
 
 
 class AsyncpgSource:
-    """ConnectionSource over an asyncpg pool."""
+    """ConnectionSource over an asyncpg pool. `wrap` (plan S38f): applied to every acquired connection, e.g. the
+    0014-schema `src.db.schema_compat.LegacyConnection`; None hands out the plain connection."""
 
-    def __init__(self, pool: Any) -> None:
+    def __init__(self, pool: Any, wrap: Callable[[PgConnection], PgConnection] | None = None) -> None:
         self._pool = pool
+        self._wrap = wrap
+
+    @property
+    def legacy_schema(self) -> bool:
+        """The pool runs every statement in its pre-0015 form (an older schema was detected at creation)."""
+        return self._wrap is not None
 
     @asynccontextmanager
     async def _acquire(self) -> AsyncIterator[PgConnection]:
         async with self._pool.acquire() as raw:
-            yield AsyncpgConnection(raw)
+            conn: PgConnection = AsyncpgConnection(raw)
+            yield conn if self._wrap is None else self._wrap(conn)
 
     def acquire(self) -> AbstractAsyncContextManager[PgConnection]:
         return self._acquire()
 
     async def close(self) -> None:
         await self._pool.close()
+
+    def terminate(self) -> None:
+        """Drop every connection at once without waiting for the server (asyncpg `Pool.terminate()`): the
+        DRAINING fallback for a pool whose graceful close did not finish inside its budget (design RT-M6)."""
+        self._pool.terminate()
 
 
 def pool_kwargs(
@@ -227,15 +240,40 @@ async def create_asyncpg_source(
     connect_timeout_s: float = 3.0,
     min_size: int = 1,
     max_size: int = 10,
+    schema_check: bool = True,
 ) -> AsyncpgSource:
     """Engine pool (asyncpg, binary protocol). application_name carries the epoch (see
     epoch.application_name) so a newer leader can terminate an older epoch's backends after the bump
-    (operations.md §2). TCP keepalives (~5 s) are set on every pooled connection by `init_connection`."""
+    (operations.md §2). TCP keepalives (~5 s) are set on every pooled connection by `init_connection`.
+    `schema_check` (plan S38f): one catalog read at creation; on a schema without the 0015 columns every
+    statement runs in its 0014 form (`src.db.schema_compat`)."""
     asyncpg = importlib.import_module("asyncpg")  # untyped library: imported dynamically
     pool = await asyncpg.create_pool(dsn, **pool_kwargs(
         application_name=application_name, statement_timeout_ms=statement_timeout_ms,
         connect_timeout_s=connect_timeout_s, min_size=min_size, max_size=max_size))
-    return AsyncpgSource(pool)
+    if not schema_check:
+        return AsyncpgSource(pool)
+    try:
+        return await with_schema_compat(pool)
+    except BaseException:
+        await pool.close()
+        raise
+
+
+async def with_schema_compat(pool: Any) -> AsyncpgSource:
+    """An AsyncpgSource over `pool` that runs every statement in its 0014 form when the schema has no 0015
+    columns (migrations held back by `XTNL_MIGRATIONS_ACCEPTED_UPTO`, plan S38f); else a plain one."""
+    compat = importlib.import_module("src.db.schema_compat")   # imports the stores: loaded on first use only
+    plain = AsyncpgSource(pool)
+    async with plain.acquire() as conn:
+        rewriter = await compat.rewriter_for(conn)
+    if rewriter is None:
+        return plain
+
+    def wrap(conn: PgConnection) -> PgConnection:
+        out: PgConnection = compat.LegacyConnection(conn, rewriter)
+        return out
+    return AsyncpgSource(pool, wrap)
 
 
 def text_array(values: Sequence[object]) -> list[str | None]:

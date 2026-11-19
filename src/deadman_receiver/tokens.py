@@ -85,9 +85,12 @@ class TokenRing:
     """The accepted tokens. Owned by the receiver's event loop (not thread-safe); `load` must not block."""
 
     def __init__(self, initial: TokenSet, *, load: Callable[[], Mapping[str, str]] | None = None,
-                 invalidate: Callable[[], None] | None = None, overlap_ms: int = DEFAULT_OVERLAP_S * 1000) -> None:
+                 invalidate: Callable[[], None] | None = None, overlap_ms: int = DEFAULT_OVERLAP_S * 1000,
+                 parse: Callable[[Mapping[str, str]], TokenSet] = token_set, label: str = "dead-man receiver") -> None:
         self._set = initial
         self._load = load
+        self._parse = parse          # K10: the dashboard's heartbeat listener reads its own keys (heartbeat.json)
+        self._label = label
         self._invalidate = invalidate
         self._overlap_ms = overlap_ms
         self._retired: dict[str, int] = {}            # token -> accepted until (receiver ms)
@@ -100,6 +103,16 @@ class TokenRing:
     def current(self) -> TokenSet:
         return self._set
 
+    @property
+    def overlap_ms(self) -> int:
+        """How long a replaced token is still accepted. Settable (K10: the dashboard re-reads `token_overlap_s`);
+        a new value applies to tokens replaced from then on, never to one already in its overlap."""
+        return self._overlap_ms
+
+    @overlap_ms.setter
+    def overlap_ms(self, value: int) -> None:
+        self._overlap_ms = int(value)
+
     def retired_count(self, now_ms: int) -> int:
         return sum(1 for until in self._retired.values() if until > now_ms)
 
@@ -109,20 +122,20 @@ class TokenRing:
         if self._load is None:
             return
         try:
-            new = token_set(self._load())
+            new = self._parse(self._load())
         except TokenError as exc:
             if self.issue != str(exc):
-                log.error("dead-man receiver token source invalid (keeping the last valid tokens): %s", exc)
+                log.error("%s token source invalid (keeping the last valid tokens): %s", self._label, exc)
             self.issue = str(exc)
             return
         except Exception as exc:   # the source itself (e.g. the secret not read yet): keep the last valid set
             msg = f"token source unreadable ({type(exc).__name__})"
             if self.issue != msg:
-                log.error("dead-man receiver %s; keeping the last valid tokens", msg)
+                log.error("%s %s; keeping the last valid tokens", self._label, msg)
             self.issue = msg
             return
         if self.issue is not None:
-            log.warning("dead-man receiver token source valid again")
+            log.warning("%s token source valid again", self._label)
         self.issue = None
         if new == self._set:
             return
@@ -134,7 +147,7 @@ class TokenRing:
             self._retired.pop(t, None)
         self._set = new
         self.rotations += 1
-        log.warning("dead-man receiver tokens rotated: %s; the replaced token is accepted for %d s more",
+        log.warning("%s tokens rotated: %s; the replaced token is accepted for %d s more", self._label,
                     "current + next" if new.next is not None else "current only", self._overlap_ms // 1000)
 
     def match(self, presented: str, now_ms: int) -> Slot | None:
@@ -158,7 +171,7 @@ class TokenRing:
             return False
         if slot != self._last_slot:
             # Lets the operator see when the engine switched (rotation step 3: promote the next token).
-            log.info("dead-man heartbeat authenticated with the %s token", slot)
+            log.info("%s: heartbeat authenticated with the %s token", self._label, slot)
             self._last_slot = slot
         return True
 
@@ -171,7 +184,7 @@ class TokenRing:
         try:
             self._invalidate()
         except Exception as exc:
-            log.warning("dead-man receiver: secret re-read request failed (%s)", type(exc).__name__)
+            log.warning("%s: secret re-read request failed (%s)", self._label, type(exc).__name__)
 
 
 __all__ = ["DEFAULT_OVERLAP_S", "TOKEN_NEXT_VAR", "TOKEN_OVERLAP_VAR", "TOKEN_VAR", "TokenError", "TokenRing",

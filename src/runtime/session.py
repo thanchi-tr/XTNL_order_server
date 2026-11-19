@@ -39,6 +39,10 @@ Runtime wiring (IMPLEMENTATION_PLAN 5.6):
 * PRE_OPEN readiness checks each adapter's token validity (> 24 h);
 * operator requests: `reset_task`, `release_account` (RiskSweep.release_account) and `refresh_cash_flows`
   (the orchestrator's rate-limited cash-flow fetch);
+* operator requests of other kinds (S10, design §B13): read only once an optional service registered a handler for
+  the kind (`register_request_handler`; the pending query filters on the core kinds plus the registered ones, so an
+  unhandled kind stays pending and never hides a core request); handlers are non-blocking and may accept a request
+  for their owning task, which answers it later through `complete_request` (src/runtime/request_handlers.py);
 * notifications follow the secrets source (`RotatingChannels`, re-read on an auth error) and the installed
   ruleset's re-page cadence;
 * telemetry: `metrics_samples()` (src/runtime/telemetry.py) and JSON log fields (`epoch` per term,
@@ -72,6 +76,19 @@ Runtime wiring (IMPLEMENTATION_PLAN 7.4):
   (`PgLocalStateWithAccounts`) so a row without broker_seq inherits the stored one after a restart;
 * 7.2: only subscribed symbols (`_wanted_symbols`) decide an adapter's OPEN; LEADER_INIT step 5 seeds the pre-close
   reference quotes from `last_clean_marks` (`seed_calendar_quotes`); the sweep marks under `calendar.mark_session`.
+* S05 (design PR5, IN-11): tick-only symbols never join `_wanted_symbols` and are never SM10 evidence; the broker
+  schedule is fetched for `_wanted_symbols` plus `md_schedule_symbols` (empty until the market-data layer is wired).
+* S09 (design §A2 / §A8; RT-M1, RT-M6, RT-M12): `start_optional_services()` at LEADER entry adds the
+  `optional-bootstrap` task only when `XTNL_MD_ENABLED=1` and a factory is wired (S31; off by default); the price
+  hook calls the late-bound market-data hook first behind its own guard, then the SM10 path unchanged; `aclose`
+  closes the HTTP client, the term pool and every registered extra closer in parallel inside `drain_aclose_s`, and
+  terminates what is still open.
+* S32 (design §A2, §B14, PR4, PR13; plan RT-2): the optional services' runtime view (`set_optional_view`, set by the
+  production plan in `src/runtime/optional_plan.py`) fills the dead-man's optional ARM fields and adds the market-data
+  and ARM metric series to `metrics_samples`; every read of it is contained (a raising view reports nothing). A
+  tick-only symbol (`IngestionOrchestrator.is_md_only`) never decides SM10's market, its latest open, its PRE_OPEN
+  readiness, the open RESYNCING or a clean-mark write (`MarketCalendar(ignored=...)`, the S05 open point 6), so a
+  stored tick-only schedule changes nothing for ingestion, the gate or Oversee.
 
 DRAINING budget (operations.md §4): close + DLQ flush + spill + end_reason + cluster flush + close-out
 (`SessionTimings.drain_budget_s`) plus the supervisor stop and the lease revoke must fit inside the
@@ -90,6 +107,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import inspect
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Coroutine, Iterable, Mapping, Sequence
@@ -118,8 +136,14 @@ from src.db.account_sampler import AccountLiveSampler, LiveSampleStore
 from src.db.epoch import Epoch
 from src.db.gate_reader import GateInputs
 from src.db.lifecycle import LifecycleRunner, PartitionMaintenance
-from src.db.operator_requests import RequestPayloadError, parse_cash_flow_refresh, parse_release
+from src.db.operator_requests import (
+    CORE_REQUEST_KINDS,
+    RequestPayloadError,
+    parse_cash_flow_refresh,
+    parse_release,
+)
 from src.db.repository import TieredStateCommitter, TieredStreamHealth
+from src.db.schema_compat import optional_payload_stored
 from src.db.snapshot_reader import SnapshotInputs
 from src.adapters.base import StreamEvent
 from src.dto import AccountDTO, AccountLive, CashFlowDTO, OrderDTO, PositionDTO, PriceDTO
@@ -138,7 +162,7 @@ from src.notifications.rotation import RotatingChannels
 from src.notifications.settings import DeadmanSettings, NotificationSettings
 from src.oversee.config import OverseeConfig
 from src.oversee.feed import FeedObserver
-from src.oversee.gate import ActionGate
+from src.oversee.gate import Action, ActionGate, GateContextReader
 from src.oversee.halt import HaltStore, HaltSwitch, HaltTxn
 from src.oversee.inhibit import EPOCH_SETTLE_MS, AlertInhibitor
 from src.oversee.notify import NotificationDispatcher, OutboxRow, Severity
@@ -164,15 +188,36 @@ from src.pubsub.orchestrator import AdapterRefresher, IngestionOrchestrator
 from src.pubsub.spooler import DlqSpooler
 from src.runtime.catchup import CatchupCoordinator, CatchupMetrics, CatchupSettings, CatchupStore
 from src.runtime.cluster import ClusterControl
-from src.runtime.deadman import DeadmanSender, DeadmanTransport, HttpsDeadmanTransport
+from src.runtime.deadman import ArmFailedBeat, DeadmanSender, DeadmanTransport, HttpsDeadmanTransport
 from src.runtime.exits import ExitFn, hard_exit
 from src.runtime.ingestion_control import ConsumerSwitches, OrchestratorIngestionControl, OrchestratorReconciler
 from src.runtime.leader_init import LeaderInitDeps, SodOutcome, is_fence_loss
 from src.runtime.maintenance import MaintenanceSource
-from src.runtime.ports import AuthRearmReader, LeaderPorts, MarketSessionStore, OperatorRequestQueue, PortsFactory
+from src.runtime.optional_settings import OptionalFlags
+from src.runtime.ports import (
+    AuthRearmReader,
+    LeaderPorts,
+    MarketSessionStore,
+    OperatorRequest,
+    OperatorRequestQueue,
+    PortsFactory,
+)
 from src.runtime.probes import BrokerTlsMonitor
+from src.runtime.request_handlers import (
+    HANDLER_ERROR,
+    HANDLER_NOT_SYNC,
+    Accepted,
+    Applied,
+    HandlerResult,
+    Moot,
+    Refused,
+    RequestHandler,
+    RequestResult,
+    check_kind,
+)
 from src.runtime.roles import BrokerLink, EndReason
 from src.runtime.schedule_refresh import SCHEDULE_REFRESH_MS, SCHEDULE_RETRY_MS, ScheduleRefresher
+from src.runtime.sleeplog import SleepFenceLog
 from src.runtime.supervisor import TaskContext, TaskSpec, TaskSupervisor
 from src.oversee.dayroll import latest_roll_ms, trading_day_for_roll
 from src.pubsub.tradingday import last_roll_ms
@@ -186,6 +231,15 @@ DEFAULT_MAX_CLEAN_SPREAD_PIPS: Final = Decimal("5")
 OPERATOR_TASK: Final = "operator"
 # The dead-man pass-age key while the RiskSweep has not listed the accounts once in this term (7.4).
 UNLISTED_ACCOUNTS: Final = "<accounts not listed yet>"
+# K3: the NO_BOOT enqueue -> SM8 signal is rate-limited to one per second (SM8's serve loop re-checks every 5 s). A
+# write suppressed inside the interval gets one trailing signal at the interval's end, so it waits <= ~1 s, not 5 s.
+NO_BOOT_SIGNAL_MIN_S: Final = 1.0
+# K14: the dead-man beat re-reads the gate's halt / epoch inputs right before each POST, bounded by this; a read that
+# fails or overruns reports gate_state CLOSED and SM5 UNKNOWN for that beat (fail closed).
+BEAT_VIEW_REFRESH_S: Final = 2.0
+# K14: the gate probe the dead-man view reads engine_epoch through (a risk-reducing action on no account / adapter:
+# the reader's per-account and per-adapter inputs are unused, only engine_epoch is taken from it).
+_BEAT_GATE_PROBE: Final = Action(account_id="", adapter_id="", risk_increasing=False, description="dead-man gate_state")
 _INCIDENT_SWITCH_STATES: Final = frozenset({IntegrityState.HALTED, IntegrityState.SWITCHING_OVER})
 # DRAINING time spent outside EngineSession.drain before the lease is released: the supervisor stopping its
 # (cancelled) tasks. The lease revoke itself is bounded by LeaseTimings.request_timeout_s.
@@ -195,6 +249,44 @@ DRAIN_SUPERVISOR_STOP_S: Final = 0.5
 DRAIN_CLUSTER_GRACE_S: Final = 0.1
 DRAIN_FINAL_SPILL_MIN_S: Final = 0.1
 DRAIN_STEP_SLACK_S: Final = DRAIN_CLUSTER_GRACE_S + DRAIN_FINAL_SPILL_MIN_S
+# S09 (design §A2 / §A8, RT-M1 / RT-M12): the one task `start_optional_services` may add, and the market-data hook's
+# own circuit on the price path (20 consecutive raises: skipped for 60 s, one page).
+OPTIONAL_BOOTSTRAP_TASK: Final = "optional-bootstrap"
+MD_HOOK_TRIP_AFTER: Final = 20
+MD_HOOK_SKIP_S: Final = 60.0
+
+#: The market-data layer's tick hook (design §A8): pure, O(1), never awaits; set late by the optional bootstrap.
+MdHook = Callable[[PriceDTO, bool], None]
+#: The market-data layer's per-market price-interval hook (`MdHook.on_price_subscription`): pure, never awaits.
+MdSubscriptionHook = Callable[[str, str, bool, int], None]
+#: The market-data layer's receipt-gap frame hook (`MdHook.note_frame`, plan S39b): pure, never awaits.
+MdFrameHook = Callable[[str, "str | None", int], None]
+#: Builds the `optional-bootstrap` TaskSpec for a term's session (set from build_engine in S31; None until then).
+OptionalBootstrap = Callable[["EngineSession"], TaskSpec]
+#: An extra close step registered by an optional service: (name, graceful async close, drop-now fallback or None).
+ExtraCloser = tuple[str, Callable[[], Awaitable[None]], Callable[[], None] | None]
+
+
+class OptionalView(Protocol):
+    """What the optional services report to the session (S32): in memory, no I/O, never a price or value."""
+
+    def arm_active(self) -> bool: ...
+
+    def arm_oldest_undelivered_notification_ms(self) -> int | None: ...
+
+    def arm_overdue_positions(self) -> int | None: ...
+
+    def arm_failed(self) -> ArmFailedBeat | None: ...
+
+    def metrics_samples(self) -> list[Sample]: ...
+
+
+def _arm_active(view: OptionalView) -> bool:
+    """Whether the ARM runs behind `view`; a raising view counts as running (fail closed)."""
+    try:
+        return bool(view.arm_active())
+    except Exception:
+        return True
 
 
 def _wall_ms() -> int:
@@ -258,7 +350,7 @@ class SessionTimings:
     drain_spill_s: float = 1.5             # after drain_flush_s: write what is left to the local spill file
     drain_record_s: float = 0.75
     drain_cluster_s: float = 0.25          # pending fenced cluster_state writes
-    drain_aclose_s: float = 0.5            # HTTP client + term pool close
+    drain_aclose_s: float = 0.5            # HTTP client + term pool + extra closers, in parallel; then terminate
     consumer_poll_s: float = 1.0
     spooler_interval_s: float = 0.5
     housekeeping_s: float = 10.0
@@ -355,6 +447,72 @@ class SessionContext:
     catchup: CatchupSettings = field(default_factory=CatchupSettings)
     catchup_metrics: CatchupMetrics = field(default_factory=CatchupMetrics)
     engine_run_id: Callable[[], str | None] = lambda: None
+    # --- S09: optional market-data / ARM services (design §A2, §C2 Local flags; off by default) -------------
+    # The tolerant parse of XTNL_MD_ENABLED / XTNL_ARM_ENABLED (src/runtime/optional_settings.py) and the factory of
+    # the `optional-bootstrap` task (None until S31). Neither is ever needed by ingestion or Oversee.
+    optional_flags: OptionalFlags = field(default_factory=OptionalFlags)
+    optional_bootstrap: OptionalBootstrap | None = None
+    # --- S38g (round 14): the node-local record of sleep fences (src/runtime/sleeplog.py; None in unit rigs). The
+    # ARM leaves a sleep's restart out of its unclean-restart count and reports each sleep restart once.
+    sleep_log: SleepFenceLog | None = None
+
+
+class MarketDataHookGuard:
+    """The market-data hook's own failure circuit on the price path (design §A8, RT-M12): a raise is counted and
+    swallowed (the calendar path after it always runs); after `trip_after` consecutive raises the hook is skipped
+    for `skip_s`, and the first trip pages once. A good call resets the streak. Logs carry the error type only,
+    never the tick (no market data in logs)."""
+
+    def __init__(self, page: Callable[[str, str, str], None], *, trip_after: int = MD_HOOK_TRIP_AFTER,
+                 skip_s: float = MD_HOOK_SKIP_S, clock: Callable[[], float] = time.monotonic) -> None:
+        self._page = page
+        self._trip_after = trip_after
+        self._skip_s = skip_s
+        self._clock = clock
+        self._skip_until: float | None = None
+        self._paged = False
+        self.consecutive = 0
+        self.raised = 0
+        self.skipped = 0
+        self.trips = 0
+
+    @property
+    def skipping(self) -> bool:
+        return self._skip_until is not None and self._clock() < self._skip_until
+
+    def call(self, hook: MdHook, tick: PriceDTO, snapshot: bool) -> None:
+        if self._skip_until is not None:
+            if self._clock() < self._skip_until:
+                self.skipped += 1
+                return
+            self._skip_until = None
+        try:
+            hook(tick, snapshot)
+        except Exception as exc:
+            self.raised += 1
+            self.consecutive += 1
+            if self.consecutive == 1:
+                log.warning("market-data hook raised %s; the calendar path continues", type(exc).__name__)
+            if self.consecutive >= self._trip_after:
+                self._trip(type(exc).__name__)
+            return
+        self.consecutive = 0
+
+    def _trip(self, error: str) -> None:
+        self.trips += 1
+        self.consecutive = 0
+        self._skip_until = self._clock() + self._skip_s
+        log.error("market-data hook skipped for %.0f s after %d consecutive errors (last: %s)",
+                  self._skip_s, self._trip_after, error)
+        if self._paged:
+            return
+        self._paged = True
+        try:
+            self._page("high", "market-data hook failing",
+                       f"{self._trip_after} consecutive errors (last: {error}); the hook is skipped for "
+                       f"{self._skip_s:.0f} s at a time; ingestion and the market calendar are unaffected")
+        except Exception:
+            log.exception("market-data hook page failed")
 
 
 class _TrackingCommitter:
@@ -598,6 +756,11 @@ def _ingest_stream(item: object) -> str:
     return "account"
 
 
+def _no_md_symbols(adapter_id: str) -> tuple[str, ...]:
+    """No market-data symbols (the default until the market-data layer is wired)."""
+    return ()
+
+
 class _ObservedOrchestrator(IngestionOrchestrator):
     """The orchestrator plus telemetry on its parser path (still synchronous, no I/O): broker events read per
     (adapter, stream), and the JSON log fields (client_order_id / position_id / account_id) of the item
@@ -641,6 +804,7 @@ class _DlqPriorityBridge(OrchestratorDlqBridge):
 
     async def reread_entity(self, adapter_id: str, event_type: Literal["ORDER", "POSITION", "ACCOUNT"],
                             entity_id: str) -> OrderDTO | PositionDTO | AccountDTO | None:
+        """The DLQ check-before-retry re-read: origin `dlq` (design PR8, set by `OrchestratorDlqBridge`)."""
         with rest_priority(RestPriority.DLQ):
             return await super().reread_entity(adapter_id, event_type, entity_id)
 
@@ -663,13 +827,16 @@ class _DlqPriorityBridge(OrchestratorDlqBridge):
 
 
 class _TimedRiskSweep(RiskSweep):
-    """RiskSweep recording the duration of its last complete pass over all accounts (metrics)."""
+    """RiskSweep recording the duration of its last complete pass over all accounts (metrics) and whether its last
+    pass found PostgreSQL unreachable (the "PostgreSQL unreachable" condition the ARM's error budget reads, S31)."""
 
     last_full_pass_s: float | None = None
+    dependency_down: bool = False
 
     async def run_pass(self, accounts: Sequence[str] | None = None) -> PassReport:
         started = time.monotonic()
         report = await super().run_pass(accounts)
+        self.dependency_down = report.dependency_down
         if accounts is None and not report.dependency_down:
             self.last_full_pass_s = time.monotonic() - started
         return report
@@ -798,10 +965,37 @@ class EngineSession:
         self._drain_jobs: set[asyncio.Future[int]] = set()   # DRAINING spooler flushes (never cancelled)
         self.halt_level_name: str | None = None
         # SM5 is out of UNKNOWN only while halt:state is present and its event id = MAX(halt_events.id) (the
-        # gate's own test, SM5 edge hx); refreshed by housekeeping, False until the first good read (8.2).
+        # gate's own test, SM5 edge hx); refreshed by housekeeping and right before each dead-man beat (K14), False
+        # until the first good read (8.2).
         self.halt_state_current = False
+        # K14: PostgreSQL engine_epoch still holds this node's epoch (the gate's `epoch_mismatch` test), read with the
+        # halt fields; False until the first good read and after any read error (fail closed).
+        self.engine_epoch_current = False
+        # Concurrent refreshes (housekeeping, the dead-man beat): a read that started earlier never overwrites one
+        # that started later.
+        self._halt_view_seq = 0
+        self._halt_view_applied = 0
         self.oldest_unacked_feed_ms: int | None = None
         self._feed_lag_paged = False
+        # S09: optional services. The market-data hook is late-bound (`set_md_hook`, S31) and runs first on the price
+        # path behind its own guard; extra closers join `aclose`; problems of the enable flags page once per term.
+        self._md_hook: MdHook | None = None
+        self._suspend_listeners: list[Callable[[int | None], None]] = []
+        self._md_guard = MarketDataHookGuard(self.page)
+        # S31: the market-data layer's per-market price-interval hook (`MdHook.on_price_subscription`), late-bound.
+        self._md_sub_hook: MdSubscriptionHook | None = None
+        # S39b: the receipt-gap detector's per-adapter frame hook (`MdHook.note_frame`), late-bound.
+        self._md_frame_hook: MdFrameHook | None = None
+        self._extra_closers: list[ExtraCloser] = []
+        self._optional_problems_paged = False
+        # S32: the optional services' runtime view (dead-man ARM fields, metric series); None while they are off.
+        self.optional_view: OptionalView | None = None
+        # S10: operator-request handlers of the optional services (design §B13, RT-M10). kind -> handler; request id
+        # -> (kind, owning task, owner seen registered) while an accepted request waits for its answer; request id ->
+        # stored result text once the owning task answered (the operator loop consumes it on its next pass).
+        self._request_handlers: dict[str, RequestHandler] = {}
+        self._accepted_requests: dict[int, tuple[str, str, bool]] = {}
+        self._request_answers: dict[int, str] = {}
 
         self.ports: LeaderPorts = ctx.ports(epoch)
         ports = self.ports
@@ -817,7 +1011,13 @@ class EngineSession:
 
         # --- Redis half, ingestion -------------------------------------------------------------------
         self.identity = BootIdentity(lambda: epoch.label, self._run_id)
-        self.no_boot = NoBootQueue()
+        # K3 (tier-persistence.md §2): a post-commit write refused with NO_BOOT (or lost to a Redis error) is kept
+        # AND signals the integrity worker's SM8, which replays it (or rebuilds Redis) at once. At most one signal per
+        # NO_BOOT_SIGNAL_MIN_S (monotonic), so a Redis outage under steady commits never spins SM8's serve loop; a
+        # write queued inside that interval is still replayed by SM8's own periodic pass (every 5 s).
+        self._no_boot_signalled_at: float | None = None
+        self._no_boot_trailing: asyncio.TimerHandle | None = None     # the one pending trailing signal (K3)
+        self.no_boot = NoBootQueue(on_enqueue=self._on_no_boot_enqueued)
         self.cache = RedisState(redis, self.identity.expected, no_boot=self.no_boot)
         # Rule configuration (4.5): the RiskSweep and the clean-spread thresholds read the installed ruleset.
         self.rules = ActiveRuleset(cfg, clock_ms=ctx.clock_ms)
@@ -844,7 +1044,9 @@ class EngineSession:
             on_price_tick=self._on_price_tick, on_execution=self._on_execution, pager=self.page,
             market_open=self._liveness_alerting, price_staleness_suppressed=self._price_alerts_muted,
             transfer_sources=ctx.transfer_sources, refresh_adapter=ctx.refresh_adapter,
-            clean_spread=clean_spread)
+            clean_spread=clean_spread, on_price_subscription=self._on_price_subscription,
+            optional_payload=optional_payload_stored,   # S38f: pre-0015 row shapes on an older schema
+            on_stream_frame=self._on_stream_frame)      # S39b: the receipt-gap detector's heartbeat feed
         for a in self.adapters:
             self.orchestrator.add_adapter(a)
         self.switches = ConsumerSwitches()
@@ -865,17 +1067,22 @@ class EngineSession:
                                        on_maintenance=self._on_maintenance,
                                        expected_adapters=lambda: self.adapter_ids,
                                        on_maintenance_notice=self._on_maintenance_notice,
-                                       subscribed_symbols=self._wanted_symbols)
+                                       subscribed_symbols=self._wanted_symbols,
+                                       ignored=self.orchestrator.is_md_only)
         self.schedule_loader = _RecordingScheduleLoader(ports.schedule)
         self.calendar_init = ScheduledCalendarInit(self.schedule_loader, self.calendar, adapters=self.adapter_ids)
         self.readiness = ReadinessDispatcher(_ReadinessActions(self))
         self._closes_cache: dict[tuple[str, int, int], dict[SymbolKey, int]] = {}
         self.market_sessions: MarketSessionStore | None = getattr(ports, "market_sessions", None)
         self.schedule_refresher: ScheduleRefresher | None = None
+        #: Market-data symbols that need a schedule too (tick-only and pre-warm symbols, design PR5 / IN-11): a
+        #: callable adapter_id -> symbols, empty until the market-data layer is wired (S32). Schedules only:
+        #: SM10's adapter OPEN still follows `_wanted_symbols`.
+        self.md_schedule_symbols: Callable[[str], Iterable[str]] = _no_md_symbols
         if self.market_sessions is not None:
             self.schedule_refresher = ScheduleRefresher(
                 self.market_sessions, adapter_ids=lambda: self.adapter_ids, adapter=self.orchestrator.adapter,
-                ready=self._adapter_streaming, wanted_symbols=self._wanted_symbols,
+                ready=self._adapter_streaming, wanted_symbols=self._schedule_symbols,
                 stored_symbols=self._stored_symbols, reload=self._reload_calendar,
                 calendar_version=lambda: self.calendar.version, pager=self.page, clock_ms=ctx.clock_ms,
                 refresh_ms=self._t.schedule_refresh_ms, retry_ms=self._t.schedule_retry_ms)
@@ -918,10 +1125,11 @@ class EngineSession:
                 sweep_now=self.sweep.sweep_now, poll_s=self._t.ruleset_poll_s)
         self.feed = FeedObserver(_PacedFeedStream(RedisFeedStream(redis, ctx.node_id)), self.sweep, self.identity.expected,
                                  ports.feed_quarantine, ctx.clock_ms, pager=self._oversee_page)
-        self.gate = ActionGate(ports.gate_reader(GateInputs(
+        self._gate_reader: GateContextReader = ports.gate_reader(GateInputs(
             node_epoch=self._node_epoch, lease_valid=self._lease_valid, settle_until_ms=lambda: self._settle_until,
             sweep_view=self.sweep.account_view, clock_ms=ctx.clock_ms, latest_open_ms=self._latest_open,
-            sweep_interval_ms=cfg.sweep.interval_ms, catchup_verified=self._catchup_verified)))
+            sweep_interval_ms=cfg.sweep.interval_ms, catchup_verified=self._catchup_verified))
+        self.gate = ActionGate(self._gate_reader)
 
         # --- integrity --------------------------------------------------------------------------------
         self.sm8 = RedisBootstrap(redis, self.cache, ports.integrity_db, self.identity, self.no_boot,
@@ -977,6 +1185,153 @@ class EngineSession:
                                   maintenance=self.calendar.in_maintenance(aid), streaming=streaming)
         return out
 
+    def start_optional_services(self) -> None:
+        """LEADER entry (the NodeController calls it right after `machine.go(LEADER)`; design §A2, RT-M1):
+        synchronous, never awaits. Pages the enable flags' problems once per term; with `XTNL_MD_ENABLED` off (the
+        default) it adds nothing. With it on and a bootstrap factory wired (S31), it adds the one non-critical
+        `optional-bootstrap` task, idempotently (`TaskSupervisor.has`). A raise here is caught by the controller,
+        which pages and keeps the term; the factory never runs in DRAINING or after `aclose`."""
+        flags = self.ctx.optional_flags
+        if flags.problems and not self._optional_problems_paged:
+            self._optional_problems_paged = True
+            self.page("high", "optional services settings", "; ".join(flags.problems))
+        if not flags.md_enabled:
+            return
+        factory = self.ctx.optional_bootstrap
+        if factory is None:
+            log.warning("%s: no optional bootstrap is wired in this build; the market-data and ARM services stay off",
+                        "XTNL_MD_ENABLED=1")
+            return
+        sup = self._sup
+        if sup is None or self._draining or self._closed or sup.has(OPTIONAL_BOOTSTRAP_TASK):
+            return
+        spec = factory(self)
+        if spec.name != OPTIONAL_BOOTSTRAP_TASK:
+            raise ValueError(f"optional bootstrap task must be named {OPTIONAL_BOOTSTRAP_TASK!r}, not {spec.name!r}")
+        if spec.critical:
+            raise ValueError("optional bootstrap task must not be leadership-critical")
+        sup.add(spec)
+
+    def set_md_hook(self, hook: MdHook | None) -> None:
+        """Bind (or unbind) the market-data tick hook late (the optional bootstrap, S31; RT-M12). A new hook gets a
+        fresh failure guard."""
+        self._md_guard = MarketDataHookGuard(self.page)
+        self._md_hook = hook
+
+    def set_md_subscription_hook(self, hook: MdSubscriptionHook | None) -> None:
+        """Bind (or unbind) the market-data layer's per-market price-interval hook (S31, design PR6). It is called from
+        the orchestrator's own guarded hook (an error there is logged and never touches the socket path)."""
+        self._md_sub_hook = hook
+
+    def set_md_frame_hook(self, hook: MdFrameHook | None) -> None:
+        """Bind (or unbind) the receipt-gap detector's frame hook (plan S39b, go-live gate `receipt_gap_feed`). It
+        is called from the orchestrator's own guarded hook on every prices-stream heartbeat (an error there is logged
+        and never touches the socket path)."""
+        self._md_frame_hook = hook
+
+    def _on_stream_frame(self, adapter_id: str, market: str | None, ts_ms: int) -> None:
+        hook = self._md_frame_hook
+        if hook is not None:
+            hook(adapter_id, market, ts_ms)
+
+    def _on_price_subscription(self, adapter_id: str, market: str, subscribed: bool, ts_ms: int) -> None:
+        hook = self._md_sub_hook
+        if hook is not None:
+            hook(adapter_id, market, subscribed, ts_ms)
+
+    def add_optional_task(self, spec: TaskSpec) -> bool:
+        """Add a task of the optional services (the optional bootstrap's plan, S31 / S32), idempotently through
+        `TaskSupervisor.has`. Never a leadership-critical task, never in DRAINING or after `aclose`. True when added."""
+        if spec.critical:
+            raise ValueError("optional tasks must not be leadership-critical")
+        sup = self._sup
+        if sup is None or self._draining or self._closed or self._stop.is_set() or sup.has(spec.name):
+            return False
+        sup.add(spec)
+        return True
+
+    def has_task(self, name: str) -> bool:
+        sup = self._sup
+        return sup is not None and sup.has(name)
+
+    def degraded_tasks(self) -> list[str]:
+        """The tasks whose circuit is open now (the ARM-global clear probe's `CircuitView`, S32)."""
+        sup = self._sup
+        return [] if sup is None else sup.degraded()
+
+    def set_optional_view(self, view: OptionalView | None) -> None:
+        """Bind (or unbind) the optional services' runtime view (S32)."""
+        self.optional_view = view
+
+    @property
+    def http_client(self) -> httpx.AsyncClient | None:
+        """The term's HTTP client (built at LEADER_INIT step 7; None before), shared by the ARM relay's channels."""
+        return self._http
+
+    @property
+    def stopping(self) -> bool:
+        """DRAINING or closed: optional services start nothing new."""
+        return self._draining or self._closed or self._stop.is_set()
+
+    @property
+    def stop_event(self) -> asyncio.Event:
+        """The term's stop flag (set at DRAINING); the optional tasks watch it."""
+        return self._stop
+
+    def pg_last_fenced_commit_ms(self) -> int | None:
+        """The term pool's last successful commit (None: not tracked by these ports, or none yet)."""
+        read = self.ports.last_fenced_commit_ms
+        return None if read is None else read()
+
+    def sweep_pg_unreachable(self) -> bool:
+        """The RiskSweep's last pass found PostgreSQL unreachable."""
+        return self.sweep.dependency_down
+
+    def register_closer(self, name: str, close: Callable[[], Awaitable[None]],
+                        terminate: Callable[[], None] | None = None) -> bool:
+        """An optional service's close step (the ARM pool, the `redis-md` clients; S31): `aclose` runs it in
+        parallel with the HTTP client and the term pool inside `drain_aclose_s`, and calls `terminate` (no await)
+        if it has not finished by then (design §A2 DRAINING, RT-M6). False after `aclose` (nothing registered: the
+        caller drops its resource itself)."""
+        if self._closed:
+            return False
+        self._extra_closers.append((name, close, terminate))
+        return True
+
+    # ================================================================================ operator-request handlers
+    def register_request_handler(self, kind: str, handler: RequestHandler) -> None:
+        """Register the handler of a non-core request kind (the optional bootstrap, S31; design §B13). From the next
+        operator pass the kind is read with the core kinds and its requests go to `handler`, which must be
+        non-blocking (`src/runtime/request_handlers.py`). A request filed before the handler registered (same epoch)
+        is still pending and is applied then. Registering a kind again replaces its handler."""
+        check_kind(kind)
+        if kind in CORE_REQUEST_KINDS:
+            raise ValueError(f"{kind!r} is a core request kind; the session consumes it itself")
+        self._request_handlers[kind] = handler
+
+    def unregister_request_handler(self, kind: str) -> None:
+        """Stop reading `kind` (its pending requests stay pending). Its accepted, unanswered requests are forgotten, so
+        a handler registered again later receives them again."""
+        self._request_handlers.pop(kind, None)
+        for rid in [rid for rid, (k, _, _) in self._accepted_requests.items() if k == kind]:
+            if rid not in self._request_answers:
+                del self._accepted_requests[rid]
+
+    def request_kinds(self) -> frozenset[str]:
+        """The kinds the pending query reads: the core kinds plus every registered one (RT-M10)."""
+        return CORE_REQUEST_KINDS | frozenset(self._request_handlers)
+
+    def complete_request(self, request_id: int, result: RequestResult) -> bool:
+        """The owning task's answer to a request its handler accepted. Synchronous and free of I/O: the answer is
+        recorded and the operator loop marks the request consumed (fenced) on its next pass. False when the request
+        is not an accepted one of this session (already answered, re-dispatched, or another term's)."""
+        if not isinstance(result, (Applied, Refused, Moot)):
+            raise TypeError("complete_request takes Applied, Refused or Moot")
+        if self._closed or request_id not in self._accepted_requests or request_id in self._request_answers:
+            return False
+        self._request_answers[request_id] = result.result()
+        return True
+
     def streaming_adapters(self) -> Mapping[str, bool]:
         return {aid: self.orchestrator.runtime(aid).conn.state is ConnState.STREAMING for aid in self.adapter_ids}
 
@@ -1007,10 +1362,23 @@ class EngineSession:
             return getattr(self.ports, "catchup", None) is None
         return catchup.verified(adapter_id)
 
+    def add_suspend_listener(self, listener: Callable[[int | None], None]) -> None:
+        """Called with the suspended time (ms, or None) on every `resume_after_sleep` of this term (round 14, plan
+        S38g: the optional services' BarClock latch and md-writer). Synchronous, no I/O; a raise is logged."""
+        self._suspend_listeners.append(listener)
+
     def resume_after_sleep(self, suspended_ms: int | None = None) -> bool:
-        """The process was suspended (UptimeTracker): force SM4 RESYNCING and a `resume_after_sleep` catch-up for
-        every adapter (fence held until each one finished). False when this session runs no catch-up."""
-        if self.catchup is None or self._draining or self._closed:
+        """The process was suspended (UptimeTracker): tell the suspend listeners (round 14), then force SM4
+        RESYNCING and a `resume_after_sleep` catch-up for every adapter (fence held until each one finished). False
+        when this session runs no catch-up."""
+        if self._draining or self._closed:
+            return False
+        for listener in list(self._suspend_listeners):
+            try:
+                listener(suspended_ms)
+            except Exception as exc:
+                log.warning("suspend listener failed (%s)", type(exc).__name__)
+        if self.catchup is None:
             return False
         self.catchup.resume_after_sleep(suspended_ms)
         return True
@@ -1086,26 +1454,69 @@ class EngineSession:
         return any(not j.done() for j in self._drain_jobs)
 
     async def aclose(self, timeout_s: float = 5.0) -> None:
-        """Release what the term holds (HTTP client, term pool, background work), within `timeout_s`.
-        Idempotent."""
+        """Release what the term holds (HTTP client, term pool, registered extra closers, background work) within
+        `timeout_s`. The close steps run in parallel (design §A2 DRAINING, RT-M6); a step still running at the
+        deadline is cancelled and its `terminate` fallback (the term pool's `Pool.terminate()`, no await) drops it,
+        so a hung close never holds DRAINING past `drain_aclose_s`. Nothing is flushed. Idempotent."""
         if self._closed:
             return
         self._closed = True
         self._stop.set()
+        if self._no_boot_trailing is not None:
+            self._no_boot_trailing.cancel()
+            self._no_boot_trailing = None
         clear_epoch_if(self.epoch.label)
         for t in list(self._background):
             t.cancel()
+        steps: list[ExtraCloser] = []
+        if self._http is not None:
+            steps.append(("http client", self._http.aclose, None))
+        steps.append(("term pool", self.ports.close, self.ports.terminate))
+        steps.extend(self._extra_closers)
+        self._extra_closers = []
 
-        async def close_all() -> None:
-            if self._http is not None:
-                with contextlib.suppress(Exception):
-                    await self._http.aclose()
-            await self.ports.close()
+        async def run(close: Callable[[], Awaitable[None]]) -> None:
+            await close()
 
+        def drop(job: asyncio.Future[None], name: str,
+                 terminate: Callable[[], None] | None) -> None:
+            job.cancel()
+            job.add_done_callback(_retrieve)
+            if terminate is not None:
+                try:
+                    terminate()
+                except Exception as exc:
+                    log.warning("terminating %s failed: %r", name, exc)
+
+        jobs: dict[asyncio.Future[None], ExtraCloser] = {asyncio.ensure_future(run(s[1])): s for s in steps}
         try:
-            await asyncio.wait_for(close_all(), timeout_s)
-        except Exception as exc:
-            log.warning("closing the term pool failed: %r", exc)
+            _, pending = await asyncio.wait(jobs, timeout=max(0.0, timeout_s))
+        except asyncio.CancelledError:
+            # Cancelled from outside: `_closed` is already set, so a retry would do nothing. Drop every step still
+            # running now (cancel + terminate), or the term pool would be left open with no one to close it.
+            for job, (name, _close, terminate) in jobs.items():
+                if not job.done():
+                    log.warning("aclose cancelled; closing %s dropped", name)
+                    drop(job, name, terminate)
+            raise
+        for job, (name, _close, terminate) in jobs.items():
+            if job in pending:
+                log.warning("closing %s did not finish within %.1f s; dropped", name, timeout_s)
+                drop(job, name, terminate)
+            elif not job.cancelled():
+                err = job.exception()
+                if err is not None and name != "http client":      # an HTTP close error is of no consequence
+                    log.warning("closing %s failed: %r", name, err)
+
+    @property
+    def aclose_budget_s(self) -> float:
+        """The term's own close budget (`drain_aclose_s`), the one DRAINING gives `aclose` (K2)."""
+        return self._t.drain_aclose_s
+
+    async def aclose_for_abort(self) -> None:
+        """K2: the close of a term aborted at LEADER_INIT (SAFE_HOLD due), within the same `drain_aclose_s` budget
+        DRAINING gives `aclose`, so the aborted term holds the lease no longer than a drained one would."""
+        await self.aclose(self._t.drain_aclose_s)
 
     def spill_torn_bytes(self) -> int:
         """The `<spill>.torn` size this term's drain service last saw (its tails are already paged): the
@@ -1250,7 +1661,7 @@ class EngineSession:
                                      is_leader=self.ctx.lease.holds_lease, client=self._http,
                                      clock_ms=self._clock, token=self.ctx.deadman.token,
                                      token_source=self.ctx.deadman_token, on_auth_error=invalidate,
-                                     copies=copies)
+                                     copies=copies, prepare=self.refresh_beat_view)
         sender = self.deadman
         self._add(self._monitored("deadman", 60.0, lambda ctx: sender.run(self._stop, stamp=ctx.stamp),
                                   self_stamping=True))
@@ -1396,23 +1807,54 @@ class EngineSession:
     async def refresh_halt_view(self) -> None:
         """The dead-man halt fields: the effective level from PostgreSQL `halt_events` and whether SM5 is out of
         UNKNOWN, i.e. Redis `halt:state` is present and carries MAX(halt_events.id) (the gate's
-        `halt_state_missing` / `halt_state_not_current` test). Any read error leaves SM5 UNKNOWN (fail closed)."""
-        max_id: int | None = None
+        `halt_state_missing` / `halt_state_not_current` test), plus whether `engine_epoch` still holds this node's
+        epoch (the gate's `epoch_mismatch` test, K14). Any read error leaves SM5 UNKNOWN and the epoch not current
+        (fail closed). A refresh that started before another one never overwrites its result."""
+        self._halt_view_seq += 1
+        seq = self._halt_view_seq
+        epoch_ok = await self._engine_epoch_is_ours()
+        level: str | None = None
+        current = False
         try:
             status = await self.halt.status()
-            self.halt_level_name = status.effective_level.name
-            max_id = status.event_id
         except Exception as exc:
-            self.halt_state_current = False
             log.warning("halt status unreadable: %r", exc)
-            return
+        else:
+            level = status.effective_level.name
+            try:
+                mirrored = await self.halt_mirror.read()
+            except Exception as exc:
+                log.warning("halt:state unreadable: %r", exc)
+            else:
+                current = mirrored is not None and status.event_id is not None and mirrored[1] == status.event_id
+        if seq < self._halt_view_applied:
+            return                                   # a refresh that started later has already landed
+        self._halt_view_applied = seq
+        self.engine_epoch_current = epoch_ok
+        self.halt_state_current = current
+        if level is not None:
+            self.halt_level_name = level
+
+    async def _engine_epoch_is_ours(self) -> bool:
+        """engine_epoch = this node's epoch, read through the gate's own reader (one PostgreSQL round trip and the
+        Redis gate keys). Any error: False."""
         try:
-            mirrored = await self.halt_mirror.read()
+            gctx = await self._gate_reader.read(_BEAT_GATE_PROBE)
+        except Exception as exc:
+            log.warning("engine_epoch unreadable for gate_state: %r", exc)
+            return False
+        return gctx.engine_epoch is not None and gctx.engine_epoch == self.epoch.token
+
+    async def refresh_beat_view(self) -> None:
+        """K14: run right before each dead-man beat, so gate_state / halt_level / SM5 describe the state at the beat
+        (a HARD trip, a lost halt:state, a moved engine_epoch) instead of the last 10 s housekeeping pass. Bounded by
+        BEAT_VIEW_REFRESH_S; an overrun or error reports the gate CLOSED and SM5 UNKNOWN for this beat."""
+        try:
+            await asyncio.wait_for(self.refresh_halt_view(), BEAT_VIEW_REFRESH_S)
         except Exception as exc:
             self.halt_state_current = False
-            log.warning("halt:state unreadable: %r", exc)
-            return
-        self.halt_state_current = mirrored is not None and max_id is not None and mirrored[1] == max_id
+            self.engine_epoch_current = False
+            log.warning("dead-man view refresh failed (%s); gate_state CLOSED for this beat", type(exc).__name__)
 
     async def _oldest_pending_ms(self) -> int | None:
         info = await self.redis.xpending(K.FEED, FEED_GROUP)
@@ -1536,25 +1978,93 @@ class EngineSession:
             self.page("info", f"adapter re-armed: {aid}", f"generation {gen} re-armed by an operator")
 
     async def _consume_operator_requests(self) -> None:
+        """Consume this epoch's requests of the kinds this session can act on (design §B13, RT-M10): first the answers
+        the owning tasks gave to accepted requests, then the pending core kinds (handled here) and registered kinds
+        (dispatched to their non-blocking handler). A row of any other kind is never consumed: it stays pending.
+
+        Accepted, unanswered requests are left out of the pending query (they take no slot of its LIMIT 50, so
+        requests waiting on a hung owner never hide a core one). An owner task that was registered and has since
+        gone gets its request dispatched again; one that was not registered when the request was accepted is waited
+        for, without calling the handler again (no repeated enqueue into a queue nobody reads)."""
         queue = self.operator_requests
-        if queue is None or self._sup is None:
+        sup = self._sup
+        if queue is None or sup is None:
             return
-        for req in await queue.pending(self.epoch.token):
-            if req.kind == "reset_task":
-                try:
-                    self._sup.reset_task(req.target, req.operator)
-                    result = "applied"
-                except KeyError:
-                    result = "unknown_task"
-            elif req.kind == "release_account":
-                result = self._release_account(req.target, req.operator, req.payload)
-            elif req.kind == "refresh_cash_flows":
-                result = await self._refresh_cash_flows(req.target, req.operator, req.payload)
+        for rid, answer in list(self._request_answers.items()):
+            kind, owner, _ = self._accepted_requests.get(rid, ("?", "?", True))
+            log.warning("operator request %d %s answered by %s: %s", rid, kind, owner, answer)
+            await queue.consume(self.epoch.token, rid, answer)
+            self._request_answers.pop(rid, None)
+            self._accepted_requests.pop(rid, None)
+        for rid, (kind, owner, seen) in list(self._accepted_requests.items()):
+            if sup.has(owner):
+                if not seen:
+                    self._accepted_requests[rid] = (kind, owner, True)
+            elif seen:
+                log.warning("operator request %d %s: owning task %s is gone; dispatching it again", rid, kind, owner)
+                del self._accepted_requests[rid]
+        for req in await queue.pending(self.epoch.token, self.request_kinds(), sorted(self._accepted_requests)):
+            if req.request_id in self._accepted_requests:
+                continue                              # its owning task answers it (a queue that ignores `exclude`)
+            if req.kind in CORE_REQUEST_KINDS:
+                result = await self._core_request(req, sup)
             else:
-                result = "unsupported_kind"
+                handler = self._request_handlers.get(req.kind)
+                if handler is None:
+                    continue                          # not read by the query; a fake or a race: leave it pending
+                outcome = self._dispatch_request(handler, req)
+                if isinstance(outcome, Accepted):
+                    running = sup.has(outcome.owner_task)
+                    self._accepted_requests[req.request_id] = (req.kind, outcome.owner_task, running)
+                    log.warning("operator request %d %s %s by %s: accepted by %s%s", req.request_id, req.kind,
+                                req.target, req.operator, outcome.owner_task,
+                                "" if running else " (not registered; waiting for it)")
+                    continue
+                result = outcome.result()
             log.warning("operator request %d %s %s by %s: %s", req.request_id, req.kind, req.target,
                         req.operator, result)
             await queue.consume(self.epoch.token, req.request_id, result)
+
+    async def _core_request(self, req: OperatorRequest, sup: TaskSupervisor) -> str:
+        """The core kinds (`CORE_REQUEST_KINDS`); `unsupported_kind` only for a core kind without a branch here."""
+        if req.kind == "reset_task":
+            try:
+                sup.reset_task(req.target, req.operator)
+            except KeyError:
+                return "unknown_task"
+            return "applied"
+        if req.kind == "release_account":
+            return self._release_account(req.target, req.operator, req.payload)
+        if req.kind == "refresh_cash_flows":
+            return await self._refresh_cash_flows(req.target, req.operator, req.payload)
+        return "unsupported_kind"
+
+    @staticmethod
+    def _dispatch_request(handler: RequestHandler, req: OperatorRequest) -> HandlerResult:
+        """Call a registered handler (synchronous, non-blocking). A raise or a result that is not a HandlerResult is
+        a handler bug: stored as `refused:handler_error`, logged with the error type only. An awaitable is stopped
+        (a coroutine closed unrun, a Task or Future cancelled, so nothing keeps running unsupervised) and stored as
+        `refused:handler_not_sync` (a handler must never await on the operator loop)."""
+        try:
+            out: object = handler(req)
+        except Exception as exc:
+            log.error("operator request %d %s: handler raised %s", req.request_id, req.kind, type(exc).__name__)
+            return HANDLER_ERROR
+        if inspect.isawaitable(out):
+            for stop in ("close", "cancel"):
+                fn = getattr(out, stop, None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception as exc:
+                        log.error("operator request %d %s: %s of the awaitable raised %s", req.request_id,
+                                  req.kind, stop, type(exc).__name__)
+            log.error("operator request %d %s: handler returned an awaitable", req.request_id, req.kind)
+            return HANDLER_NOT_SYNC
+        if not isinstance(out, (Applied, Refused, Moot, Accepted)):
+            log.error("operator request %d %s: handler returned %s", req.request_id, req.kind, type(out).__name__)
+            return HANDLER_ERROR
+        return out
 
     def _release_account(self, target: str, operator: str, payload: object) -> str:
         """`python -m src.ops account release`: the RiskSweep releases its quarantine of the account (the next
@@ -1626,8 +2136,16 @@ class EngineSession:
         return sorted(accts)
 
     def _on_price_tick(self, tick: PriceDTO, snapshot: bool) -> None:
-        """SM10 open-market evidence (4.8): every tick, on the parser path (pure, no I/O)."""
-        if self.calendar.version is None:
+        """The composite price hook, on the parser path (pure, no I/O; design §A8, RT-M12). First the late-bound
+        market-data hook (None until S31) behind its own guard (`MarketDataHookGuard`), independent of the
+        calendar's "no schedule loaded" guard; whatever it does, the calendar path below runs unchanged.
+        SM10 open-market evidence (4.8): every tick. A tick-only symbol's tick (design PR5) is the market-data
+        layer's, never SM10 evidence: it would otherwise move that symbol's session (and with it an open resync or
+        a calendar flag) although nothing held needs it."""
+        hook = self._md_hook
+        if hook is not None:
+            self._md_guard.call(hook, tick, snapshot)
+        if self.calendar.version is None or self.orchestrator.is_md_only(tick.adapter_id, tick.symbol):
             return
         self.calendar.on_tick(tick.adapter_id, tick.symbol, tick.bid, tick.ask, tick.timestamp_ms, self._clock(),
                               snapshot=snapshot)
@@ -1642,6 +2160,51 @@ class EngineSession:
     def _credential_generation(self, adapter_id: str) -> str:
         # The adapter the orchestrator drives now: a rotated replacement reports its own generation.
         return self.ctx.credential_generation(self.orchestrator.adapter(adapter_id))
+
+    def _on_no_boot_enqueued(self) -> None:
+        """NoBootQueue.on_enqueue (K3, tier-persistence.md §2): a committed write's Redis copy was refused NO_BOOT or
+        lost to a Redis error. Signal SM8 (never blocks): with redis:boot_id current it replays the queue at once,
+        otherwise it runs the in-place bootstrap. Before SM8 exists (construction) or after close, nothing to do: the
+        LEADER_INIT bootstrap replays the queue itself (step 5)."""
+        sm8 = getattr(self, "sm8", None)
+        if sm8 is None or self._closed:
+            return
+        now = time.monotonic()
+        last = self._no_boot_signalled_at
+        if last is not None and now - last < NO_BOOT_SIGNAL_MIN_S:
+            self._schedule_trailing_no_boot_signal(NO_BOOT_SIGNAL_MIN_S - (now - last))
+            return
+        self._signal_sm8_no_boot("NO_BOOT: post-commit Redis write queued", now)
+
+    def _signal_sm8_no_boot(self, reason: str, now: float) -> None:
+        self._no_boot_signalled_at = now
+        try:
+            self.sm8.signal(reason)
+        except Exception as exc:                      # never fail the commit path over a signal
+            log.warning("SM8 signal failed (%s)", type(exc).__name__)
+
+    def _schedule_trailing_no_boot_signal(self, delay_s: float) -> None:
+        """K3: a write queued inside the rate-limit interval (e.g. just after SM8 took its replay snapshot) gets one
+        signal at the interval's end, so it is replayed within ~1 s instead of SM8's 5 s pass. At most one trailing
+        signal is pending; still at most one signal per NO_BOOT_SIGNAL_MIN_S."""
+        if self._no_boot_trailing is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:                          # no loop (sync caller): SM8's periodic pass covers it
+            return
+        self._no_boot_trailing = loop.call_later(max(0.0, delay_s), self._trailing_no_boot_signal)
+
+    def _trailing_no_boot_signal(self) -> None:
+        self._no_boot_trailing = None
+        if self._closed or getattr(self, "sm8", None) is None or not len(self.no_boot):
+            return                                    # closed, or the queue was already replayed
+        now = time.monotonic()
+        last = self._no_boot_signalled_at
+        if last is not None and now - last < NO_BOOT_SIGNAL_MIN_S:
+            self._schedule_trailing_no_boot_signal(NO_BOOT_SIGNAL_MIN_S - (now - last))
+            return
+        self._signal_sm8_no_boot("NO_BOOT: post-commit Redis write queued (trailing)", now)
 
     def _on_fence_lost(self, exc: BaseException) -> None:
         if self.ctx.on_fence_lost is not None:
@@ -1694,6 +2257,17 @@ class EngineSession:
     def _wanted_symbols(self, adapter_id: str) -> list[str]:
         rt = self.orchestrator.runtime(adapter_id)
         return sorted(rt.tick_symbols | rt.pending_symbols)
+
+    def _schedule_symbols(self, adapter_id: str) -> list[str]:
+        """The symbols whose broker schedule is fetched: the wanted (held) symbols plus the market-data layer's
+        tick-only and pre-warm symbols (IN-11). A failing `md_schedule_symbols` never stops the held symbols'
+        schedules: it is logged and left out."""
+        wanted = set(self._wanted_symbols(adapter_id))
+        try:
+            wanted.update(s for s in self.md_schedule_symbols(adapter_id) if isinstance(s, str) and s)
+        except Exception:
+            log.exception("%s: md_schedule_symbols failed (held symbols only)", adapter_id)
+        return sorted(wanted)
 
     def _stored_symbols(self, adapter_id: str) -> list[str]:
         schedule = self.schedule_loader.last
@@ -1779,14 +2353,22 @@ class EngineSession:
                 continue
             for acct in list(rt.accounts):
                 try:
-                    await self.orchestrator.reread_entity(aid, "ACCOUNT", acct)
+                    await self.orchestrator.reread_entity(aid, "ACCOUNT", acct, origin="snapshot")
                 except Exception as exc:
                     log.warning("%s: account snapshot %s failed: %r", aid, acct, exc)
 
     # --- calendar hooks (synchronous; I/O goes to background tasks) ---------------------------------------
+    def _md_only(self, adapter_id: str, symbol: str) -> bool:
+        try:
+            return adapter_id in self._by_id and self.orchestrator.is_md_only(adapter_id, symbol)
+        except Exception:
+            return False
+
     def _on_transition(self, t: SessionTransition) -> None:
         if t.old is t.new:
             return
+        if self._md_only(t.adapter_id, t.symbol):
+            return                  # a tick-only symbol: no clean mark, no open RESYNCING (S32, S05 open point 6)
         self._background_task(self.committer.force_clean_marks(t.adapter_id, [t.symbol]),
                               f"clean mark {t.adapter_id}:{t.symbol}")
         # operations.md §10 "At the open": every new market open the gate measures reconciliation against
@@ -1875,6 +2457,14 @@ class EngineSession:
         # 7.4: lost frames / skipped broker rows per stream (summed over adapters; cumulative for this term)
         for stream, n in sorted(self.orchestrator.frames_lost.items()):
             out.append(Sample("xtnl_frames_lost_total", float(n), {"stream": stream}))
+        view = self.optional_view
+        if view is not None:
+            try:
+                out += view.metrics_samples()
+            except Exception as exc:          # the optional services never cost the core series
+                log.warning("optional metric series not read (%s)", type(exc).__name__)
+                if _arm_active(view):         # fail closed: the off-node XtnlArmFailed still sees a FAILED
+                    out += gauge("xtnl_arm_failed_scopes", 1) + gauge("xtnl_arm_failed_global", 1)
         return out
 
     def risksweep_pass_ms(self) -> dict[str, int]:
@@ -1943,7 +2533,7 @@ class _ReadinessActions:
         if rt.conn.state is not ConnState.STREAMING:
             raise RuntimeError(f"{adapter_id} is not STREAMING")
         for acct in list(rt.accounts):
-            await self._s.orchestrator.reread_entity(adapter_id, "ACCOUNT", acct)
+            await self._s.orchestrator.reread_entity(adapter_id, "ACCOUNT", acct, origin="snapshot")
 
     async def fetch_cash_flows(self, adapter_id: str) -> None:
         rt = self._s.orchestrator.runtime(adapter_id)
@@ -1978,8 +2568,20 @@ class _DeadmanView:
         return self._s.epoch.label
 
     def gate_state(self) -> str | None:
+        """CLOSED in every case where ActionGate denies every action (oversee-rules.md §8; K14): SM8 not READY
+        (redis:boot_id not current), this node not holding the lease or its lease invalid (no node epoch), PostgreSQL
+        engine_epoch not this node's epoch or unreadable (`epoch_mismatch`), halt:state
+        not current (missing or behind MAX(halt_events.id), any read error included: SM5 UNKNOWN), the halt level
+        HARD or unknown, and while the term drains or is closed. OPEN otherwise: some action may pass (a SOFT level
+        still lets risk-reducing ones through; the per-account conditions are not part of this field)."""
         s = self._s
-        if not s.sm8.ready or not s.ctx.lease.lease_valid():
+        lease = s.ctx.lease
+        if not s.sm8.ready or not lease.holds_lease() or not lease.lease_valid() or not s.engine_epoch_current:
+            return "CLOSED"
+        if s._draining or s._closed or not s.halt_state_current:
+            return "CLOSED"
+        level = self.halt_level()
+        if level is None or level == HaltLevel.HARD.name:
             return "CLOSED"
         return "OPEN"
 
@@ -2038,3 +2640,28 @@ class _DeadmanView:
     def degraded(self) -> Sequence[str]:
         sup = self._s._sup
         return [] if sup is None else sup.degraded()
+
+    # optional ARM fields (PR4): from the optional services' view (S32); None while the ARM is off, so they are left
+    # out of the beat. A raising view never fails the beat: it reports None, except `arm_failed` (fail closed).
+    def arm_oldest_undelivered_notification_ms(self) -> int | None:
+        view = self._s.optional_view
+        try:
+            return None if view is None else view.arm_oldest_undelivered_notification_ms()
+        except Exception:
+            return None
+
+    def arm_overdue_positions(self) -> int | None:
+        view = self._s.optional_view
+        try:
+            return None if view is None else view.arm_overdue_positions()
+        except Exception:
+            return None
+
+    def arm_failed(self) -> ArmFailedBeat | None:
+        """A raising view reports one global FAILED while the ARM runs (fail closed: the receiver pages), None
+        otherwise."""
+        view = self._s.optional_view
+        try:
+            return None if view is None else view.arm_failed()
+        except Exception:
+            return ArmFailedBeat(1, True) if view is not None and _arm_active(view) else None

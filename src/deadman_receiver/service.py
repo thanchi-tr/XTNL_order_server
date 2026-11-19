@@ -13,6 +13,13 @@ invalid secret keeps the last valid tokens and pages `token_source`), then compa
 paged (critical), a condition still active is re-paged every `repage_s`, a cleared one sends a resolved notice
 (info). A daily test page at `test_page_utc` proves the path (operations.md §9), and a start-up notice shows
 receiver restarts. Nothing here reads or writes PostgreSQL or Redis, and nothing reaches a broker.
+
+K5 / K10 (operations.md §13): every `CERT_CHECK_S` the tick re-loads a changed TLS certificate / key in place
+(`ReloadingServerTls`; a pair that fails to load keeps the current one and pages `tls_reload`) and reads the watched
+certificates (`settings.certs`, its own included): one unreadable or within 30 days of expiry pages `cert:<name>`.
+With a `channels_source`, every `CHANNEL_REFRESH_S` the paging channel settings are re-read from the cached secret
+and changed ones rebuild the transports (`Pager.replace_transports`); a source with no usable channel keeps the
+current transports and pages `channel_source`.
 """
 from __future__ import annotations
 
@@ -28,7 +35,9 @@ from src.deadman_receiver.evaluate import MAX_BODY_BYTES, BeatError, Condition, 
 from src.deadman_receiver.pager import Pager
 from src.deadman_receiver.settings import ReceiverSettings
 from src.deadman_receiver.tokens import TokenRing, TokenSet
-from src.oversee.notify import AlertKind, AlertMessage, Severity
+from src.notifications.settings import NotificationSettings
+from src.observability.certs import CertReading, ReloadingServerTls, read_file_certs
+from src.oversee.notify import AlertKind, AlertMessage, AlertTransport, Severity
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +50,8 @@ _REASONS: Final = {200: "OK", 204: "No Content", 400: "Bad Request", 401: "Unaut
                    405: "Method Not Allowed", 409: "Conflict", 411: "Length Required", 413: "Payload Too Large",
                    431: "Request Header Fields Too Large"}
 SUBJECT_TAG: Final = "[XTNL DEADMAN]"
+CERT_CHECK_S: Final = 60            # K5 / K10: certificate expiry check and TLS file reload
+CHANNEL_REFRESH_S: Final = 60       # K10: paging channel credentials re-read from the cached secret
 
 
 def wall_ms() -> int:
@@ -58,10 +69,25 @@ def next_daily_ms(now_ms: int, hhmm: tuple[int, int]) -> int:
 
 class ReceiverService:
     def __init__(self, settings: ReceiverSettings, pager: Pager, *, clock_ms: Callable[[], int] = wall_ms,
-                 thresholds: Thresholds | None = None, tokens: TokenRing | None = None) -> None:
+                 thresholds: Thresholds | None = None, tokens: TokenRing | None = None,
+                 channels_source: Callable[[], NotificationSettings] | None = None,
+                 transports_for: Callable[[NotificationSettings], list[AlertTransport]] | None = None,
+                 read_certs: Callable[[], list[CertReading]] | None = None) -> None:
         self._s = settings
         self._pager = pager
         self._clock = clock_ms
+        # K10: rotation without restart of the paging channel credentials and of the server certificate.
+        self._channels_source = channels_source
+        self._transports_for = transports_for
+        self._channels = (settings.channels.email, settings.channels.push)
+        self._channel_issue: str | None = None
+        self._next_channel_ms = 0
+        self._tls: ReloadingServerTls | None = None
+        # K5: the watched certificates (its own TLS certificate included).
+        certs = dict(settings.certs)
+        self._read_certs = read_certs or (lambda: read_file_certs(certs))
+        self._cert_problems: dict[str, str] = {}
+        self._next_cert_ms = 0
         now = clock_ms()
         self.evaluator = Evaluator(started_ms=now, thresholds=thresholds or Thresholds())
         self.tokens = tokens or TokenRing(TokenSet(settings.token, settings.token_next),
@@ -114,11 +140,24 @@ class ReceiverService:
             out.append(self._msg("receiver started", self._body(
                 [f"dead-man receiver started; paging via {', '.join(self._pager.backends)}"], now), "info", "info"))
         self.tokens.refresh(now)
+        self._refresh_channels(now)
+        self._check_certs(now)
         active = self.evaluator.active(now)
         if self.tokens.issue is not None:
             active["token_source"] = Condition(
                 "token_source", "dead-man: receiver token source invalid",
                 f"{self.tokens.issue}; the last valid tokens stay accepted (deadman-alert.md, token rotation)")
+        if self._channel_issue is not None:
+            active["channel_source"] = Condition(
+                "channel_source", "dead-man: receiver paging channel source invalid",
+                f"{self._channel_issue}; the current channels stay in use (deadman-alert.md)")
+        if self._tls is not None and self._tls.issue is not None:
+            active["tls_reload"] = Condition(
+                "tls_reload", "dead-man: receiver TLS certificate not reloaded", self._tls.issue)
+        for name, problem in self._cert_problems.items():
+            active[f"cert:{name}"] = Condition(
+                f"cert:{name}", f"dead-man: {problem}",
+                f"{problem}; renew it from the internal CA (off-node-alerts.md XtnlCertExpiry)")
         for key, cond in active.items():
             last = self._last_paged.get(key)
             if key not in self._active:
@@ -143,6 +182,51 @@ class ReceiverService:
         if out:
             await asyncio.gather(*(self._pager.page(m) for m in out))
         await self._pager.retry_due()
+
+    def _refresh_channels(self, now: int) -> None:
+        """K10: rebuild the paging transports when the channel settings in the cached secret change."""
+        if self._channels_source is None or self._transports_for is None or now < self._next_channel_ms:
+            return
+        self._next_channel_ms = now + CHANNEL_REFRESH_S * 1000
+        try:
+            channels = self._channels_source()
+        except Exception as exc:                 # the source itself: keep the current channels
+            self._channel_issue = f"channel source unreadable ({type(exc).__name__})"
+            return
+        if channels.email is None and channels.push is None:
+            self._channel_issue = "no paging channel outside eu-west-2 in the source"
+            return
+        self._channel_issue = None
+        key = (channels.email, channels.push)
+        if key == self._channels:
+            return
+        try:
+            self._pager.replace_transports(self._transports_for(channels))
+        except Exception as exc:
+            self._channel_issue = f"paging channels not rebuilt ({type(exc).__name__})"
+            return
+        self._channels = key
+        log.warning("dead-man receiver paging channels reloaded (rotated credentials): %s",
+                    ", ".join(self._pager.backends))
+
+    def _check_certs(self, now: int) -> None:
+        """K5 / K10: reload a changed TLS certificate in place, and read the watched certificates."""
+        if now < self._next_cert_ms:
+            return
+        self._next_cert_ms = now + CERT_CHECK_S * 1000
+        if self._tls is not None:
+            self._tls.reload_if_changed()
+        try:
+            readings = self._read_certs()
+        except Exception as exc:
+            log.error("dead-man receiver certificate check failed: %s", type(exc).__name__)
+            return
+        problems: dict[str, str] = {}
+        for r in readings:
+            problem = r.problem(now / 1000.0)
+            if problem is not None:
+                problems[r.name] = problem
+        self._cert_problems = problems
 
     @property
     def active(self) -> dict[str, Condition]:
@@ -212,12 +296,12 @@ class ReceiverService:
         return self.on_beat(body)
 
     def ssl_context(self) -> ssl.SSLContext | None:
+        """The listener's TLS context, re-loaded in place when the certificate / key files change (K10)."""
         if self._s.tls_cert is None or self._s.tls_key is None:
             return None
-        ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        ctx.load_cert_chain(self._s.tls_cert, self._s.tls_key)
-        return ctx
+        if self._tls is None:
+            self._tls = ReloadingServerTls(self._s.tls_cert, self._s.tls_key)
+        return self._tls.context
 
     async def run(self, stop: asyncio.Event) -> None:
         server = await asyncio.start_server(self.handle, self._s.host, self._s.port, ssl=self.ssl_context(),

@@ -286,9 +286,11 @@ class DlqBroker(Protocol):
 
     async def reread_entity(self, adapter_id: str, event_type: Literal["ORDER", "POSITION", "ACCOUNT"],
                             entity_id: str) -> StatefulDTO | None:
-        """Read the broker's row and re-submit it versioned at its own read (IngestionOrchestrator). None is
-        absence only when the adapter recorded an explicit "not found" for this id (src.adapters.base.note_absent,
-        read through ``absence_probe``); the worker treats every other None as not converged."""
+        """Read the broker's row and re-submit it versioned at its own read (IngestionOrchestrator, origin `dlq`;
+        the bridge maps the orchestrator's `RereadResult` back to this contract: the broker's row whenever it had
+        one, whatever the version compare decided). None is absence only when the adapter recorded an explicit
+        "not found" for this id (src.adapters.base.note_absent, read through ``absence_probe``); the worker treats
+        every other None as not converged."""
         ...
 
     async def read_entity(self, adapter_id: str, event_type: Literal["ORDER", "POSITION", "ACCOUNT"],

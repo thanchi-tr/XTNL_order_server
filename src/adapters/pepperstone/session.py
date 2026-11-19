@@ -9,7 +9,10 @@
   :func:`encode_request`, which refuses any payloadType outside the read-only allow-list.
 - Every request takes a token from the adapter's shared RestBudget (operations.md §15) first; the
   lease-checked auth / token-refresh requests spend one without waiting. Heartbeats are not metered.
-  REQUEST_FREQUENCY_EXCEEDED empties the bucket for a second.
+  REQUEST_FREQUENCY_EXCEEDED empties the bucket for a second. Each request's outcome is reported to the bucket
+  by priority (answered, or timeout / socket lost; a throttle answer is counted apart), and its send time is
+  stamped right before the send, after the token wait and any historical-request spacing, and only when the
+  socket is open (``rest_sent_ms``).
 The socket sits behind the small :class:`WsConnection` protocol so tests inject a fake (no network).
 """
 from __future__ import annotations
@@ -35,7 +38,7 @@ from src.adapters.pepperstone.protocol import (
     encode_request,
     is_error,
 )
-from src.adapters.ratelimit import RestBudget
+from src.adapters.ratelimit import RestBudget, current_rest_priority, mark_rest_sent
 from src.adapters.sockets import apply_reset_options
 
 log = logging.getLogger(__name__)
@@ -149,32 +152,50 @@ class OpenApiSession:
         """Send one allowed request and wait for its response (matched on clientMsgId)."""
         budget = self._budget
         if budget is not None:
+            # The send is stamped below, right before it leaves (after any historical spacing; IN-5).
             if payload_type in UNWAITED_REQUESTS:
-                budget.spend()
+                budget.spend(stamp=False)
             else:
-                await budget.acquire()
+                await budget.acquire(stamp=False)
         if payload_type in HISTORICAL_REQUESTS:
             async with self._historical_lock:
                 wait = self._last_historical + self._historical_interval_s - self._monotonic()
                 if wait > 0:
                     await asyncio.sleep(wait)
                 self._last_historical = self._monotonic()
+        priority = current_rest_priority()
         msg_id = f"xtnl-{next(self._ids)}"
         fut: asyncio.Future[Frame] = asyncio.get_running_loop().create_future()
         self._pending[msg_id] = fut
         try:
+            if self._ws is None or self._closed_reason is not None:     # nothing leaves, so nothing is stamped
+                raise SessionClosedError(f"cTrader socket is closed ({self._closed_reason or 'not open'})")
+            if budget is not None:
+                budget.mark_sent()
+            else:
+                mark_rest_sent()
             await self.send(payload_type, payload, msg_id)
             try:
                 frame = await asyncio.wait_for(fut, timeout_s if timeout_s is not None else self._request_timeout_s)
             except TimeoutError:
                 raise TransientBrokerError(f"cTrader request {payload_type} timed out") from None
+        except TransientBrokerError:
+            if budget is not None:
+                budget.note_result(priority, False)     # no answer: timeout or socket lost (R11-M10)
+            raise
         finally:
             self._pending.pop(msg_id, None)
         if is_error(frame.payload_type):
             code = str(frame.payload.get("errorCode") or "UNKNOWN_ERROR")
-            if code in THROTTLE_CODES and budget is not None:
-                budget.throttled(None)
+            if budget is not None:
+                if code in THROTTLE_CODES:      # counted apart: a throttle is never read as an outage
+                    budget.note_throttled(priority)
+                    budget.throttled(None)
+                else:
+                    budget.note_result(priority, True)
             raise OpenApiError(code, str(frame.payload.get("description") or ""), payload_type)
+        if budget is not None:
+            budget.note_result(priority, True)
         return frame
 
     # --- background tasks -------------------------------------------------------------------------

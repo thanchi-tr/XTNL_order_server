@@ -39,8 +39,12 @@ SQL_INSERT_TERM: Final = (
 SQL_READ_CLUSTER_STATE: Final = "SELECT safe_hold, last_resume_at FROM cluster_state WHERE id = 1 FOR UPDATE"
 SQL_COUNT_ABNORMAL: Final = (
     "SELECT count(*) FROM leader_terms WHERE end_reason IN ('lost', 'init_failed') "
-    "AND ended_at >= $1::bigint AND ended_at > COALESCE($2::bigint, 0)"
+    "AND ended_at >= $1::bigint AND started_at >= $1::bigint AND ended_at > COALESCE($2::bigint, 0)"
 )
+"""A flap is a term that both started and ended abnormally inside the window. A term left open by a kill (a PC
+shutdown or sleep, a crash hours ago) is closed by its successor's step 1 with `ended_at` = now; counting it by
+that closing time alone made several old kills look like 3 crashes within 15 min (false SAFE_HOLD on a single PC
+after a shutdown, 2026-11-18). Its start time shows it was not part of a restart loop."""
 SQL_COUNT_EPOCH_CHANGES: Final = (
     "SELECT count(*) FROM leader_terms WHERE started_at >= $1::bigint AND started_at > COALESCE($2::bigint, 0)"
 )

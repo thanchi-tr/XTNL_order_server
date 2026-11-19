@@ -10,6 +10,7 @@ from src.adapters.stonex.codes import (
     StoneXOrderType,
     canonical_status,
     is_tradeable,
+    order_kind_of,
     parse_order_type,
     parse_side,
     parse_status,
@@ -58,6 +59,16 @@ def test_every_status_code_has_a_canonical_mapping() -> None:
 ])
 def test_order_type_table(raw: object, expected: StoneXOrderType | None) -> None:
     assert parse_order_type(raw) == expected
+
+
+@pytest.mark.parametrize(("raw", "kind"), [
+    ("2", "STOP"), (2, "STOP"), ("Stop", "STOP"), (StoneXOrderType.STOP, "STOP"),
+    ("3", "LIMIT"), (3, "LIMIT"), ("LIMIT", "LIMIT"), (StoneXOrderType.LIMIT, "LIMIT"),
+    ("1", None), (StoneXOrderType.TRADE, None), ("Trade", None), ("4", None), ("", None), (None, None),
+])
+def test_order_kind_table(raw: object, kind: str | None) -> None:
+    """Design PR1: StoneX type 2 -> STOP, 3 -> LIMIT, 1 (a trade) and anything unknown -> None."""
+    assert order_kind_of(raw) == kind
 
 
 @pytest.mark.parametrize(("raw", "expected"), [
@@ -121,6 +132,27 @@ def test_fx_market_information_maps_to_instrument_spec() -> None:
     assert spec.broker_symbol == "401484347" and spec.adapter_id == "stonex" and spec.swap_booked_to_balance
     jpy = spec_from_market_info(MARKETS[USDJPY_ID])
     assert jpy is not None and jpy.point_size == Decimal("0.01") and jpy.contract_size == 1
+
+
+def test_price_increment_comes_from_the_price_decimal_places() -> None:
+    """PR7: 10^-PriceDecimalPlaces, independent of the "per" size in the name."""
+    spec = spec_from_market_info(MARKETS["401484347"])
+    jpy = spec_from_market_info(MARKETS[USDJPY_ID])
+    assert spec is not None and spec.price_increment == Decimal("0.00001")
+    assert jpy is not None and jpy.price_increment == Decimal("0.001")
+    idx = spec_from_market_info({"MarketId": 3, "Name": "UK 100 CFD", "PriceDecimalPlaces": 0,
+                                 "MarketCurrency": "GBP"})
+    assert idx is not None and idx.price_increment == Decimal(1)
+    assert spec.min_stop_distance is None and spec.asset_class is None    # no StoneX field states them yet
+
+
+def test_point_size_is_never_a_price_increment_fallback() -> None:
+    """A market without PriceDecimalPlaces has no price_increment, even though its point size is known."""
+    spec = spec_from_market_info({"MarketId": 7, "Name": "EUR/USD (per 0.0001) CFD", "MarketUnderlyingTypeId": 4})
+    assert spec is not None and spec.point_size > 0
+    assert spec.price_increment is None
+    fx = spec_from_market_info({"MarketId": 8, "Name": "EUR/USD", "MarketUnderlyingTypeId": 4})
+    assert fx is not None and fx.point_size > 0 and fx.price_increment is None
 
 
 def test_fx_pip_defaults_without_per_in_name() -> None:

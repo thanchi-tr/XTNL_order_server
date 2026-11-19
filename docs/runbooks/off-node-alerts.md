@@ -138,7 +138,24 @@ The witness's disk above 85 %: act now (an etcd member without space raises NOSP
 
 ### XtnlCertExpiry
 A certificate expires within 30 days: renew it from the internal CA and reload the service that uses it
-(etcd, Patroni REST, PostgreSQL), one node at a time.
+(etcd, Patroni REST, PostgreSQL, the Redis TLS proxy), one node at a time. `cert` names it: the files of
+`XTNL_METRICS_CERTS` on that node, or an endpoint of `XTNL_METRICS_CERT_ENDPOINTS` read from that node
+(`etcd-witness-server` / `etcd-witness-peer`: the witness's etcd member; `deadman-receiver` /
+`dashboard-heartbeat`: the Melbourne listeners, which load a renewed certificate without a restart within 60 s).
+The Melbourne-local client certificate (the dashboard's Redis client certificate) is watched by the dead-man
+receiver itself (`XTNL_RECEIVER_CERTS`, a `cert:<name>` page from Melbourne).
+
+### XtnlCertUnreadable
+A configured certificate could not be read for 15 min (missing file, no read permission for the `xtnl` user:
+certificates are public, install them 0644 in a traversable directory, install-node.md step 3b), an endpoint's
+certificate did not verify (expired, untrusted, wrong name; the handshake trusts the entry's `ca=`, else
+`XTNL_ETCD_CA` for the `etcd-*` names, else `SSL_CERT_FILE`; the engine logs `cert endpoint <name>: no trust
+source ...` at start when only the system store is left), or the node exports fewer than the required
+certificates (one left out of `XTNL_METRICS_CERTS` / `XTNL_METRICS_CERT_ENDPOINTS`, engine.env.example; each
+name must point at the file its service loads, not a copy). Fix the file or the setting; the series returns
+within 30 s (files) or 300 s (endpoints). CloudWatch: while the node's `xtnl-engine-down-<node>` alarm is in
+ALARM (planned stop, node lost) the per-certificate alarms are held back (composite `-notify` alarms with that
+ActionsSuppressor), so a down node pages once, as XtnlEngineDown.
 
 ### XtnlEventLoopLag
 Engine event loop lagging more than 100 ms for 30 s (the watchdog kills at 3 s): the journal names slow
@@ -156,6 +173,22 @@ The oldest un-acked feed entry is older than 30 s: the feed observer is stuck (i
 
 ### XtnlClockOffset
 Clock offset above 50 ms: the node fails its hard check. `chronyc tracking`; never step the clock by hand.
+
+### XtnlArmFailed
+
+The ARM (optional, `XTNL_ARM_ENABLED=1`) has at least one FAILED scope (design §B14): it gives no advice for the
+positions the scope covers; ingestion, Oversee and the gate are unaffected. The immediate ping names the scope, the
+reason and the clear command. Run `python -m src.ops arm failed show`, fix the recorded cause (the ping and the
+refusal of a clear name the request to run first, for example `md_rebuild` or `md_writer_reset`), then
+`python -m src.ops arm failed clear <scope> --reason <text>`. The ARM never sends orders.
+
+### XtnlRedisMdMemoryHigh
+
+The optional market-data store `redis-md` (only with `XTNL_MD_ENABLED=1`) is above 70 % of its `maxmemory`
+(`noeviction`). `md-writer` has paged "redis-md memory high" and sheds TICK data in its fixed order (design §A8);
+BROKER series, their indicators and the rollback sets are never shed. Ingestion, Oversee and the gate are unaffected.
+Follow `marketdata.md` "redis-md memory": check `md show`, the sizing (design §A5) and the unit's `MemoryMax`, then
+raise `maxmemory` in `/etc/xtnl/redis-md.conf` (keep `MemoryMax` at twice it) or reduce the demanded symbols.
 
 ### Balance moves and transfers (operator cash-flow refresh)
 When an alert or a page shows an unexplained balance move, ask the leader to fetch the account's cash flows

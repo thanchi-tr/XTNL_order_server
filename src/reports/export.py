@@ -1,5 +1,8 @@
 """`python -m src.ops pinescript`: read the window (read-only), build trades, render, write one file per symbol.
 
+`plan_pinescript` / `plan_texts` are the in-memory variant (no file): the order-server API (src/api) renders the
+current ISO week with them and caches the texts in Redis only.
+
 Files are named `<SYMBOL>_<YYYY-MM-DD>.pine` (normalised symbol, UTC date of the export) in the output folder.
 The summary carries file names and counts only (orders, positions, trades, pending orders, drawings used, left
 out): never an amount.
@@ -77,10 +80,22 @@ def write_plan(plan: ExportPlan, out_dir: Path) -> list[Path]:
     return paths
 
 
+async def plan_pinescript(conn: PgConnection, window: Window, *, now_ms: int, symbol: str | None = None,
+                          adapter: str | None = None) -> ExportPlan:
+    """In-memory variant: one read-only transaction over `window`, rendered, nothing written anywhere (the
+    order-server API keeps the texts in its Redis cache only)."""
+    read = await read_versions(conn, window, adapter=adapter)
+    return plan_from_read(read, now_ms=now_ms, symbol=symbol, adapter=adapter)
+
+
+def plan_texts(plan: ExportPlan) -> tuple[tuple[str, str], ...]:
+    """(normalised symbol, Pine Script source) per script, in symbol order."""
+    return tuple((e.symbol, e.result.text) for e in plan.exports)
+
+
 async def export_pinescript(conn: PgConnection, *, days: int, now_ms: int, out_dir: Path,
                             symbol: str | None = None, adapter: str | None = None) -> tuple[ExportPlan, list[Path]]:
-    read = await read_versions(conn, Window.last_days(days, now_ms), adapter=adapter)
-    plan = plan_from_read(read, now_ms=now_ms, symbol=symbol, adapter=adapter)
+    plan = await plan_pinescript(conn, Window.last_days(days, now_ms), now_ms=now_ms, symbol=symbol, adapter=adapter)
     return plan, write_plan(plan, out_dir)
 
 

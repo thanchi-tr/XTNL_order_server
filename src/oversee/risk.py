@@ -9,8 +9,9 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
+from typing import Literal
 
-from src.dto import CashFlowDTO, InstrumentSpec, OrderDTO, OrderStatus, PositionDTO, Side
+from src.dto import CashFlowDTO, InstrumentSpec, OrderDTO, OrderKind, OrderStatus, PositionDTO, Side
 from src.oversee.snapshot import CashFlowRow, SodMark, SymbolQuotes, TimedMid
 from src.oversee.types import SymbolKey
 
@@ -259,14 +260,107 @@ def _units_to_cover(e: AnyEntity, positions: Sequence[PositionDTO], orders: Sequ
     return linked_units(_entity_id(e), e.symbol, child_side, positions, orders)
 
 
-def effective_stop(e: AnyEntity, positions: Sequence[PositionDTO], orders: Sequence[OrderDTO]) -> Decimal | None:
-    """e.stop_loss; else the non-terminal linked reduce-only stop children whose remaining units cover
-    e's units (the most distant child stop); else None (§5).
+_stop_at_entry: bool = False
+"""The process-wide Oversee stop rule (plan S38f): True = the S07 / PR1 kind rules, False (the default) = the exact
+pre-S07 rule. Set once at engine start from `XTNL_OVERSEE_STOP_AT_ENTRY` (`src/oversee/stop_rule.py`); the ARM passes
+`at_entry=True` itself and may run only with the setting on (go-live gate `oversee_c4`)."""
 
-    A child counts as a stop when its trigger price lies on the loss side of e's entry (no order
-    type field exists on OrderDTO)."""
+
+def set_stop_at_entry(on: bool) -> None:
+    global _stop_at_entry
+    _stop_at_entry = bool(on)
+
+
+def stop_at_entry() -> bool:
+    """Whether Oversee counts stops by the S07 / PR1 kind rules (`XTNL_OVERSEE_STOP_AT_ENTRY=1`)."""
+    return _stop_at_entry
+
+
+STOP_KIND_UNKNOWN = "stop_kind_unknown"            # a linked child of unknown kind (None) was seen
+STOP_KIND_INCONSISTENT = "stop_kind_inconsistent"  # a counted STOP child is not on its triggerable side
+STOP_CAVEATS = frozenset({STOP_KIND_UNKNOWN, STOP_KIND_INCONSISTENT})
+
+StopHandleKind = Literal["CHILD_ORDER", "POSITION_FIELD"]
+# Mark qualities a STOP child's triggerable side is judged against: a fresh mark while OPEN (clean, or the
+# liquidation side of a fresh raw quote) and the last clean mark while closed / in the roll break. An OPEN
+# symbol with no quote at all for longer than stale_mark_ms (LAST_MID) is not judged: that is `stale_mark`.
+_JUDGED_QUALITIES = frozenset({MarkQuality.CLEAN, MarkQuality.LIQUIDATION, MarkQuality.CLOSED_LAST_CLEAN})
+
+
+@dataclass(frozen=True)
+class StopHandle:
+    """One thing that holds an entity's stop (design PR1): its own `stop_loss` field (POSITION_FIELD, also
+    for an order's attached stop) or a linked reduce-only child order (CHILD_ORDER). `id` is the broker id
+    (position_id / broker_order_id); `units` the units it covers (None when the entity's units are unknown)."""
+
+    kind: StopHandleKind
+    id: str
+    level: Decimal
+    units: Decimal | None
+    order_kind: OrderKind | None = None
+
+
+@dataclass(frozen=True)
+class StopDetail:
+    """`effective_stop_detail()`'s answer: the effective stop level, the handles that make it up and the
+    caveats (STOP_KIND_UNKNOWN, STOP_KIND_INCONSISTENT). `inconsistent_ids` names only the CHILD_ORDER handles
+    that raised STOP_KIND_INCONSISTENT (sorted), so a page never blames a correctly placed child. Contains
+    order-state levels and ids only, no market data."""
+
+    level: Decimal
+    handles: tuple[StopHandle, ...]
+    caveats: tuple[str, ...] = ()
+    inconsistent_ids: tuple[str, ...] = ()
+
+
+def _beyond_unfilled_entry(e: AnyEntity, level: Decimal) -> bool:
+    """A level strictly beyond the entry of a still-unfilled (PENDING / WORKING) entry order: above it for a
+    buy, below it for a sell. Nothing is filled yet, so it cannot be a break-even stop: it is the wrong side
+    (risk()'s wrong-side test) and is most likely a take-profit mislabelled as STOP."""
+    if not isinstance(e, OrderDTO) or e.status not in (OrderStatus.PENDING, OrderStatus.WORKING):
+        return False
+    if e.entry_price is None:
+        return False
+    return level > e.entry_price if e.side == "BUY" else level < e.entry_price
+
+
+def _counts_as_stop(e: AnyEntity, child: OrderDTO) -> bool:
+    """STOP at any price, except strictly beyond a still-unfilled entry order's entry; LIMIT never; None
+    only strictly on the loss side of e's entry (§5, PR1).
+
+    The exception keeps the pre-S07 behaviour for an unfilled entry order: a STOP child beyond its entry is
+    no stop, so MissingStopLossRule goes SOFT_HALT `missing_stop_loss` (uncapped) after its grace and risk()
+    reports no_stop, instead of an UNKNOWN that would also blind MaxAggregateOpenRiskRule for the account."""
+    if child.order_kind == "STOP":
+        return child.entry_price is None or not _beyond_unfilled_entry(e, child.entry_price)
+    if child.order_kind == "LIMIT" or child.entry_price is None or e.entry_price is None:
+        return False
+    return (child.entry_price < e.entry_price) if e.side == "BUY" else (child.entry_price > e.entry_price)
+
+
+def _off_triggerable_side(e: AnyEntity, level: Decimal, mark: Mark | None) -> bool:
+    """A STOP child of a long (a sell stop) triggers at or below the market, so it should sit strictly below
+    the mark; a short's (a buy stop) strictly above. At or beyond the mark it is touched and awaiting its
+    fill, or a take-profit mislabelled as STOP. Not judged without a usable mark, and only for a position:
+    the children of a still-unfilled entry order are not live yet (a buy-stop entry above the market has its
+    stop child above the market too), and `_counts_as_stop` already drops one beyond the entry.
+
+    Known limit: while the mark is CLEAN it is the mid, not the side the stop triggers on (a long's sell stop
+    triggers on the bid, a short's buy stop on the ask). A stop between the bid and the mid has been touched
+    at the broker yet reads as consistent until the mid reaches it. The error is in the safe direction (a
+    caveat noticed a little late, never a false UNKNOWN); LIQUIDATION marks are already the bid / ask."""
+    if not isinstance(e, PositionDTO) or mark is None or mark.quality not in _JUDGED_QUALITIES:
+        return False
+    return level >= mark.price if e.side == "BUY" else level <= mark.price
+
+
+def _pre_s07_detail(e: AnyEntity, positions: Sequence[PositionDTO], orders: Sequence[OrderDTO]) -> StopDetail | None:
+    """The stop rule before S07 (commit 31d9b58's `effective_stop`), as a StopDetail: e.stop_loss; else the
+    non-terminal linked reduce-only children strictly on the loss side of e's entry (any kind) whose remaining
+    units cover e's units, level = the most distant one; else None. No caveats."""
     if e.stop_loss is not None:
-        return e.stop_loss
+        units = e.units if isinstance(e, PositionDTO) else e.remaining_units
+        return StopDetail(e.stop_loss, (StopHandle("POSITION_FIELD", _entity_id(e), e.stop_loss, units),))
     if e.entry_price is None:
         return None
     link = _entity_id(e)
@@ -283,8 +377,62 @@ def effective_stop(e: AnyEntity, positions: Sequence[PositionDTO], orders: Seque
     covered = sum((o.remaining_units or ZERO for o in children), ZERO)
     if covered < _units_to_cover(e, positions, orders):
         return None
-    prices = [o.entry_price for o in children if o.entry_price is not None]
-    return min(prices) if e.side == "BUY" else max(prices)
+    handles = tuple(StopHandle("CHILD_ORDER", o.broker_order_id, o.entry_price, o.remaining_units, o.order_kind)
+                    for o in children if o.entry_price is not None)
+    levels = [h.level for h in handles]
+    return StopDetail(min(levels) if e.side == "BUY" else max(levels), handles)
+
+
+def effective_stop_detail(e: AnyEntity, positions: Sequence[PositionDTO], orders: Sequence[OrderDTO],
+                          mark: Mark | None = None, *, at_entry: bool | None = None) -> StopDetail | None:
+    """e.stop_loss (one POSITION_FIELD handle); else the non-terminal linked reduce-only stop children whose
+    remaining units together cover e's units, level = the most distant child; else None (§5, design PR1).
+
+    A child counts by its `order_kind`: STOP at any price (a stop moved to or beyond entry is still a stop)
+    except strictly beyond the entry of a still-unfilled PENDING / WORKING entry order (no stop, as before
+    S07), LIMIT never, None only strictly on the loss side of e's entry (caveat STOP_KIND_UNKNOWN). `mark` is the
+    RiskSweep's MarkBook mark for e's symbol, or None: a counted STOP child that is not on its triggerable side
+    of it keeps its level and adds the caveat STOP_KIND_INCONSISTENT (MissingStopLossRule's UNKNOWN).
+
+    `at_entry`: these kind rules (True) or the exact pre-S07 rule (False, `_pre_s07_detail`); None = the process
+    setting `XTNL_OVERSEE_STOP_AT_ENTRY` (off by default, plan S38f). Oversee passes None; the ARM passes True."""
+    if not (stop_at_entry() if at_entry is None else at_entry):
+        return _pre_s07_detail(e, positions, orders)
+    if e.stop_loss is not None:
+        units = e.units if isinstance(e, PositionDTO) else e.remaining_units
+        return StopDetail(e.stop_loss, (StopHandle("POSITION_FIELD", _entity_id(e), e.stop_loss, units),))
+    link = _entity_id(e)
+    linked = [
+        o for o in orders
+        if o.is_reduce_only and not o.status.terminal and o.linked_position_id == link
+        and o.symbol == e.symbol and o.side != e.side and o.entry_price is not None
+        and o.remaining_units is not None
+    ]
+    children = [o for o in linked if _counts_as_stop(e, o)]
+    if not children:
+        return None
+    covered = sum((o.remaining_units or ZERO for o in children), ZERO)
+    if covered < _units_to_cover(e, positions, orders):
+        return None
+    handles = tuple(StopHandle("CHILD_ORDER", o.broker_order_id, o.entry_price, o.remaining_units, o.order_kind)
+                    for o in children if o.entry_price is not None)
+    levels = [h.level for h in handles]
+    caveats: set[str] = set()
+    if any(o.order_kind is None for o in linked):
+        caveats.add(STOP_KIND_UNKNOWN)
+    inconsistent = tuple(sorted({h.id for h in handles
+                                 if h.order_kind == "STOP" and _off_triggerable_side(e, h.level, mark)}))
+    if inconsistent:
+        caveats.add(STOP_KIND_INCONSISTENT)
+    level = min(levels) if e.side == "BUY" else max(levels)
+    return StopDetail(level, handles, tuple(sorted(caveats)), inconsistent)
+
+
+def effective_stop(e: AnyEntity, positions: Sequence[PositionDTO], orders: Sequence[OrderDTO], *,
+                   at_entry: bool | None = None) -> Decimal | None:
+    """`effective_stop_detail(...).level` (signature unchanged, so Oversee and the ARM never disagree)."""
+    detail = effective_stop_detail(e, positions, orders, at_entry=at_entry)
+    return detail.level if detail is not None else None
 
 
 # ---------------------------------------------------------------- risk
@@ -305,7 +453,12 @@ def risk(e: AnyEntity, units: Decimal, book: MarkBook, account_ccy: str,
 
     BUY (entry - stop) x units, SELL (stop - entry) x units; a stop at or past breakeven is 0.
     UNKNOWN for a missing InstrumentSpec, a PENDING/WORKING order with its stop on the wrong side,
-    or no mid ever seen. A missing entry price (market order) uses the current mark."""
+    or no mid ever seen. A missing entry price (market order) uses the current mark.
+
+    With the PR1 kind rules a STOP child counts at any price for a position: a STOP at or beyond entry is
+    a break-even stop (risk 0). For a PENDING / WORKING entry order (nothing filled yet) a STOP child beyond
+    entry is not counted at all (`_counts_as_stop`), so it reads `no_stop`, as before S07; the wrong-side
+    raise here still applies to a `stop_loss` field beyond an unfilled entry."""
     if e.instrument_unknown:
         raise RiskUnknown("risk_unknown", "instrument_unknown")
     spec = book.spec(e.adapter_id, e.symbol)
@@ -415,7 +568,13 @@ def equity_mark(balance: Decimal, account_ccy: str, positions: Sequence[Position
                 flows: Sequence[CashFlowRow], sod: SodMark | None) -> EquityMark:
     """balance + sum(OPEN position P&L at the mark + unbooked swap/commission), minus unexplained balance
     increases: today's unexplained increase and the part of `unexplained_increase_at_roll` that is
-    still unexplained (so a late pre-roll deposit can't hide a loss)."""
+    still unexplained (so a late pre-roll deposit can't hide a loss).
+
+    K11 (oversee-rules.md §5): today's unexplained increase stays excluded while the day is `pnl_unverified` too
+    (fail closed). A partial cash-flow fetch (a capped / truncated history page, an unmapped booked move) can drop
+    DEPOSIT rows as well as TRADE_PNL rows, and `transfer_source` only reflects the adapter's capability, so it
+    proves nothing about the day: reading the increase as P&L would let a missing deposit hide a real loss and
+    understate every "% of equity" rule. The FLAG `pnl_unverified` reports the day instead."""
     total = Valued(balance)
     for p in positions:
         if p.status == "OPEN":

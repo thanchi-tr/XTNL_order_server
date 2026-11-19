@@ -4,7 +4,8 @@ Exit 78 (EX_CONFIG) on a bad configuration (the message names variables only); e
 restarts it) when the Secrets Manager secret cannot be read at start. SIGTERM / SIGINT stop it.
 
 Credentials follow the secrets source (`receiver_secrets_source`: XTNL_SECRETS_SOURCE env | aws-sm): read once at
-start for the settings, then the bearer tokens are re-read from the cached secret on every tick (`TokenRing`).
+start for the settings, then the bearer tokens are re-read from the cached secret on every tick (`TokenRing`) and
+the paging channel credentials every minute (K10); the TLS certificate is re-loaded in place when its files change.
 """
 from __future__ import annotations
 
@@ -14,13 +15,18 @@ import logging
 import os
 import signal
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import httpx
 
 from src.deadman_receiver.pager import Pager
 from src.deadman_receiver.service import ReceiverService, wall_ms
-from src.deadman_receiver.settings import ReceiverConfigError, ReceiverSettings, receiver_secrets_source
+from src.deadman_receiver.settings import (
+    ReceiverConfigError,
+    ReceiverSettings,
+    channel_settings,
+    receiver_secrets_source,
+)
 from src.deadman_receiver.tokens import TokenRing, TokenSet
 from src.notifications.mail import SesTransport, SmtpTransport
 from src.notifications.push import NtfyTransport, PushoverTransport
@@ -55,7 +61,8 @@ def token_ring(settings: ReceiverSettings, source: SecretsSource, base: Mapping[
                      invalidate=source.invalidate, overlap_ms=settings.token_overlap_s * 1000)
 
 
-async def serve(settings: ReceiverSettings, tokens: TokenRing | None = None) -> None:
+async def serve(settings: ReceiverSettings, tokens: TokenRing | None = None,
+                channels_source: Callable[[], NotificationSettings] | None = None) -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -65,7 +72,8 @@ async def serve(settings: ReceiverSettings, tokens: TokenRing | None = None) -> 
             signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
     async with httpx.AsyncClient(timeout=10.0) as client:
         service = ReceiverService(settings, Pager(build_transports(settings.channels, client), wall_ms),
-                                  tokens=tokens)
+                                  tokens=tokens, channels_source=channels_source,
+                                  transports_for=lambda channels: build_transports(channels, client))
         await service.run(stop)
 
 
@@ -105,8 +113,15 @@ def _run(check_config: bool, settings: ReceiverSettings, source: SecretsSource, 
               f"push={'on' if settings.channels.push else 'off'}, tokens from {source.kind}")
         return 0
     source.start()
-    asyncio.run(serve(settings, token_ring(settings, source, base)))
+    asyncio.run(serve(settings, token_ring(settings, source, base), channels_source(source, base)))
     return 0
+
+
+def channels_source(source: SecretsSource, base: Mapping[str, str]) -> Callable[[], NotificationSettings] | None:
+    """K10: the paging channel settings re-read from the cached secret (aws-sm); fixed for the env source."""
+    if source.kind == "env":
+        return None
+    return lambda: channel_settings(source.resolve_cached(base))
 
 
 if __name__ == "__main__":

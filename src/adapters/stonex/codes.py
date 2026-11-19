@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from enum import IntEnum
 
-from src.dto import OrderStatus, Side
+from src.dto import OrderKind, OrderStatus, Side
 
 
 class StoneXOrderStatus(IntEnum):
@@ -53,6 +53,13 @@ CANONICAL_STATUS: dict[StoneXOrderStatus, OrderStatus] = {
 
 CHILD_TYPES = frozenset({StoneXOrderType.STOP, StoneXOrderType.LIMIT})
 
+#: Canonical order kind of a StoneX order type (design PR1): Stop 2 -> STOP, Limit 3 -> LIMIT; a Trade (1) has
+#: no kind (None).
+ORDER_KIND: dict[StoneXOrderType, OrderKind] = {
+    StoneXOrderType.STOP: "STOP",
+    StoneXOrderType.LIMIT: "LIMIT",
+}
+
 
 def _clean(raw: object) -> str | None:
     if raw is None:
@@ -93,6 +100,13 @@ def parse_order_type(raw: object) -> StoneXOrderType | None:
         except ValueError:
             return None
     return StoneXOrderType.__members__.get(text)
+
+
+def order_kind_of(type_id: object) -> OrderKind | None:
+    """StoneX ``Type`` / ``OrderTypeId`` / ``TypeId`` (code, word or parsed type) -> OrderKind: 2 -> STOP,
+    3 -> LIMIT; 1 (Trade), unknown or missing -> None (design PR1)."""
+    code = type_id if isinstance(type_id, StoneXOrderType) else parse_order_type(type_id)
+    return None if code is None else ORDER_KIND.get(code)
 
 
 def parse_side(raw: object) -> Side | None:

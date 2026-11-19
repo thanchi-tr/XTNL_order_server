@@ -48,6 +48,10 @@ class GateContext:
     # The adapter's newest downtime catch-up of this term was complete and nothing interrupted its orders /
     # account path since (src/runtime/catchup.py `CatchupCoordinator.verified`). Fail closed: False unless read.
     catchup_verified: bool = False
+    # K6: the account's own adapter (account_state, else its positions / orders, else its halt_breaches rows:
+    # `adapter_of`, §8). The stream_health, reconcile-after-open, latest-open and catch-up inputs above are read for
+    # this adapter, never for whatever adapter the action names. Fail closed: None (unresolved) denies.
+    account_adapter_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +83,12 @@ def evaluate_gate(ctx: GateContext, action: Action) -> GateVerdict:
         return GateVerdict(False, "hard_halt")
     if level is HaltLevel.SOFT and action.risk_increasing:
         return GateVerdict(False, "soft_halt_risk_increasing")
+    # K6: every adapter-scoped condition is judged against the account's own adapter. An account that resolves to
+    # no adapter, or an action that names another adapter than the account's, is denied whatever its direction.
+    if ctx.account_adapter_id is None:
+        return GateVerdict(False, "account_adapter_unknown")
+    if action.adapter_id != ctx.account_adapter_id:
+        return GateVerdict(False, "adapter_mismatch")
     if not action.risk_increasing:
         return GateVerdict(True, "ok")
     if ctx.now_ms < ctx.settle_until_ms:

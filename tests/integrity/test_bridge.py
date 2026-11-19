@@ -99,3 +99,18 @@ async def test_dlq_worker_drops_a_row_only_on_the_adapters_explicit_not_found(tm
     adapter.fetch_order_status = proves_nothing.__get__(adapter)  # type: ignore[method-assign]
     unproven = store.park("ORDER", "B1", "QueueFull")
     assert await w.run_once() == [(unproven.dlq_id, DlqOutcome.BACKOFF)]
+
+
+async def test_reread_maps_the_orchestrator_result_back_to_the_dlq_contract(tmp_path: Path) -> None:
+    """Plan S04: the orchestrator answers a RereadResult; the bridge keeps `StatefulDTO | None` (the broker's row
+    whenever it had one, also when the row was stale or could not be handed over) and re-reads with origin `dlq`."""
+    bridge, orch, adapter, bus = make(tmp_path)
+    fresh = await bridge.reread_entity("stonex", "ORDER", "B1")
+    assert fresh is not None and fresh.origin == "dlq" and bus.orders.get_nowait().origin == "dlq"
+    assert await bridge.reread_entity("stonex", "ORDER", "B1") is not None           # NOOP: still converged
+    bad = order("B2")
+    object.__setattr__(bad, "checksum", "0" * 64)          # parked again (checksum), never handed over
+    adapter.set_order(bad)
+    assert (await orch.reread_entity("stonex", "ORDER", "B2")).status.value == "TRANSIENT"
+    assert await bridge.reread_entity("stonex", "ORDER", "B2") is bad                 # converged as before
+    assert await bridge.reread_entity("stonex", "POSITION", "NOPE") is None

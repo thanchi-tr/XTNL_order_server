@@ -18,7 +18,7 @@ from typing import Any
 from src.adapters.pepperstone.instruments import ADAPTER_ID, SymbolInfo, unknown_symbol
 from src.adapters.pepperstone.protocol import JsonObj
 from src.adapters.stonex.wire import to_bool, to_decimal, to_id, to_int
-from src.dto import AccountDTO, CashFlowDTO, OrderDTO, OrderStatus, PositionDTO, Side, Source
+from src.dto import AccountDTO, CashFlowDTO, OrderDTO, OrderKind, OrderStatus, PositionDTO, Side, Source
 
 SymbolLookup = Callable[[int | None], SymbolInfo | None]
 
@@ -40,9 +40,11 @@ EXECUTION_TYPE = {"ORDER_ACCEPTED": 2, "ORDER_FILLED": 3, "ORDER_REPLACED": 4, "
 DEAL_STATUS = {"FILLED": 2, "PARTIALLY_FILLED": 3, "REJECTED": 4, "INTERNALLY_REJECTED": 5, "ERROR": 6, "MISSED": 7}
 BALANCE_OPERATION = {"DEPOSIT": 0, "WITHDRAW": 1}
 
-OT_STOP_LOSS_TAKE_PROFIT = 4
+OT_LIMIT, OT_STOP, OT_STOP_LOSS_TAKE_PROFIT, OT_STOP_LIMIT = 2, 3, 4, 6
 OS_ACCEPTED, OS_FILLED, OS_REJECTED, OS_EXPIRED, OS_CANCELLED = 1, 2, 3, 4, 5
 PS_OPEN, PS_CLOSED = 1, 2
+KNOWN_ORDER_STATUSES = frozenset(ORDER_STATUS.values())
+KNOWN_POSITION_STATUSES = frozenset(POSITION_STATUS.values())
 ET_PARTIAL_FILL = 11
 DS_FILLED, DS_PARTIALLY_FILLED = 2, 3
 DEFAULT_MONEY_DIGITS = 2
@@ -64,6 +66,18 @@ def enum_value(raw: object, names: Mapping[str, int]) -> int | None:
         if name.endswith(text) or text.endswith(name):
             return value
     return None
+
+
+def known_status(raw: object, names: Mapping[str, int], known: frozenset[int]) -> int | None:
+    """The status enum of a row, None when the field is absent (the proto default). A status that is present but
+    not one of ``known`` raises UnmappableError (adapter-isolation.md §1, K7): the adapter never invents a status,
+    and the caller counts the row as unmappable and opens the stream's gap."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    value = enum_value(raw, names)
+    if value is None or value not in known:
+        raise UnmappableError(f"unrecognised status {str(raw)[:40]!r}")
+    return value
 
 
 def side_of(raw: object) -> Side | None:
@@ -125,7 +139,8 @@ def symbol_of(info: SymbolInfo | None, symbol_id: int | None) -> str:
 
 # --- orders ------------------------------------------------------------------------------------------
 def order_status(order: JsonObj, execution_type: int | None = None) -> OrderStatus:
-    status = enum_value(order.get("orderStatus"), ORDER_STATUS)
+    """Canonical status; an unrecognised ``orderStatus`` raises UnmappableError (K7)."""
+    status = known_status(order.get("orderStatus"), ORDER_STATUS, KNOWN_ORDER_STATUSES)
     volume = to_decimal(obj(order, "tradeData").get("volume")) or Decimal(0)
     executed = to_decimal(order.get("executedVolume")) or Decimal(0)
     if status == OS_FILLED:
@@ -150,6 +165,19 @@ def order_entry_price(order: JsonObj, order_type: int | None) -> Decimal | None:
     elif order_type == OT_STOP_LOSS_TAKE_PROFIT:
         entry = price(order.get("stopPrice")) or price(order.get("limitPrice"))
     return entry if entry is not None else price(order.get("executionPrice"))
+
+
+def order_kind(order: JsonObj, order_type: int | None) -> OrderKind | None:
+    """cTrader order type -> OrderKind (design PR1): LIMIT -> LIMIT; STOP, STOP_LIMIT -> STOP;
+    STOP_LOSS_TAKE_PROFIT -> STOP when its ``stopPrice`` is set (the stop-loss leg), else LIMIT (the take-profit
+    leg); MARKET, MARKET_RANGE, unknown or missing -> None."""
+    if order_type == OT_LIMIT:
+        return "LIMIT"
+    if order_type in (OT_STOP, OT_STOP_LIMIT):
+        return "STOP"
+    if order_type == OT_STOP_LOSS_TAKE_PROFIT:
+        return "STOP" if price(order.get("stopPrice")) is not None else "LIMIT"
+    return None
 
 
 def is_protection_order(order: JsonObj) -> bool:
@@ -198,19 +226,21 @@ def map_order(order: JsonObj, *, account_id: str, lookup: SymbolLookup, source: 
         broker_updated_at_ms=broker_ms(order, "utcLastUpdateTimestamp"),
         broker_seq=None,
         source=source,
+        order_kind=order_kind(order, order_type),
     )
 
 
 # --- positions -----------------------------------------------------------------------------------
 def map_position(position: JsonObj, *, account_id: str, lookup: SymbolLookup, source: Source,
                  default_money_digits: int = DEFAULT_MONEY_DIGITS, adapter_id: str = ADAPTER_ID) -> PositionDTO | None:
-    """ProtoOAPosition -> PositionDTO; None for CREATED / ERROR positions (never filled)."""
+    """ProtoOAPosition -> PositionDTO; None for CREATED / ERROR positions (never filled). An unrecognised
+    ``positionStatus`` raises UnmappableError (K7: counted as unmappable and the stream's gap opens)."""
     position_id = to_id(position.get("positionId"))
     trade = obj(position, "tradeData")
     side = side_of(trade.get("tradeSide"))
     if position_id is None or side is None:
         raise UnmappableError(f"position {position_id}: missing positionId or tradeSide")
-    status_raw = enum_value(position.get("positionStatus"), POSITION_STATUS)
+    status_raw = known_status(position.get("positionStatus"), POSITION_STATUS, KNOWN_POSITION_STATUSES)
     if status_raw not in (None, PS_OPEN, PS_CLOSED):
         return None
     closed = status_raw == PS_CLOSED

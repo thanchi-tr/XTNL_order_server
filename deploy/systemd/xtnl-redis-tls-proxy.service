@@ -3,6 +3,8 @@
 # deploy/redis/redis-tls-proxy.conf rendered to /etc/xtnl/redis-tls-proxy.conf and the certificates in
 # /etc/xtnl/redis-tls-proxy/ (0600 root). It listens on ${NODE_IP}:6380 (mutual TLS) and forwards to the local
 # Redis on 127.0.0.1:6379, where the dashboard can only use the read-only ACL user xtnl_dashboard.
+# A second section listens on ${NODE_IP}:6382 for the optional market-data store redis-md (127.0.0.1:6381, plan S37),
+# where a remote reader can only use the read-only ACL user md_reader.
 # It never touches the engine and never sends anything to a broker; stopping it only blanks the dashboard's
 # live values (they are then shown as stale).
 

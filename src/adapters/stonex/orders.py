@@ -9,6 +9,15 @@
   IfDone) or, failing that, from XTNL's proven rule: a Pending(1) stop / limit is a bracket whose
   LastChangedTime equals its parent's first LastChangedTime.
 - Versions: ORDER and POSITION carry the item's LastChangedTime (broker-time domain).
+- ``order_kind`` (design PR1) comes from the memo's order type: an item without ``Type`` keeps the type last
+  seen for that order (from an earlier item or a REST read), so a stop never loses its kind; a Trade has none.
+  ``ORDER_FIELDS`` is unchanged (an unknown field name would fail the whole subscription).
+- IN-7 (open, decided by the PR3 probe): an item with ``OpenPrice`` empty re-emits the order's last known level.
+- K8 (adapter-isolation.md §2 StoneX): the PositionDTO(OPEN) of the first filled item takes its entry price from
+  REST (``GET order/{id}/openposition``, else ``GET order/{id}``), read in the background by the adapter
+  (``needs_entry_lookup`` / ``learn_entry``) while the item is held; a REST entry is never overwritten by a later
+  item's ``OpenPrice``. Without a REST answer (failure, timeout, too many held) the stream price stands in until a
+  later REST ``openpositions`` read calls ``learn_position``; the next item of that order then carries the REST entry.
 """
 from __future__ import annotations
 
@@ -24,6 +33,7 @@ from src.adapters.stonex.codes import (
     StoneXOrderType,
     canonical_status,
     opposite,
+    order_kind_of,
     parse_order_type,
     parse_side,
     parse_status,
@@ -114,6 +124,7 @@ class _PositionMemo:
     side: Side
     entry_price: Decimal | None
     is_open: bool = True
+    rest_entry: bool = False   # entry_price came from REST (K8): a later item's OpenPrice never overwrites it
 
 
 Emitted = OrderDTO | PositionDTO
@@ -132,6 +143,8 @@ class OrderStreamMapper:
         self._parents: OrderedDict[str, str] = OrderedDict()
         self._standalone: OrderedDict[str, bool] = OrderedDict()
         self._looked_up: OrderedDict[str, bool] = OrderedDict()
+        self._entry_looked_up: OrderedDict[str, bool] = OrderedDict()
+        self._rest_entry: OrderedDict[str, Decimal] = OrderedDict()   # K8: REST entry price per OrderId
         self._first_ts: OrderedDict[tuple[str | None, int], str] = OrderedDict()
         self.watermark_ms: int | None = None
 
@@ -149,7 +162,8 @@ class OrderStreamMapper:
         if position.status != "OPEN":
             return
         _remember(self._positions, position.position_id,
-                  _PositionMemo(market_id=market_id, side=position.side, entry_price=position.entry_price))
+                  _PositionMemo(market_id=market_id, side=position.side, entry_price=position.entry_price,
+                                rest_entry=position.entry_price is not None))
         memo = self._orders.get(position.position_id) or _OrderMemo()
         memo.market_id = memo.market_id or market_id
         memo.side = memo.side or position.side
@@ -164,6 +178,8 @@ class OrderStreamMapper:
         if order.raw_qty is not None:
             memo.quantity = order.raw_qty
         memo.price = order.entry_price or memo.price
+        if order.order_kind is not None:
+            memo.order_type = StoneXOrderType[order.order_kind]
         memo.terminal = memo.terminal or order.status.terminal
         _remember(self._orders, order.broker_order_id, memo)
         self.learn_parent(order.broker_order_id, order.linked_position_id if order.is_reduce_only else None)
@@ -212,6 +228,33 @@ class OrderStreamMapper:
 
     def mark_looked_up(self, order_id: str) -> None:
         _remember(self._looked_up, order_id, True)
+
+    def needs_entry_lookup(self, item: OrderItem) -> bool:
+        """K8: an item reporting Open(3) for an order with no position yet (its first fill emits PositionDTO(OPEN)),
+        that is not a known if-done child or closing trade: its entry price is read from REST (one background read
+        each, like the parent read)."""
+        if item.status != StoneXOrderStatus.OPEN:
+            return False
+        memo = self._orders.get(item.order_id)
+        return (item.order_id not in self._positions
+                and item.order_id not in self._parents
+                and item.order_id not in self._entry_looked_up
+                and item.order_id not in self._rest_entry
+                and not (memo is not None and (memo.closing or memo.bracket)))
+
+    def mark_entry_looked_up(self, order_id: str) -> None:
+        _remember(self._entry_looked_up, order_id, True)
+
+    def learn_entry(self, order_id: str, price: Decimal | None) -> None:
+        """The entry price of a filled order read from REST (K8); taken by its first PositionDTO(OPEN), or set on a
+        position this mapper already opened from the stream price."""
+        if price is None or price <= 0:
+            return
+        pos = self._positions.get(order_id)
+        if pos is not None:
+            pos.entry_price, pos.rest_entry = price, True
+            return
+        _remember(self._rest_entry, order_id, price)
 
     # --- mapping -----------------------------------------------------------------------------
     def map(self, item: OrderItem) -> list[Emitted]:
@@ -293,10 +336,12 @@ class OrderStreamMapper:
                 out.append(self._order(item.order_id, memo, account_id, OrderStatus.FILLED, ts,
                                        reduce_only=False, linked=None))
                 memo.terminal = True
-            entry = item.open_price or item.execution_price or memo.price
+            rest_entry = self._rest_entry.pop(item.order_id, None)
+            entry = rest_entry or item.open_price or item.execution_price or memo.price
             pos = _remember(self._positions, item.order_id,
-                            _PositionMemo(market_id=memo.market_id, side=memo.side, entry_price=entry))
-        elif item.open_price is not None:
+                            _PositionMemo(market_id=memo.market_id, side=memo.side, entry_price=entry,
+                                          rest_entry=rest_entry is not None))
+        elif item.open_price is not None and not pos.rest_entry:
             pos.entry_price = item.open_price
         closed = memo.quantity is not None and memo.quantity == 0
         out.append(self._position(item.order_id, pos, memo, account_id, ts, closed=closed))
@@ -357,7 +402,7 @@ class OrderStreamMapper:
             remaining_units=None if unknown else rem_units,
             instrument_unknown=unknown, raw_qty=qty,
             is_reduce_only=reduce_only, linked_position_id=linked if reduce_only else None,
-            broker_updated_at_ms=ts, source="STREAM",
+            broker_updated_at_ms=ts, source="STREAM", order_kind=order_kind_of(memo.order_type),
         )
 
     def _position(self, pid: str, pos: _PositionMemo, memo: _OrderMemo, account_id: str, ts: int, *,
