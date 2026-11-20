@@ -344,6 +344,24 @@ class _Fresh:
     handles: tuple[str, ...]
     read_at_ms: int | None = None
     """The latest read time of the handles to move (order-state time)."""
+    level: Decimal | None = field(default=None, repr=False)
+    """The order-state stop level the handles to move held when read (`held_stop_level`); None when unknown."""
+
+
+def held_stop_level(levels: Sequence[Decimal | None], side: str) -> Decimal | None:
+    """The stop level the handles to move held when read: their one level, or, when they differ, the most distant
+    from price on the loss side (lowest for a long, highest for a short, as `effective_stop_detail` counts children);
+    None when no level was read or the side is unknown with differing levels."""
+    known = sorted({lv for lv in levels if lv is not None})
+    if not known:
+        return None
+    if len(known) == 1:
+        return known[0]
+    if side == "BUY":
+        return known[0]
+    if side == "SELL":
+        return known[-1]
+    return None
 
 
 @dataclass
@@ -514,7 +532,8 @@ class ArmNotices:
             moved = [h for h in w.item.handles if h.target_level is not None]
             reads = [h.read_at_ms for h in moved if h.read_at_ms is not None]
             fresh[(w.ref.decision_id, w.ref.bar_end_ms)] = _Fresh(
-                shown=w.item.shown, handles=tuple(h.handle_id for h in moved), read_at_ms=max(reads, default=None))
+                shown=w.item.shown, handles=tuple(h.handle_id for h in moved), read_at_ms=max(reads, default=None),
+                level=held_stop_level([h.level_read for h in moved], info.side))
             groups.add((self._routes.route_of(d.key.adapter_id, info.account_id), d.bar_spec))
         for route, spec in sorted(groups):
             await self._flush(tx, st, route, spec, now, fresh, commit=(event.value, bar_end_ms), grace=None)
@@ -884,7 +903,11 @@ class ArmNotices:
             first_bar_ratio=d.first_bar_ratio, caveats=d.caveats, quality_flags=d.quality_flags,
             stop_basis=d.stop_basis, trigger_source=d.close_source, handles=fresh.handles if fresh is not None else (),
             stop_read_at_ms=fresh.read_at_ms if fresh is not None else None, late=late,
-            trigger_input=trig, entry=info.entry if info is not None and trig is not None else None,
+            stop_now=fresh.level if fresh is not None else None,
+            # the pinned entry: for favour R at send time (with the trigger input), and for a PRE ADJUST item's HTML
+            # stop block (order state; the text shows it only as before, Q13 and never at PRE)
+            trigger_input=trig, entry=info.entry if info is not None and (
+                trig is not None or (d.event == PRE and d.outcome == Outcome.ADJUST.value)) else None,
             s0=info.s0 if info is not None and trig is not None else None, supersedes=d.supersedes_decision_id,
             decided_at_ms=d.decided_at_ms, strategy_kind=d.strategy_kind,
             strategy_impl_version=d.strategy_impl_version, valid_until_ms=valid_until,
@@ -1084,6 +1107,6 @@ __all__ = [
     "ALIVE", "AcceptedPolicies", "ArmNotices", "BAR_EVENTS", "END_PART", "FAILED_CLEARED", "FOLDS",
     "FailedLinesPort", "GLOBAL_ROUTE", "IMMEDIATE_OUTCOMES", "ITEM_EVENTS", "LAST_PART", "MD_RESET",
     "NoticeCounters", "NoticeMeta", "NoticeOutboxPort", "NoticeSettings", "NoticeSink", "OutboxNotice", "RouteBook",
-    "RoutePolicyPort", "TASK", "TEST", "expires_at_ms", "item_key_of", "pinned_loosen_policy", "shown_by_mode",
-    "supersedes",
+    "RoutePolicyPort", "TASK", "TEST", "expires_at_ms", "held_stop_level", "item_key_of", "pinned_loosen_policy",
+    "shown_by_mode", "supersedes",
 ]
