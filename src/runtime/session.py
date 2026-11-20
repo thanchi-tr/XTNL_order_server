@@ -1620,6 +1620,10 @@ class EngineSession:
     def flag(self, code: str, detail: str) -> None:
         self.page("high", f"flag:{code}", detail)
 
+    def email_footer(self) -> tuple[str, str | None]:
+        """(node id, epoch label) for the HTML email footer (src/notifications/email_html.py)."""
+        return self.node_id, self.epoch.label
+
     def _start_notifications(self) -> None:
         self._http = self.ctx.http_client()
         loader = self.ctx.notification_settings
@@ -1628,10 +1632,11 @@ class EngineSession:
             # credentials_poll_ms and at once after an auth error. `initial=` never raises at build time.
             self.channels = RotatingChannels(loader, self._http, smtp_factory=self.ctx.smtp_factory,
                                              invalidate=self.ctx.invalidate_secrets or (lambda: None),
-                                             initial=self.ctx.notifications)
+                                             initial=self.ctx.notifications, footer=self.email_footer)
             cs = self.channels.current
         else:
-            cs = build_channels(self.ctx.notifications, self._http, smtp_factory=self.ctx.smtp_factory)
+            cs = build_channels(self.ctx.notifications, self._http, smtp_factory=self.ctx.smtp_factory,
+                                footer=self.email_footer)
         dispatcher = self.dispatcher
         self.relay = OutboxRelay(self.ports.outbox, self.ports.dedupe, cs.channels, disabled=cs.disabled,
                                  issues=cs.issues, lease_valid=self._lease_valid, clock_ms=self._clock,

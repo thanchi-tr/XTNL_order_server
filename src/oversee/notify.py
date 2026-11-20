@@ -57,6 +57,8 @@ class OutboxRow:
     attempts: int = 0                # delivery attempts so far (relay bookkeeping)
     channel_failures: tuple[tuple[str, int], ...] = ()   # failed attempts per remaining channel (SM6 n)
     escalated: bool = False          # SM6 ESCALATED: the alert also goes to the other channel(s)
+    html: str | None = field(default=None, compare=False, repr=False)
+    """A prebuilt HTML email part (the ARM relay's send-time render): never persisted, None on every outbox read."""
 
     @property
     def bypass_dedupe(self) -> bool:
@@ -111,6 +113,10 @@ class AlertMessage:
     kind: AlertKind
     outbox_id: int | None = None
     account_id: str | None = None
+    # Presentation only (the email's HTML part, src/notifications/email_html.py): not compared, never persisted.
+    created_ms: int = field(default=0, compare=False)
+    episode: EpisodeKey | None = field(default=None, compare=False)
+    html: str | None = field(default=None, compare=False, repr=False)
 
 
 def render_message(row: OutboxRow) -> AlertMessage:
@@ -121,7 +127,7 @@ def render_message(row: OutboxRow) -> AlertMessage:
     if row.outbox_id is not None:
         lines.append(f"alert id: {row.outbox_id}")
     return AlertMessage(f"[XTNL {tag}] {row.title}", "\n".join(lines), row.severity, row.kind,
-                        row.outbox_id, row.account_id)
+                        row.outbox_id, row.account_id, created_ms=row.created_ms, episode=row.episode, html=row.html)
 
 
 class AlertTransport(Protocol):

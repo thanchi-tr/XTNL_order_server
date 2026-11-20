@@ -78,6 +78,7 @@ from src.db.arm_budget_store import PgArmBudgetStore, PgRestartHistory
 from src.db.arm_config_store import PgArmConfigStore
 from src.db.arm_failures_store import PgArmFailedClear, PgArmFailuresStore
 from src.db.arm_outbox_store import PgArmOutboxInserter, PgArmOutboxStore
+from src.db.instrument_reads import PgPointSizes
 from src.db.arm_ports import ArmConfigStore, ArmPositionRow, ArmStatusRow, ArmStatusWriter, ControlsRow, is_lost_fence
 from src.db.arm_status_store import PgArmStatusStore
 from src.db.arm_store import PgArmStateStore
@@ -788,7 +789,11 @@ class OptionalRuntime:
         renderer = SendTimeRenderer(md.port, keyring=lambda: md.settings.keyring)
         relay = ArmRelay(PgArmOutboxStore(engine_db), channels.channels, renderer=renderer,
                          disabled=channels.disabled, issues=channels.issues, lease_valid=s.ctx.lease.lease_valid,
-                         clock_ms=s.ctx.clock_ms, page=svc.pager.page, drain_notices=self.controls.drain)
+                         clock_ms=s.ctx.clock_ms, page=svc.pager.page, drain_notices=self.controls.drain,
+                         footer=lambda: s.email_footer(),   # read at send time
+                         # XTNL_EMAIL_THEME of the ARM channels; the xtnl theme shows pips from the entry (point sizes
+                         # read at send time, never stored or shown)
+                         email_theme=channels.email_theme, point_sizes=PgPointSizes(engine_db))
         config = self._config_installer(arm)
         accepted = config if config is not None else _NoConfig()
         grid = CalendarGrid(schedule_of=s.calendar.schedule_of, skew_of=md.hook.skew_estimate,
@@ -1410,7 +1415,8 @@ def default_arm_channels(environ: Mapping[str, str]) -> Callable[[EngineSession]
             own = session.ctx.http_client()
             session.register_closer("arm-http", own.aclose)
             client = own
-        return build_arm_channels(settings, client, smtp_factory=session.ctx.smtp_factory)
+        return build_arm_channels(settings, client, smtp_factory=session.ctx.smtp_factory,
+                                  footer=lambda: session.email_footer())   # read at send time
 
     return build
 

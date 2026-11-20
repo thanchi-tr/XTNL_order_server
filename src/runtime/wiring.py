@@ -893,7 +893,7 @@ def build_engine(config: RuntimeConfig, *, environ: Mapping[str, str] | None = N
 
         direct_pager = DirectChannelPager(
             settings_from_secrets(source, raw) if source.kind != "env" else notification_settings,
-            h.http_client or _http_client, clock_ms=clock_ms)
+            h.http_client or _http_client, clock_ms=clock_ms, node_id=node)
         closers.append(direct_pager.aclose)
         log.warning("config: XTNL_SINGLE_PC=1: SAFE_HOLD auto-resumes after a %d s cool-down (doubling to %d s, at "
                     "most %d within %d h); single-PC deployments only", single_pc.resume_first_s,
