@@ -1,0 +1,15 @@
+# Runs xtnl-deadman-healthz.service every minute on the home receiver VPS (home-server-plan §3.1, W6):
+#     sudo systemctl enable --now xtnl-deadman-healthz.timer
+# OnCalendar (not OnUnitInactiveSec) so a failed run never stops the next one. Healthchecks.io check B: period
+# 1 min, grace 3 min (docs/runbooks/deadman-receiver-home.md).
+
+[Unit]
+Description=XTNL dead-man receiver /healthz check every minute
+
+[Timer]
+OnBootSec=1min
+OnCalendar=minutely
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

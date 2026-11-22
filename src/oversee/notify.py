@@ -194,7 +194,8 @@ def repages_due(states: Iterable[BreachState], acks: Sequence[BreachAck], last_s
     The cadence runs from the episode's last delivery (`notification_dedupe`); an episode whose alert was never
     delivered (held back by the AlertInhibitor, or written by an earlier leader whose relay never sent it) runs
     from the state's `active_since`, so it is not silent for ever. `held(state)`: the state's re-page is held back
-    now (its adapter's dependent alerts are suppressed: maintenance window or epoch-change settle)."""
+    now (its adapter's dependent alerts are suppressed: maintenance window or epoch-change settle). The RiskSweep
+    passes no state at all for a flat account (oversee-rules.md §10 accepted deviation, `sweep._flat_account`)."""
     rows: list[OutboxRow] = []
     for s in states:
         if not s.active or is_acknowledged(s, acks):
@@ -345,7 +346,7 @@ class NotificationDispatcher:
         cadence at most: a row the sender has not recorded in `notification_dedupe` yet (still pending, or
         suppressed by a sender whose own cadence is longer, or just alerted: `mark_alerted`) is not queued again
         on every pass. A state whose re-page is held back is simply not passed in (the RiskSweep filters the
-        stale / FENCE states of a suppressed adapter)."""
+        stale / FENCE states of a suppressed adapter, and every state of a flat account: `sweep._flat_account`)."""
         cadence = self.escalate_after_ms
         self._queued = {k: at for k, at in self._queued.items() if now_ms - at < cadence}
         states = list(states)

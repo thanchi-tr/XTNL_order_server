@@ -10,9 +10,10 @@ HTTP (stdlib asyncio streams, HTTP/1.1, one request per connection, `Connection:
 
 Each tick (1 s) first re-reads the tokens from the secrets source (no I/O; a rotation needs no restart, and an
 invalid secret keeps the last valid tokens and pages `token_source`), then compares the active conditions (`Evaluator.active`) with the previous set: a new condition is
-paged (critical), a condition still active is re-paged every `repage_s`, a cleared one sends a resolved notice
-(info). A daily test page at `test_page_utc` proves the path (operations.md §9), and a start-up notice shows
-receiver restarts. Nothing here reads or writes PostgreSQL or Redis, and nothing reaches a broker.
+paged (at the condition's severity: critical, or high for the W19 `node_changed` notice), a condition still active
+is re-paged every `repage_s` at the same severity, a cleared one sends a resolved notice (info). A daily test page
+at `test_page_utc` proves the path (operations.md §9), and a start-up notice shows receiver restarts. Nothing here
+reads or writes PostgreSQL or Redis, and nothing reaches a broker.
 
 K5 / K10 (operations.md §13): every `CERT_CHECK_S` the tick re-loads a changed TLS certificate / key in place
 (`ReloadingServerTls`; a pair that fails to load keeps the current one and pages `tls_reload`) and reads the watched
@@ -58,6 +59,11 @@ def wall_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
+def monotonic_ms() -> int:
+    """W19 receive times: a clock that never steps back (round-2 review), unlike the wall clock under NTP."""
+    return time.monotonic_ns() // 1_000_000
+
+
 def next_daily_ms(now_ms: int, hhmm: tuple[int, int]) -> int:
     """The next HH:MM UTC strictly after `now_ms`."""
     now = datetime.fromtimestamp(now_ms / 1000, tz=UTC)
@@ -72,10 +78,15 @@ class ReceiverService:
                  thresholds: Thresholds | None = None, tokens: TokenRing | None = None,
                  channels_source: Callable[[], NotificationSettings] | None = None,
                  transports_for: Callable[[NotificationSettings], list[AlertTransport]] | None = None,
-                 read_certs: Callable[[], list[CertReading]] | None = None) -> None:
+                 read_certs: Callable[[], list[CertReading]] | None = None,
+                 mono_ms: Callable[[], int] | None = None) -> None:
         self._s = settings
         self._pager = pager
         self._clock = clock_ms
+        # W19 (round-2 review): the two-engine rules use a monotonic receive clock, so a wall clock step cannot
+        # make one engine look like two. In production (the default wall clock) that is time.monotonic; a caller
+        # that injects its own wall clock (a test) drives both from it unless it passes `mono_ms` too.
+        self._mono = mono_ms or (monotonic_ms if clock_ms is wall_ms else clock_ms)
         # K10: rotation without restart of the paging channel credentials and of the server certificate.
         self._channels_source = channels_source
         self._transports_for = transports_for
@@ -89,7 +100,9 @@ class ReceiverService:
         self._cert_problems: dict[str, str] = {}
         self._next_cert_ms = 0
         now = clock_ms()
-        self.evaluator = Evaluator(started_ms=now, thresholds=thresholds or Thresholds())
+        # W19: the two-engine window comes from the settings unless a caller (a test) passes its own thresholds.
+        self.evaluator = Evaluator(started_ms=now, started_rx=self._mono(), thresholds=thresholds or Thresholds(
+            two_engines_window_ms=settings.two_engines_window_s * 1000))
         self.tokens = tokens or TokenRing(TokenSet(settings.token, settings.token_next),
                                           overlap_ms=settings.token_overlap_s * 1000)
         self._active: dict[str, Condition] = {}
@@ -104,11 +117,11 @@ class ReceiverService:
         try:
             beat = parse_beat(body)
         except BeatError as exc:
-            self.evaluator.reject(str(exc))
+            self.evaluator.reject(str(exc), self._clock(), rx_ms=self._mono())
             log.warning("dead-man heartbeat rejected: %s", exc)
             return 400, str(exc)
         try:
-            self.evaluator.accept(beat, self._clock())
+            self.evaluator.accept(beat, self._clock(), rx_ms=self._mono())
         except BeatError as exc:
             log.warning("dead-man heartbeat from %s rejected: %s", beat.node, exc)
             return (409 if "not newer" in str(exc) else 400), str(exc)
@@ -126,7 +139,8 @@ class ReceiverService:
 
     def _body(self, lines: list[str], now_ms: int) -> str:
         stamp = datetime.fromtimestamp(now_ms / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
-        return "\n".join([*lines, "", f"receiver time: {stamp}", self.evaluator.status_line(now_ms),
+        return "\n".join([*lines, "", f"receiver time: {stamp}",
+                          self.evaluator.status_line(now_ms, rx_ms=self._mono()),
                           "runbook: docs/runbooks/deadman-alert.md",
                           "Phase 1 never sends orders: this means oversight may be blind, not that an order is at risk."])
 
@@ -142,7 +156,7 @@ class ReceiverService:
         self.tokens.refresh(now)
         self._refresh_channels(now)
         self._check_certs(now)
-        active = self.evaluator.active(now)
+        active = self.evaluator.active(now, rx_ms=self._mono())
         if self.tokens.issue is not None:
             active["token_source"] = Condition(
                 "token_source", "dead-man: receiver token source invalid",
@@ -161,12 +175,12 @@ class ReceiverService:
         for key, cond in active.items():
             last = self._last_paged.get(key)
             if key not in self._active:
-                log.error("dead-man condition active: %s (%s)", cond.summary, cond.detail)
-                out.append(self._msg(cond.summary, self._body([cond.detail], now), "critical", "episode"))
+                log.error("dead-man condition active (%s): %s (%s)", cond.severity, cond.summary, cond.detail)
+                out.append(self._msg(cond.summary, self._body([cond.detail], now), cond.severity, "episode"))
                 self._last_paged[key] = now
             elif last is not None and now - last >= self._s.repage_s * 1000:
                 out.append(self._msg(f"still active: {cond.summary}", self._body([cond.detail], now),
-                                     "critical", "repage"))
+                                     cond.severity, "repage"))
                 self._last_paged[key] = now
         for key, cond in self._active.items():
             if key not in active:

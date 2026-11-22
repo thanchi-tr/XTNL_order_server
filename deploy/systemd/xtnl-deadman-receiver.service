@@ -19,7 +19,8 @@ DynamicUser=yes
 WorkingDirectory=/opt/xtnl/order-server
 # XTNL_RECEIVER_TOKEN (+ _NEXT, _OVERLAP_S), XTNL_RECEIVER_LISTEN, XTNL_RECEIVER_PATH, XTNL_RECEIVER_TEST_PAGE_UTC,
 # channel variables, and optionally XTNL_SECRETS_SOURCE=aws-sm / _ID / _REGION (outside eu-west-2): the tokens then
-# follow the secret without a restart. Exit 75 (secret unreadable at start) is restarted; 78 (config) is not.
+# follow the secret without a restart. Exit 75 (secret unreadable at start) is restarted; 78 (config) from the
+# main process is not (see ExecStartPre below).
 EnvironmentFile=/etc/xtnl/deadman-receiver.env
 # TLS certificate and key, handed to the dynamic user as systemd credentials (never world-readable files)
 LoadCredential=tls.crt:/etc/xtnl/deadman-receiver/tls.crt
@@ -29,7 +30,11 @@ Environment=XTNL_RECEIVER_TLS_KEY=%d/tls.key
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 SyslogIdentifier=xtnl-deadman-receiver
-ExecStartPre=/opt/xtnl/order-server/.venv/bin/python -m src.deadman_receiver --check-config
+# The '-' prefix (review round 1): RestartPreventExitStatus= tests only the MAIN process's exit status, so a
+# config check that failed the unit here would be restarted every 5 s for ever (the start limit, 5 in 10 s, is
+# never reached). The check's line is still logged; the main process then refuses the same configuration with
+# 78, which stops the unit, and a 75 (secret unreadable) is still restarted.
+ExecStartPre=-/opt/xtnl/order-server/.venv/bin/python -m src.deadman_receiver --check-config
 ExecStart=/opt/xtnl/order-server/.venv/bin/python -m src.deadman_receiver
 RestartPreventExitStatus=78
 Restart=always

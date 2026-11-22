@@ -5,7 +5,8 @@
 .DESCRIPTION
   Sends Ctrl+C to start-xtnl.ps1's hidden console (send-ctrl-c.ps1): the engine gets SIGINT and drains, records
   its stop in engine_runs (end_reason SIGINT) and exits; the order-server API (python -m src.api, when enabled)
-  on the same console closes its listener and exits too; start-xtnl.ps1 waits for both and exits 0, so the task
+  and the live view (python -m src.liveview, when enabled; read-only, docs/runbooks/live-view.md) on the same
+  console close their listeners and exit too; start-xtnl.ps1 waits for them and exits 0, so the task
   does not restart it. If it has not stopped within -TimeoutS, the task is ended hard (Stop-ScheduledTask /
   Stop-Process); the kill-on-close job ends the engine with it and the next start-up catch-up re-reads what
   changed. The containers keep running unless -Containers is given (`docker compose --profile md stop`, data
@@ -42,7 +43,7 @@ $target = Get-StartXtnl
 if ($null -eq $target) {
     Write-Host 'start-xtnl.ps1 is not running (no live pid in var\logs\start-xtnl.pid).'
 } else {
-    Write-Host "sending Ctrl+C to start-xtnl.ps1 (pid $target), the engine and the order-server API on its console"
+    Write-Host "sending Ctrl+C to start-xtnl.ps1 (pid $target), the engine, the order-server API and the live view on its console"
     $helperArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $Helper), '-TargetPid', [string]$target)
     $h = Start-Process -FilePath $PsExe -ArgumentList $helperArgs -WindowStyle Hidden -Wait -PassThru
     if ($h.ExitCode -ne 0) { Write-Host "Ctrl+C could not be delivered (helper exit $($h.ExitCode))" }
@@ -53,7 +54,7 @@ if ($null -eq $target) {
         catch { $gone = -not (Get-Process -Id $target -ErrorAction SilentlyContinue) }
     }
     if ($gone) {
-        Write-Host 'stopped cleanly (engine and order-server API).'
+        Write-Host 'stopped cleanly (engine, order-server API and live view).'
     } else {
         Write-Host 'not stopped in time: ending it hard (its kill-on-close job ends the engine too).'
         $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue

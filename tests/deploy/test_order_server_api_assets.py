@@ -71,7 +71,7 @@ def test_no_script_changes_firewall_router_or_tasks_it_should_not(path: Path) ->
     for forbidden in ("New-NetFirewallRule", "Set-NetFirewall", "netsh", "Remove-NetFirewallRule", "powercfg",
                       "Add-MpPreference", "New-NetNat", "upnp"):
         assert forbidden.lower() not in code.lower(), (path.name, forbidden)
-    if path.name != "install-autostart.ps1":
+    if path.name not in {"install-autostart.ps1", "install-backup-task.ps1", "install-ups-watch.ps1"}:
         assert "Register-ScheduledTask" not in code, path.name
 
 
@@ -104,7 +104,9 @@ def test_api_child_gets_no_broker_credentials_or_engine_storage() -> None:
     assert "-Stdin -DropEnv $ApiDropEnv" in code                      # the API child
     assert "'' -DropEnv $EngineDropEnv" in code                       # the engine child
     m = re.search(r"\$EngineDropEnv = @\(([^)]*)\)", code)
-    assert m is not None and set(re.findall(r"'([^']+)'", m.group(1))) == {"XTNL_API_SECRET", "XTNL_API_DSN"}
+    assert m is not None and set(re.findall(r"'([^']+)'", m.group(1))) == {"XTNL_API_SECRET", "XTNL_API_DSN",
+                                                                           "XTNL_LIVEVIEW_DSN", "XTNL_BACKUP_*",
+                                                                           "RCLONE_*", "B2_*"}
     pumped = code[code.index("function Start-Pumped"):code.index("function Wait-Pumped")]
     assert "[string[]]$DropEnv = @()" in pumped
     assert "$psi.EnvironmentVariables.Remove($name)" in pumped and "$name -like $pattern" in pumped
@@ -214,6 +216,88 @@ def test_every_user_environment_name_but_the_apis_own_is_dropped_from_the_api_ch
     for name in names:
         if not name.startswith("XTNL_API_"):
             assert settings.forbidden_env_names({name: "x"}) == [name], name
+
+
+# ---------------------------------------------------------------------------------------------- live view (s5)
+LIVEVIEW_DROP = ["STONE_X_*", "CTRADER_*", "XTNL_MD_*", "XTNL_ARM_*", "XTNL_SMTP_*", "XTNL_SES_*", "XTNL_PUSH_*",
+                 "XTNL_API_*", "ORDER_SERVER_DSN", "REDIS_URL", "BROKER_ENV", "XTNL_DEADMAN_TOKEN",
+                 "XTNL_HEARTBEAT_COPY_TOKEN", "XTNL_DASHBOARD_DSN", "XTNL_HEARTBEAT_COPY_URL",
+                 "XTNL_BACKUP_*", "RCLONE_*", "B2_*"]
+
+
+def _like(name: str, pattern: str) -> bool:
+    """PowerShell `-like` ignores case: compare both sides upper-cased."""
+    return fnmatch.fnmatchcase(name.upper(), pattern.upper())
+
+
+def test_live_view_drop_list_is_the_explicit_refuse_list() -> None:
+    """docs/design/live-view.md s4.1 / s5: only the explicit prefixes and names, never the generic rule."""
+    code = _code(LOCAL / "start-xtnl.ps1")
+    assert _ps_list(code, "LiveViewDropEnv") == LIVEVIEW_DROP
+    assert "'[liveview] ' -Stdin -DropEnv $LiveViewDropEnv" in code
+
+
+def test_live_view_child_gets_no_user_environment_name_but_its_own_dsn() -> None:
+    code = _code(LOCAL / "start-xtnl.ps1")
+    drop = _ps_list(code, "LiveViewDropEnv")
+    names = _ps_list(code, "UserVarNames")
+    assert "XTNL_LIVEVIEW_DSN" in names
+    for name in names:
+        if name == "XTNL_LIVEVIEW_DSN":
+            continue
+        assert any(_like(name, p) for p in drop), f"{name} would reach the live view child"
+    # its own DSN survives Start-Pumped's `-like` removal, or the child would exit 78 on every start
+    assert not [p for p in drop if _like("XTNL_LIVEVIEW_DSN", p)]
+    for p in drop:
+        assert "*" not in p[:-1], f"{p}: a wildcard only at the end"
+    # the DSN reaches the live view only: dropped from the engine and the API children, refused in the env file
+    assert "XTNL_LIVEVIEW_DSN" in _ps_list(code, "EngineDropEnv")
+    assert "XTNL_LIVEVIEW_DSN" in _ps_list(code, "ApiDropEnv")
+    assert "XTNL_LIVEVIEW_DSN" in _ps_list(code, "ForbiddenInFile")
+    assert "XTNL_LIVEVIEW_DSN" in settings.FORBIDDEN_NAMES
+    # the name only: the non-secret live view settings never make the API exit 78
+    assert settings.forbidden_env_names({"XTNL_LIVEVIEW_ADDR": "127.0.0.1:8090"}) == []
+    assert settings.forbidden_env_names({"XTNL_LIVEVIEW_DSN": "x"}) == ["XTNL_LIVEVIEW_DSN"]
+
+
+def test_supervisor_runs_the_live_view_as_a_third_child() -> None:
+    code = _code(LOCAL / "start-xtnl.ps1")
+    assert "@('-m', 'src.liveview', '--stop-on-stdin-eof') '[liveview] ' -Stdin" in code
+    assert "[switch]$NoLiveView" in code
+    assert re.search(r"\[int\]\$LiveViewRetryFirstS = 5\b", code)
+    assert re.search(r"\[int\]\$LiveViewRetryMaxS = 300\b", code)
+    step = code[code.index("function Step-LiveView"):code.index("function Stop-LiveView")]
+    assert "[Math]::Min($l.Delay * 2, $LiveViewRetryMaxS)" in step
+    assert "if ($code -eq 78)" in step and "$l.Enabled = $false" in step       # configuration refused: disabled
+    assert "TotalMinutes -ge 10) { $l.Delay = $LiveViewRetryFirstS }" in step
+    # started inside step 8 only, after the API; stopped when the engine run ends
+    attempt = code[code.index("function Invoke-Attempt"):code.index("function Invoke-Cleanup")]
+    assert (attempt.index("$RunLocal") < attempt.index("Step-Api") < attempt.index("Step-LiveView")
+            < attempt.index("Stop-LiveView"))
+    assert "foreach ($st in @($script:Engine, $script:Api.St, $script:LiveView.St))" in attempt
+    assert code.count("Step-LiveView") == 2 and code.count("Start-LiveView") == 2   # definition + one call each
+    main = code[code.index("function Invoke-Main"):code.index("function Invoke-Attempt")]
+    assert "Step-LiveView" not in main and "Start-LiveView" not in main
+    cleanup = code[code.index("function Invoke-Cleanup"):]
+    assert "Stop-LiveView" in cleanup
+    stop = code[code.index("function Stop-LiveView"):code.index("function ", code.index("function Stop-LiveView") + 1)]
+    assert "StandardInput.Close()" in stop and "Stop-Tree" in stop
+    # enabled only with XTNL_LIVEVIEW_DSN from the Windows User environment and without -NoLiveView
+    assert main.index("if ($NoLiveView)") < main.index("$loaded -contains 'XTNL_LIVEVIEW_DSN'")
+    assert "$script:LiveView.Enabled = $true" in main
+    assert "live view disabled: XTNL_LIVEVIEW_DSN is not set" in main
+    assert "$script:LiveView = @{ Enabled = $false;" in code
+
+
+def test_status_and_stop_cover_the_live_view() -> None:
+    st = _code(LOCAL / "status-xtnl.ps1")
+    assert "$lvAddr = ([string]$env:XTNL_LIVEVIEW_ADDR).Trim()" in st              # the configured address
+    assert "if ($lvAddr -eq '') { $lvAddr = '127.0.0.1:8090' }" in st
+    assert "$client.BeginConnect($lvHost, $lvPort, $null, $null)" in st
+    assert "live view: listening on {0}" in st
+    assert "[Environment]::GetEnvironmentVariable('XTNL_LIVEVIEW_DSN', 'User'))" in st
+    assert "'XTNL_LIVEVIEW_DSN', $" not in st.replace("'XTNL_LIVEVIEW_DSN', 'User'", "")   # never copied or set
+    assert "live view" in (LOCAL / "stop-xtnl.ps1").read_text(encoding="utf-8")
 
 
 def test_redis_md_step_runs_only_with_xtnl_md_enabled_and_is_never_fatal() -> None:

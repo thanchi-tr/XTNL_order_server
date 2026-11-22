@@ -20,7 +20,7 @@ import asyncio
 import logging
 from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, Protocol
+from typing import Any, Final, Literal, Protocol
 
 from src.dto import OrderDTO, PositionDTO
 from src.oversee.config import OverseeConfig, SweepConfig
@@ -35,7 +35,15 @@ from src.oversee.notify import (
     is_acknowledged,
 )
 from src.oversee.risk import RiskUnknown, effective_stop_detail, needs_stop
-from src.oversee.rules import INPUT_FLAG_RULES, STALE_MARK, EvalContext, Evaluation, RuleRegistry, stale_symbols
+from src.oversee.rules import (
+    INPUT_FLAG_RULES,
+    STALE_ACCOUNT_IMAGE,
+    STALE_MARK,
+    EvalContext,
+    Evaluation,
+    RuleRegistry,
+    stale_symbols,
+)
 from src.oversee.snapshot import AccountSnapshot, DependencyUnavailable, SnapshotReader, SodMark, StopWatchKey
 from src.oversee.states import StepParams, resolve_state, step_state
 from src.oversee.types import (
@@ -80,6 +88,92 @@ def sod_partial_alert(account_id: str, sod: SodMark | None, now_ms: int) -> Outb
 def _input_flag_state(s: BreachState) -> bool:
     """A stale / FENCE input FLAG state (`stale_account_image`, `stale_mark`): its re-pages are dependent alerts."""
     return s.rule_id in INPUT_FLAG_RULES
+
+
+#: The streams whose loss can hide an order or a position (the §2 fence). A lost prices feed hides none.
+ENTITY_STREAMS: Final = frozenset({"orders", "positions", "account"})
+MARGIN_USAGE: Final = "margin_usage"
+
+
+#: How long a flat-looking account's re-pages wait for a lost stream or a stale image to clear (`FlatView`): longer than
+#: the start-up catch-up holds the fence (7-22 s seen), far shorter than the 30 min re-page cadence. Past it, re-page.
+FLAT_UNSURE_MAX_MS: Final = 120_000
+
+
+@dataclass(frozen=True)
+class FlatView:
+    """`flat`: the account holds nothing a rule state could act on and its image says so reliably. `unsure_since`:
+    the image shows nothing open, but an orders / positions / account stream of its adapter is lost (`conn_lost_at`,
+    any age: the start-up catch-up holds the fence on every start) or `stale_account_image` is active, so it may be
+    missing a position; the earliest of those times. Neither: the account has (or may have) exposure."""
+
+    flat: bool
+    unsure_since: int | None = None
+
+    def repages_held(self, now_ms: int, term_start_ms: int) -> bool:
+        """Re-pages are held while flat, and deferred (not dropped) for up to FLAT_UNSURE_MAX_MS while unsure. The
+        wait runs from no earlier than this term's start: `conn_lost_at` (kept by LEADER_INIT's COALESCE) and the
+        `stale_account_image` row outlive a crashed or SAFE_HOLD-ended term, so a restart more than FLAT_UNSURE_MAX_MS
+        later would otherwise re-page a flat account at once."""
+        if self.flat:
+            return True
+        if self.unsure_since is None:
+            return False
+        return now_ms - max(self.unsure_since, term_start_ms) < FLAT_UNSURE_MAX_MS
+
+
+def _flat_view(snap: AccountSnapshot, states: Iterable[BreachState]) -> FlatView:
+    """oversee-rules.md §10 accepted deviation (owner request 2026-11-20): a flat account is not paged about states
+    left over after every position was closed (seen live: a daily-loss FLAG `transfers_unverified` re-paged every
+    30 min all night, and again at each restart). Exposure: an integrity incident, an OPEN position, a non-terminal
+    order, margin in use by the broker's live fields (a position the image is missing still holds margin) or an
+    active `margin_usage` state. Unsure / flat: see FlatView. While flat, re-pages and the per-day FLAG alerts
+    (`_quiet_day_flag`) are not sent; while unsure, re-pages wait at most FLAT_UNSURE_MAX_MS and the per-day FLAG
+    alerts are sent (fail loud). Every other alert and every halt-level change is unaffected; re-pages resume on
+    the first pass that sees exposure (the cadence runs from the last delivery, so a long-held state re-pages at
+    once)."""
+    exposed = FlatView(False)
+    if snap.integrity_incident:
+        return exposed
+    states = list(states)
+    if any(s.active and s.rule_id == MARGIN_USAGE for s in states):
+        return exposed
+    live = snap.account_live
+    if live is not None and live.margin_used is not None and live.margin_used > 0:
+        return exposed
+    if any(p.status == "OPEN" for p in snap.positions) or any(not o.status.terminal for o in snap.orders):
+        return exposed
+    marks = [h.conn_lost_at_ms for h in snap.stream_health
+             if h.adapter_id == snap.adapter_id and h.stream in ENTITY_STREAMS and h.conn_lost_at_ms is not None]
+    for s in states:
+        if s.active and s.rule_id == STALE_ACCOUNT_IMAGE:
+            if s.active_since is None:
+                return exposed
+            marks.append(s.active_since)
+    if marks:
+        return FlatView(False, min(marks))
+    return FlatView(True)
+
+
+def _flat_account(snap: AccountSnapshot, states: Iterable[BreachState]) -> bool:
+    """Flat and the image current (`_flat_view`)."""
+    return _flat_view(snap, states).flat
+
+
+ACCOUNT_DAY: Final = "account_day"
+
+
+def _quiet_day_flag(t: Transition, before: Mapping[StateKey, BreachState]) -> bool:
+    """A transition of a per-day account state (`max_daily_loss`, subject `account_day`) that stays at FLAG or below
+    on both sides: the day roll's resolve of yesterday's FLAG and the new day's FLAG activation (`transfers_unverified`),
+    or a FLAG capped / uncapped. While the account is flat and its image current its alert is not sent (oversee-rules.md §10 accepted
+    deviation, owner request 2026-11-20); the `oversee_events` row is still written. A transition from or to SOFT /
+    HARD always alerts."""
+    if t.subject_type != ACCOUNT_DAY:
+        return False
+    prev = before.get((t.rule_id, t.subject_type, t.subject_id))
+    was = prev.level if prev is not None and prev.active else Level.PASS
+    return max(was, t.level) <= Level.FLAG
 
 
 def _closed_market_stale_mark(s: BreachState, evals: Mapping[StateKey, Evaluation], snap: AccountSnapshot) -> bool:
@@ -383,6 +477,7 @@ class RiskSweep:
         self._cfg = config
         self._clock = clock
         self._epoch = epoch
+        self._term: tuple[int, int] | None = None          # (engine epoch, first time this sweep saw it)
         self._sweep_ids = sweep_ids or HlcSweepIds(clock)
         self._cf_requester = cash_flow_requester
         self._pager = pager
@@ -651,6 +746,8 @@ class RiskSweep:
             result = apply_pass(prev, evals, now, sweep_id, self._cfg.sweep, self._registry.rule_ids)
             sw_set, sw_clear = stop_watch_changes(snap, now)
             alerted, held, why = self._split_alerts(snap, result.transitions, now)
+            if _flat_account(snap, result.states.values()):             # not while unsure: fail loud
+                alerted = [t for t in alerted if not _quiet_day_flag(t, prev)]
             outbox = tuple(alerts_for_transitions(alerted))
             sod_alert = sod_partial_alert(acct, new_sod, now)
             batch = AccountWrite(
@@ -747,13 +844,17 @@ class RiskSweep:
         """Cash-flow request, then the re-pages due (every active state, FLAG included, oversee-rules.md §10).
         `alerted`: the episodes whose alert this pass wrote. `why`: the adapter's dependent alerts are held back
         now (AlertInhibitor), so the input FLAG states (stale / FENCE) are not re-paged either. A `stale_mark` state
-        whose symbols are all closed / in their roll break is not re-paged (`_closed_market_stale_mark`)."""
+        whose symbols are all closed / in their roll break is not re-paged (`_closed_market_stale_mark`), a flat
+        account re-pages nothing, and a flat-looking account whose image may be missing something waits up to
+        FLAT_UNSURE_MAX_MS (`_flat_view`)."""
         wants = any(isinstance(ev.outcome, Result) and ev.outcome.wants_cash_flows for ev in evals.values())
         if wants:
             self._request_cash_flows(acct, now)
         if self._dispatcher is not None:
+            held = _flat_view(snap, result.states.values()).repages_held(now, self._term_start(now))
             states = [s for s in result.states.values()
-                      if (why is None or not _input_flag_state(s)) and not _closed_market_stale_mark(s, evals, snap)]
+                      if not held and (why is None or not _input_flag_state(s))
+                      and not _closed_market_stale_mark(s, evals, snap)]
             self._dispatcher.mark_alerted(alerted, now)
             try:
                 await self._dispatcher.queue_repages(states, snap.acks, now)
@@ -763,6 +864,13 @@ class RiskSweep:
                 self._latched_page(Page("high", "repage_failed", acct, "", now))
             else:
                 self._unlatch("repage_failed", acct)
+
+    def _term_start(self, now: int) -> int:
+        """The first time this sweep ran under the current engine epoch (a new term restarts the clock)."""
+        epoch = self._epoch()
+        if self._term is None or self._term[0] != epoch:
+            self._term = (epoch, now)
+        return self._term[1]
 
     def _request_cash_flows(self, acct: str, now: int) -> None:
         """Unexplained balance decrease -> fetch_cash_flows via the orchestrator, at most once a minute."""

@@ -6,8 +6,13 @@
 - An item reaching Closed(9) with no prior Open is a closing trade: reduce-only, never a position.
 - If-done stop / limit children stay separate reduce-only OrderDTOs with linked_position_id = parent
   OrderId. The parent is learned from REST (ParentOrderId, StopOrder / LimitOrder of a position,
-  IfDone) or, failing that, from XTNL's proven rule: a Pending(1) stop / limit is a bracket whose
-  LastChangedTime equals its parent's first LastChangedTime.
+  IfDone) or, failing that, from XTNL's proven rule: a Pending(1) stop / limit is a bracket whose first
+  LastChangedTime equals its parent's first LastChangedTime, on the same trading account and market and on the
+  opposite side; more than one such candidate is never guessed. A candidate is registered when its first frame
+  arrives (``note_frame``), even while that frame is held for its own REST read, and the adapter keeps a held
+  bracket held until every held candidate of its key has finished its read (``bracket_candidates``), so a
+  bracket is mapped once, after its parent (live finding 2026-11-20: a sell-stop entry's stop and take-profit
+  children were committed unlinked, so the entry and both children read as missing a stop).
 - Versions: ORDER and POSITION carry the item's LastChangedTime (broker-time domain).
 - ``order_kind`` (design PR1) comes from the memo's order type: an item without ``Type`` keeps the type last
   seen for that order (from an earlier item or a REST read), so a stop never loses its kind; a Trade has none.
@@ -116,6 +121,7 @@ class _OrderMemo:
     bracket: bool = False      # seen as a Pending stop / limit (if-done child evidence)
     closing: bool = False      # a closing trade (reduce-only)
     terminal: bool = False     # its OrderDTO reached a terminal status
+    first_ts: int | None = None   # the order's first LastChangedTime (a bracket carries its parent's)
 
 
 @dataclass
@@ -128,6 +134,7 @@ class _PositionMemo:
 
 
 Emitted = OrderDTO | PositionDTO
+_CandKey = tuple[str | None, str | None, int]   # (trading account, market, first LastChangedTime)
 
 
 class OrderStreamMapper:
@@ -145,7 +152,11 @@ class OrderStreamMapper:
         self._looked_up: OrderedDict[str, bool] = OrderedDict()
         self._entry_looked_up: OrderedDict[str, bool] = OrderedDict()
         self._rest_entry: OrderedDict[str, Decimal] = OrderedDict()   # K8: REST entry price per OrderId
-        self._first_ts: OrderedDict[tuple[str | None, int], str] = OrderedDict()
+        # Bracket-parent candidates: (trading account, market, first LastChangedTime) -> [(order id, side)], and
+        # the reverse index; registered from an order's first frame (note_frame).
+        self._cands: OrderedDict[_CandKey, list[tuple[str, Side | None]]] = OrderedDict()
+        self._cand_of: OrderedDict[str, _CandKey] = OrderedDict()
+        self._noted: OrderedDict[str, bool] = OrderedDict()
         self.watermark_ms: int | None = None
 
     # --- knowledge from REST snapshots ---------------------------------------------------
@@ -154,6 +165,7 @@ class OrderStreamMapper:
         if parent_id is not None and parent_id != child_id:
             _remember(self._parents, child_id, parent_id)
             self._standalone.pop(child_id, None)
+            self._drop_candidate(child_id)        # a known child is never a bracket parent
         elif child_id not in self._parents:
             _remember(self._standalone, child_id, True)
 
@@ -186,6 +198,75 @@ class OrderStreamMapper:
 
     def parent_of(self, order_id: str) -> str | None:
         return self._parents.get(order_id)
+
+    # --- bracket-parent candidates ---------------------------------------------------------------
+    def note_frame(self, item: OrderItem) -> None:
+        """Called by the adapter as each ORDERS frame arrives, before it may be held for a REST read: an order's
+        first frame registers it as a bracket-parent candidate at once. Never a Pending stop / limit (itself a
+        bracket), an order first seen through REST, or a known child."""
+        oid = item.order_id
+        if oid in self._noted:
+            return
+        _remember(self._noted, oid, True)
+        if oid in self._orders or oid in self._parents or item.last_changed_ms is None:
+            return
+        if item.order_type in CHILD_TYPES and item.status == StoneXOrderStatus.PENDING:
+            return
+        key: _CandKey = (item.trading_account_id, item.market_id, item.last_changed_ms)
+        _remember(self._cands, key, [*(self._cands.get(key) or []), (oid, item.side)])
+        _remember(self._cand_of, oid, key)
+
+    def bracket_candidates(self, item: OrderItem) -> list[str]:
+        """The candidates (valid yet or not) sharing this item's bracket key, other than itself, when the item is a
+        Pending stop / limit whose parent is not known: the orders a held bracket waits for before it is mapped."""
+        oid = item.order_id
+        memo = self._orders.get(oid)
+        order_type = item.order_type or (memo.order_type if memo is not None else None)
+        if (item.last_changed_ms is None or oid in self._parents or oid in self._standalone
+                or order_type not in CHILD_TYPES or item.status != StoneXOrderStatus.PENDING):
+            return []
+        ts = memo.first_ts if memo is not None and memo.first_ts is not None else item.last_changed_ms
+        account = item.trading_account_id or (memo.trading_account_id if memo is not None else None)
+        market = item.market_id or (memo.market_id if memo is not None else None)
+        return [p for p, _side in self._cands.get((account, market, ts)) or [] if p != oid]
+
+    def _drop_candidate(self, oid: str) -> None:
+        key = self._cand_of.pop(oid, None)
+        found = self._cands.get(key) if key is not None else None
+        if key is not None and found is not None:
+            rest = [c for c in found if c[0] != oid]
+            if rest:
+                self._cands[key] = rest
+            else:
+                del self._cands[key]
+
+    def _bracket_parent(self, oid: str, memo: _OrderMemo, item_ts: int | None) -> str | None:
+        """The one valid candidate at this bracket's first LastChangedTime (else, before the memo has one, the
+        item's). Valid: on the opposite side, not itself a child, a bracket or a closing trade. More than one valid,
+        or a candidate whose side is still unknown, is never guessed. Never a later item's time: an order first
+        seen after the bracket was created cannot be its parent."""
+        ts = memo.first_ts if memo.first_ts is not None else item_ts
+        found = [c for c in self._cands.get((memo.trading_account_id, memo.market_id, ts)) or [] if c[0] != oid]             if ts is not None else []
+        verdicts = [self._parent_ok(memo, p, side) for p, side in found]
+        if not found or None in verdicts:
+            return None                          # none, or a candidate's side is not known yet: undecided
+        valid = [p for (p, _s), ok in zip(found, verdicts) if ok]
+        if len(valid) != 1:
+            return None
+        _remember(self._parents, oid, valid[0])
+        return valid[0]
+
+    def _parent_ok(self, memo: _OrderMemo, parent: str, side: Side | None) -> bool | None:
+        """True / False, or None when the candidate's side is not known yet."""
+        if parent in self._parents:
+            return False
+        pmemo = self._orders.get(parent)
+        if pmemo is not None and (pmemo.closing or pmemo.bracket):
+            return False
+        parent_side = side or (pmemo.side if pmemo is not None else None)
+        if parent_side is None or memo.side is None:
+            return None
+        return parent_side != memo.side
 
     def known_position(self, position_id: str) -> tuple[str | None, Side, Decimal | None] | None:
         """(market id, side, entry price) of a position this process has seen (stream or REST), else None."""
@@ -293,12 +374,9 @@ class OrderStreamMapper:
         memo = self._orders.get(item.order_id)
         if memo is None:
             memo = _OrderMemo()
-            is_bracket = item.order_type in CHILD_TYPES and item.status == StoneXOrderStatus.PENDING
-            if item.last_changed_ms is not None and not is_bracket and item.order_id not in self._parents:
-                # candidate parent: its first LastChangedTime is what its brackets carry (XTNL)
-                self._first_ts.setdefault((item.market_id, item.last_changed_ms), item.order_id)
-                while len(self._first_ts) > MEMO_CAP:
-                    self._first_ts.popitem(last=False)
+            self.note_frame(item)             # candidate parent: its brackets carry its first LastChangedTime
+        if memo.first_ts is None:
+            memo.first_ts = item.last_changed_ms
         memo.market_id = item.market_id or memo.market_id
         memo.trading_account_id = item.trading_account_id or memo.trading_account_id
         memo.side = item.side or memo.side
@@ -319,12 +397,8 @@ class OrderStreamMapper:
             return False, None
         if memo.order_type in CHILD_TYPES and (code == StoneXOrderStatus.PENDING or memo.bracket):
             memo.bracket = True
-            parent = (self._first_ts.get((memo.market_id, item.last_changed_ms))
-                      if item.last_changed_ms is not None else None)
-            if parent is not None and parent != oid:
-                _remember(self._parents, oid, parent)
-                return True, parent
-            return True, None
+            self._drop_candidate(oid)         # a bracket is never a bracket parent
+            return True, self._bracket_parent(oid, memo, item.last_changed_ms)
         return False, None
 
     def _on_open(self, item: OrderItem, memo: _OrderMemo, pos: _PositionMemo | None,

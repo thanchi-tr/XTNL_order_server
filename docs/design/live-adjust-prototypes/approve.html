@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#04080f">
+<title>Approvals · XTNL live adjust (prototype)</title>
+<link rel="stylesheet" href="theme.css">
+<script src="proto.js" defer></script>
+</head>
+<body data-page="approve">
+<div class="banners" id="banners"></div>
+<main class="wrap" id="main">
+  <div class="pagehead">
+    <div>
+      <div class="eyebrow">Phase 3 · you approve each stop move</div>
+      <h1>Approvals</h1>
+      <p class="lede">The order-server proposes a stop move only at a bar end, and nothing is sent until you approve. Each request expires at most 60 seconds after that bar-end decision (D4), sooner for a delayed decision; the expiry time is on the request.</p>
+    </div>
+    <span class="meta">Local approval page (D5) · own login · every answer is audited</span>
+  </div>
+
+  <div class="grid-2">
+    <div class="stack">
+      <section class="req" id="req" data-state="awaiting" aria-labelledby="reqTitle">
+        <div class="req-head">
+          <div>
+            <span class="who who--server"><svg viewBox="0 0 12 12" aria-hidden="true"><rect x="1.5" y="1.5" width="9" height="4" rx="1"/><rect x="1.5" y="6.5" width="9" height="4" rx="1"/></svg>Server proposes</span>
+            <h2 class="req-title" id="reqTitle">Move Order 1’s stop to break-even</h2>
+          </div>
+          <span class="chip chip-warn pulse" id="reqState">▲ AWAITING YOU</span>
+        </div>
+        <div class="req-body">
+          <div>
+            <div class="move" role="group" aria-label="Stop move from 1.09800 to 1.10000">
+              <div class="move-side">
+                <div class="move-label">Stop now (at broker)</div>
+                <div class="move-value num" id="curStop">1.09800</div>
+                <div class="move-sub">−1.00R from entry</div>
+              </div>
+              <div class="move-arrow"><svg viewBox="0 0 28 28" aria-hidden="true"><path d="M4 14h19M17 8l6 6-6 6"/></svg></div>
+              <div class="move-side">
+                <div class="move-label">Proposed stop</div>
+                <div class="move-value num target">1.10000</div>
+                <div class="move-sub">break-even · 0R</div>
+              </div>
+            </div>
+            <dl>
+              <div class="kv"><dt>Position</dt><dd class="hi">Order 1 · EURUSD · long · 1039712204</dd></div>
+              <div class="kv"><dt>Why</dt><dd>bar 3 close 1.15R &gt; risk 1R</dd></div>
+              <div class="kv"><dt>Decided</dt><dd>bar end 11:00:11 UTC</dd></div>
+              <div class="kv"><dt>Expires</dt><dd class="hi">11:01:11 UTC</dd></div>
+              <div class="kv"><dt>Direction</dt><dd>tightens only · never loosens</dd></div>
+              <div class="kv"><dt>Intent</dt><dd>7f3a91c2</dd></div>
+            </dl>
+          </div>
+          <div class="countdown">
+            <svg class="ring" viewBox="0 0 132 132" aria-hidden="true">
+              <circle class="track" cx="66" cy="66" r="56"/>
+              <circle class="arc" id="ringArc" cx="66" cy="66" r="56" stroke-dashoffset="0"/>
+              <text x="66" y="70" text-anchor="middle" id="ringSecs">59</text>
+              <text class="unit" x="66" y="90" text-anchor="middle">SECONDS LEFT</text>
+            </svg>
+            <p class="sr-only" id="ringSr">59 seconds left. Expires 11:01:11 UTC.</p>
+            <span class="meta">at most 60 s after the decision (D4)</span>
+          </div>
+        </div>
+        <ol class="steps" id="steps" aria-label="Progress of this stop move">
+          <li class="step">Proposed</li><li class="step">Awaiting you</li><li class="step">Approved</li><li class="step">Checking</li><li class="step">Sending</li><li class="step">Acked</li><li class="step">Confirmed</li>
+        </ol>
+        <div class="req-actions" id="reqActions">
+          <button class="btn btn-primary" id="btnApprove" type="button">Approve move</button>
+          <button class="btn btn-danger" id="btnReject" type="button">Reject</button>
+        </div>
+        <div class="req-note" id="reqNote"></div>
+        <div class="sr-only" id="reqLive" aria-live="polite" aria-atomic="true"></div>
+        <div class="sr-only" id="ringAlert" aria-live="assertive"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="histH">
+        <div class="panel-head"><h2 id="histH">Recent stop moves</h2><span class="meta">today · all orders · Phase 3</span></div>
+        <div class="tbl-wrap" role="region" aria-labelledby="histH" tabindex="0">
+          <table class="tbl">
+            <thead><tr><th>Time</th><th>Intent</th><th>Order</th><th>Stop</th><th>Outcome</th><th>Detail</th></tr></thead>
+            <tbody id="histBody">
+              <tr><td data-label="Time">10:45:51</td><td data-label="Intent">2b91e07d</td><td data-label="Order">Order 2 · EURUSD long</td><td data-label="Stop">1.09950 → 1.10050</td><td data-label="Outcome"><span class="chip chip-ok">✓ CONFIRMED</span></td><td class="wrap-cell" data-label="Detail">approved 10:45:50 by you</td></tr>
+              <tr><td data-label="Time">10:31:11</td><td data-label="Intent">9d12f4e0</td><td data-label="Order">Order 3 · GBPUSD long</td><td data-label="Stop">1.26400 → 1.26520</td><td data-label="Outcome"><span class="chip chip-muted">○ EXPIRED</span></td><td class="wrap-cell" data-label="Detail">no answer in 60 s</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <div class="stack">
+      <section class="panel" aria-labelledby="ctxH">
+        <div class="panel-head"><h2 id="ctxH">Order 1 now</h2><span class="chip chip-warn">▲ ADVICE OUTSTANDING</span></div>
+        <div class="panel-body">
+          <dl>
+            <div class="kv"><dt>Entry</dt><dd>1.10000 · 10:03:20</dd></div>
+            <div class="kv"><dt>1R</dt><dd>0.00200</dd></div>
+            <div class="kv"><dt>Take profit</dt><dd>none</dd></div>
+            <div class="kv"><dt>Stop owner</dt><dd><span class="who who--server"><svg viewBox="0 0 12 12" aria-hidden="true"><rect x="1.5" y="1.5" width="9" height="4" rx="1"/><rect x="1.5" y="6.5" width="9" height="4" rx="1"/></svg>Server</span></dd></div>
+            <div class="kv"><dt>Next bar end</dt><dd>11:15:11</dd></div>
+          </dl>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="howH">
+        <div class="panel-head"><h2 id="howH">What happens</h2></div>
+        <div class="panel-body stack">
+          <div class="story" data-tone="info"><div class="story-meta"><span class="who who--you"><svg viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="3.8" r="2.2"/><path d="M1.8 11c.5-2.4 2.2-3.6 4.2-3.6s3.7 1.2 4.2 3.6"/></svg>You</span>approve before it expires</div><div class="story-text">The server checks the gate, the broker’s current stop and the live price again, then sends one in-place amend.</div></div>
+          <div class="story" data-tone="ok"><div class="story-meta"><span class="who who--server"><svg viewBox="0 0 12 12" aria-hidden="true"><rect x="1.5" y="1.5" width="9" height="4" rx="1"/><rect x="1.5" y="6.5" width="9" height="4" rx="1"/></svg>Server</span>after the broker confirms</div><div class="story-text">The stop sits at break-even. The position is released after the next bar end that sees it there.</div></div>
+          <div class="story"><div class="story-meta">if you do nothing</div><div class="story-text">The request expires and the stop stays where it is. The next bar end proposes again.</div></div>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="phH">
+        <div class="panel-head"><h2 id="phH">On your phone</h2><span class="chip chip-muted">LATER</span></div>
+        <div class="panel-body">
+          <div class="locked"><svg viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg>Phone access through a tunnel<span class="chip chip-muted">NEEDS ITS OWN SECURITY DESIGN</span></div>
+          <p class="muted">Today this page answers only on this PC; the layout already works at phone width. The tunnel adds strong authentication on every request, TLS end to end, no unauthenticated public route, CSRF-protected approvals bound to one intent, a session timeout and the same audit trail.</p>
+        </div>
+      </section>
+    </div>
+  </div>
+</main>
+<div class="demo" role="region" aria-label="Prototype controls">
+  <span class="demo-label">Prototype</span>
+  <button class="seg" type="button" data-demo="restart">New request</button>
+  <button class="seg" type="button" data-demo="low">12 s left</button>
+  <button class="seg" type="button" data-demo="refuse">Refused at check</button>
+</div>
+</body>
+</html>

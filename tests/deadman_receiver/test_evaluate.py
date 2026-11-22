@@ -106,7 +106,9 @@ def test_adapter_not_streaming_pages_only_after_2_min_while_open() -> None:
     down = {"stonex": AdapterBeat("BACKOFF", True, None)}
     assert f.run(105, adapters=down) == set()               # 1:45 not streaming
     assert f.run(30, adapters=down) == {"adapter_not_streaming:stonex"}
-    assert f.run(15) == set()                               # STREAMING again: resolved
+    # STREAMING again: held SOURCE_LIVE_MS (40 s) after the last beat that showed it (round 9), then resolved
+    assert f.run(15) == {"adapter_not_streaming:stonex"}
+    assert f.run(30) == set()
 
 
 def test_market_closed_or_maintenance_suppresses_the_adapter_page() -> None:
@@ -122,10 +124,12 @@ def test_market_closed_or_maintenance_suppresses_the_adapter_page() -> None:
 
 def test_null_fields_page_on_the_first_beat_that_lacks_them() -> None:
     """8.2 (operations.md §9 "pages ... when those fields are missing"): no 60 s grace any more (before, a null
-    health field paged only after 60 s). A beat that has them again resolves it."""
+    health field paged only after 60 s). Beats that have them again resolve it, SOURCE_LIVE_MS (40 s) after the last
+    beat that lacked them (round 9)."""
     f = Feed()
     assert f.run(15, sm8_state="READY", gate_state=None) == {"fields_missing:gate_state"}
-    assert f.run(15) == set()
+    assert f.run(15) == {"fields_missing:gate_state"}
+    assert f.run(30) == set()
     g = Feed()
     assert g.run(15, adapters={"stonex": AdapterBeat(None, None, None)}) == {"adapter_fields_missing:stonex"}
     h = Feed()
@@ -151,7 +155,8 @@ def test_sm8_sm5_and_spill_page_after_60_s() -> None:
     assert f.run(45, sm8_state="BOOTSTRAPPING", sm5_state="UNKNOWN", spill_bytes=10) == set()
     assert f.run(30, sm8_state="BOOTSTRAPPING", sm5_state="UNKNOWN", spill_bytes=10) == {
         "sm8_not_ready", "sm5_unknown", "spill_nonempty"}
-    assert f.run(15) == set()
+    assert f.run(15) == {"sm8_not_ready", "sm5_unknown", "spill_nonempty"}   # held 40 s (round 9)
+    assert f.run(30) == set()
 
 
 def test_open_circuit_pages_at_once_per_task() -> None:
@@ -168,9 +173,14 @@ def test_replayed_or_skewed_beats_are_refused() -> None:
     with pytest.raises(BeatError, match="clock"):
         f.ev.accept(parse_beat(body(payload(sent_at_ms=f.now + 600_000))), f.now)
     assert "payload_invalid" in f.ev.active(f.now)
+    bad_at = f.now
     f.now += 15_000
-    f.beat()                                                 # a good beat clears it
-    assert "payload_invalid" not in f.ev.active(f.now)
+    f.beat()                                                 # a good beat after it: held 40 s (review round 5)
+    assert "payload_invalid" in f.ev.active(f.now)
+    f.now += 15_000
+    f.beat()
+    assert "payload_invalid" in f.ev.active(bad_at + 40_000)
+    assert "payload_invalid" not in f.ev.active(bad_at + 40_001)
 
 
 def test_thresholds_are_the_operations_values() -> None:

@@ -20,6 +20,9 @@
     (default var\api-tls\server.crt; python -m
     src.api.selfcheck, with XTNL_API_SECRET copied from the Windows User environment, never shown), plus the
     certificate fingerprint to compare with Vercel's ORDER_SERVER_TLS_FINGERPRINT.
+  * The live view (docs/runbooks/live-view.md; read-only, never sends orders): whether XTNL_LIVEVIEW_DSN is set in
+    the Windows User environment (name only, never the value) and a TCP connect to the configured
+    XTNL_LIVEVIEW_ADDR from deploy\env\local.env (default 127.0.0.1:8090): "live view: listening on <address>".
   * Windows time sync: the offset the engine's own clock check measures (w32tm on Windows; limit 50 ms).
   * redis-md, the market-data store (compose profile md): XTNL_MD_ENABLED from the env file (or inherited from the
     Windows User environment; on only when it is 1 after trimming, as the engine reads it), whether the ACL file
@@ -163,6 +166,30 @@ if ([string]::IsNullOrEmpty($apiSecret)) {
     [Environment]::SetEnvironmentVariable('XTNL_API_SECRET', $null, 'Process')
 }
 $apiSecret = $null
+
+Show-Title 'live view (python -m src.liveview, read-only)'
+# The configured address (XTNL_LIVEVIEW_ADDR from the env file, default 127.0.0.1:8090), never a fixed one; host and
+# port split as host:port or [v6]:port.
+$lvAddr = ([string]$env:XTNL_LIVEVIEW_ADDR).Trim()
+if ($lvAddr -eq '') { $lvAddr = '127.0.0.1:8090' }
+$lvHost = $null; $lvPort = 0
+if ($lvAddr -match '^\[([^\]]+)\]:([0-9]+)$' -or $lvAddr -match '^([^:\[\]]+):([0-9]+)$') {
+    $lvHost = $Matches[1]; $lvPort = [int]$Matches[2]
+}
+$lvDsnSet = -not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable('XTNL_LIVEVIEW_DSN', 'User'))
+if (-not $lvDsnSet) { Write-Host 'XTNL_LIVEVIEW_DSN is not set in the Windows User environment: the live view is disabled (deploy\local\new-liveview-credentials.ps1)' }
+if ($null -eq $lvHost) {
+    Write-Host "live view: XTNL_LIVEVIEW_ADDR is not host:port: $lvAddr"
+} else {
+    $lvUp = $false
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $wait = $client.BeginConnect($lvHost, $lvPort, $null, $null)
+        if ($wait.AsyncWaitHandle.WaitOne(2000) -and $client.Connected) { $lvUp = $true }
+    } catch { $lvUp = $false } finally { $client.Close() }
+    if ($lvUp) { Write-Host ("live view: listening on {0} (http://{0}/ and http://{0}/edge)" -f $lvAddr) }
+    else { Write-Host ("live view: nothing listens on {0} (see the [liveview] lines in the log)" -f $lvAddr) }
+}
 
 Show-Title 'Windows time sync (the engine clock check: w32tm offset, limit 50 ms)'
 if (Test-Path -LiteralPath $Py) { & $Py -c $ClockProbe } else { Write-Host "not found: $Py" }

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#04080f">
+<title>Live mode · XTNL live adjust (prototype)</title>
+<link rel="stylesheet" href="theme.css">
+<script src="proto.js" defer></script>
+</head>
+<body data-page="live">
+<div class="banners" id="banners"></div>
+<main class="wrap" id="main">
+  <div class="pagehead">
+    <div>
+      <div class="eyebrow">Live mode · gate · halt · recovery</div>
+      <h1>Live mode</h1>
+      <p class="lede">Which phase is running, whether the server may send stop moves right now, and why not when it may not.</p>
+    </div>
+    <span class="meta">Mode changes are audited · an unreadable switch counts as off</span>
+  </div>
+
+  <div class="grid-2">
+    <div class="stack">
+      <section class="panel" aria-labelledby="phaseH">
+        <div class="panel-head"><h2 id="phaseH">Autonomy phase</h2><span class="chip chip-ok">✓ ALL PREREQUISITES MET</span></div>
+        <div class="panel-body">
+          <div class="seg-group" role="radiogroup" aria-labelledby="phaseH">
+            <button class="seg" type="button" role="radio" aria-checked="false" tabindex="-1" data-phase="1" data-note="Phase 1: advice only. The server never sends; you move stops yourself.">P1 · advice</button>
+            <button class="seg" type="button" role="radio" aria-checked="true" tabindex="0" data-phase="3" data-note="Phase 3: the server proposes at bar ends and sends only after you approve (at most 60 s after the decision).">P3 · approve</button>
+            <button class="seg" type="button" role="radio" aria-checked="false" tabindex="-1" data-phase="4" data-note="Phase 4: the server sends automatically and tells you the result.">P4 · auto + notify</button>
+            <button class="seg" type="button" role="radio" aria-checked="false" tabindex="-1" data-phase="5" data-note="Phase 5: autonomous. Routine notices can be off; safety alerts stay on (D1).">P5 · autonomous</button>
+          </div>
+          <p class="muted" id="phaseNote">Phase 3: the server proposes at bar ends and sends only after you approve (at most 60 s after the decision).</p>
+          <div class="setrow">
+            <button class="switch" id="liveSwitch" type="button" role="switch" aria-checked="true" aria-labelledby="liveLabel" aria-describedby="liveSub"></button>
+            <div class="setrow-text"><div class="setrow-title" id="liveLabel">Live moves</div><div class="setrow-sub" id="liveSub">Switching off cancels every move not yet sent, in one transaction.</div></div>
+          </div>
+          <p class="muted">Lowering the phase also cancels unsent moves; a lower phase never inherits a move made under a higher one.</p>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="gateH">
+        <div class="panel-head"><h2 id="gateH">Can the server send right now?</h2></div>
+        <div class="panel-body">
+          <div class="tiles" id="gateTiles">
+            <div class="tile" data-tone="ok"><div class="tile-label">Gate · stop tighten</div><div class="tile-value">OPEN</div><div class="tile-sub">stop tighten passes all freshness checks</div></div>
+            <div class="tile" data-tone="ok"><div class="tile-label">Oversee halt</div><div class="tile-value">NONE</div><div class="tile-sub">Oversee level</div></div>
+            <div class="tile" data-tone="ok"><div class="tile-label">Dead-man receiver</div><div class="tile-value">ACK 4 s</div><div class="tile-sub">off-PC receiver</div></div>
+            <div class="tile" data-tone="ok"><div class="tile-label">Live moves</div><div class="tile-value">ON</div><div class="tile-sub">phase 3 · approve</div></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="openH">
+        <div class="panel-head"><h2 id="openH">Open stop moves by state</h2><span class="meta">not yet finished</span></div>
+        <div class="panel-body">
+          <div class="tiles" id="moveTiles">
+            <div class="tile" data-tone="warn"><div class="tile-label">Awaiting you</div><div class="tile-value">1</div><div class="tile-sub">expires 11:01:11</div></div>
+            <div class="tile"><div class="tile-label">Held</div><div class="tile-value">0</div><div class="tile-sub">retry every 5 s</div></div>
+            <div class="tile"><div class="tile-label">Sending / acked</div><div class="tile-value">0</div><div class="tile-sub">confirm ≤ 30 s</div></div>
+            <div class="tile"><div class="tile-label">Unknown</div><div class="tile-value">0</div><div class="tile-sub">never re-sent</div></div>
+            <div class="tile"><div class="tile-label">Operator</div><div class="tile-value">0</div><div class="tile-sub">critical page</div></div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="stack">
+      <section class="panel" aria-labelledby="preH">
+        <div class="panel-head"><h2 id="preH">Prerequisites</h2></div>
+        <div class="panel-body">
+          <div class="check"><span class="check-glyph ok" aria-hidden="true">✓</span><div><div class="check-title">P1 · stop-tighten gate kind</div><div class="check-sub">Settle window and full freshness checks; allowed under SOFT halt.</div></div></div>
+          <div class="check"><span class="check-glyph ok" aria-hidden="true">✓</span><div><div class="check-title">P2 · single in-place amend</div><div class="check-sub">Price only, never a quantity; take profit untouched.</div></div></div>
+          <div class="check"><span class="check-glyph ok" aria-hidden="true">✓</span><div><div class="check-title">P3 · broker probes</div><div class="check-sub">Versions change on amend; manual moves are streamed and told apart from our amends; ops rule for resolving unknown sends updated.</div></div></div>
+          <div class="check"><span class="check-glyph ok" aria-hidden="true">✓</span><div><div class="check-title">P4 · off-PC dead-man receiver</div><div class="check-sub">Checked continuously; no ack for 2 min → advice only.</div></div></div>
+          <div class="check"><span class="check-glyph ok" aria-hidden="true">✓</span><div><div class="check-title">P5 · your decisions D1–D6</div><div class="check-sub">Made 2026-11-22.</div></div></div>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="alwaysH">
+        <div class="panel-head"><h2 id="alwaysH">Your recovery and halt choices</h2></div>
+        <div class="panel-body stack">
+          <div class="locked"><svg viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg>HARD halt: nothing is sent, not even a tighten<span class="chip chip-muted">D3</span></div>
+          <div class="locked"><svg viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg>SAFE_HOLD auto-resume brings live moves back too<span class="chip chip-warn">D6</span></div>
+          <div class="locked"><svg viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg>Unknown send outcome: never re-sent, operator resolves<span class="chip chip-muted">ALWAYS</span></div>
+          <p class="muted">D6 resumes sending after a crash loop without review. The resume is paged, every send still passes all checks, and repeated unclean restarts (ARM FAILED) still block moves until an operator clears them.</p>
+        </div>
+      </section>
+    </div>
+  </div>
+</main>
+<div class="demo" role="region" aria-label="Prototype controls">
+  <span class="demo-label">Prototype</span>
+  <button class="seg" type="button" data-state-btn="normal" aria-pressed="true">Normal</button>
+  <button class="seg" type="button" data-state-btn="hard" aria-pressed="false">HARD halt</button>
+  <button class="seg" type="button" data-state-btn="resume" aria-pressed="false">Auto-resumed</button>
+  <button class="seg" type="button" data-state-btn="dead" aria-pressed="false">Dead-man lost</button>
+  <button class="seg" type="button" data-state-btn="unknown" aria-pressed="false">Unknown send</button>
+</div>
+</body>
+</html>

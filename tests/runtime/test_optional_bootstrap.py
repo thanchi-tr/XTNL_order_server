@@ -105,6 +105,18 @@ class FakeConn:
         self.pool = pool
 
     async def execute(self, sql: str, *args: object) -> str:
+        """A healthy pool: a write answers with PostgreSQL's command tag and one row affected, so a fenced write
+        (`FencedTx.write`, which reads the row count from the tag) succeeds. "OK" reads as 0 rows, which the fence
+        takes for a lost epoch: the ARM's daily TEST notice (after `test_at_ms_of_day`, 22:00 UTC) then ended the ARM
+        loop mid-test, and tests that ran in that window failed depending on timing."""
+        verb = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
+        if verb == "WITH":                       # a data-modifying CTE: the tag is the main statement's
+            m = re.search(r"\)\s*(INSERT|UPDATE|DELETE)\b", sql, re.I)
+            verb = m.group(1).upper() if m else verb
+        if verb == "INSERT":
+            return "INSERT 0 1"
+        if verb in ("UPDATE", "DELETE"):
+            return f"{verb} 1"
         return "OK"
 
     async def fetchrow(self, sql: str, *args: object) -> Any:
@@ -263,6 +275,24 @@ def arm_plan(tasks: list[str]) -> OptionalPlan:
         tasks.append("arm")
         return [TaskSpec("arm", forever, max_stamp_age_s=60.0)]
     return OptionalPlan(arm_tasks=arm_tasks)
+
+
+# ============================================================================================ the fake ARM pool
+@pytest.mark.parametrize("sql", [
+    "INSERT INTO notification_outbox (created_at_ms) SELECT 1 WHERE true",   # the ARM daily TEST notice's insert
+    "UPDATE arm_status SET x = 1",
+    "DELETE FROM arm_notices WHERE false",
+    "WITH s AS (SELECT 1) INSERT INTO arm_notices SELECT 1",
+])
+async def test_a_fenced_write_on_the_fake_arm_pool_succeeds(sql: str) -> None:
+    """The fake pool answers writes like PostgreSQL (a command tag with the row count), so a healthy fenced write
+    never reads as a lost epoch. Before, "OK" read as 0 rows: from 22:00 UTC the ARM's daily TEST notice raised
+    EpochMismatch, ended the ARM loop, and the hanging-clear-probe test failed depending on timing."""
+    from src.db.arm_outbox_store import SQL_ARM_OUTBOX_INSERT
+    from src.db.fence import FencedTx
+    tx = FencedTx(FakeConn(FakeArmPool("xtnl-arm")), 31)
+    assert await tx.write(sql) == 1
+    assert await tx.write(SQL_ARM_OUTBOX_INSERT, 0, [], "s", "b", 0) == 1
 
 
 # ============================================================================================ market data

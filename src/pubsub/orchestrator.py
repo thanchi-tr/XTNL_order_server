@@ -87,6 +87,14 @@ ARM prerequisites (design PR1, PR8, PR9; arm-implementation-plan S04):
   plain dict seeded from the stored rows), before the version compare, as `broker_seq` does, so a stream / REST
   resync never flips a STOP child to None. Two different known kinds page `order_kind_conflict` once per entity and
   the entity counts as None (unknown) for the rest of the term.
+* Known facts are never blanked (fix 2026-11-21, live finding: after a restart the start-up catch-up re-read a
+  closed StoneX position from the trade history, which states no entry price, and its take-profit child, which the
+  history could not link; both won the version tie at the same broker time and replaced the stored entry price and
+  the child's link with nothing). Before the version compare, a row that states no fact the entity's known row has
+  takes it (`_keep_known_facts`): an order's parent link (and so `is_reduce_only`) and entry price, a position's
+  entry price and opening order. A fact the row does state always wins (a correction). Before a catch-up applies
+  its rows, the stored rows of the entities it touches that this term does not hold in memory are loaded
+  (`StoredEntityReader.stored_entities`), so a restart cannot hide them.
 * Version labels: every labelled row carries `origin` (`stream`, `snapshot`, `history`, `dlq`, `stop_read`: the path
   that read it) and `broker_time_source` (`BROKER` when its `broker_updated_at_ms` is the broker's own record time,
   else `WATERMARK`: a watermark-labelled REST row, or an entity type kept in the local-time domain). Both are
@@ -204,6 +212,7 @@ log = logging.getLogger(__name__)
 
 StatefulDTO = OrderDTO | PositionDTO | AccountDTO
 _S = TypeVar("_S", OrderDTO, PositionDTO, AccountDTO)
+_E = TypeVar("_E", OrderDTO, PositionDTO)
 _NO_DECL = VersionDecl(has_broker_seq=False, has_broker_time=False)
 HEARTBEAT_TIMEOUT_MS = 30_000
 CASH_FLOW_MIN_INTERVAL_MS = 60_000
@@ -256,6 +265,15 @@ class LocalStateReader(Protocol):
     async def open_entities(self, adapter_id: str) -> tuple[Sequence[OrderDTO], Sequence[PositionDTO]]: ...
 
 
+class StoredEntityReader(Protocol):
+    """Optional extra method of the `local_state` reader: the stored rows (any status) of the given orders and
+    positions of an adapter, so a catch-up compares its rows with what is stored even for entities this term does
+    not hold in memory (closed or finished before a restart)."""
+
+    async def stored_entities(self, adapter_id: str, order_ids: Sequence[str],
+                              position_ids: Sequence[str]) -> tuple[Sequence[OrderDTO], Sequence[PositionDTO]]: ...
+
+
 class AccountStateReader(Protocol):
     """Optional extra method of the `local_state` reader: the stored `account_state` rows of an adapter, read
     once before its first snapshot so a row without broker_seq inherits the stored one after a restart."""
@@ -282,6 +300,32 @@ class SnapshotReport:
     #: entity keys the broker listed in this pass (open orders / positions), for the downtime catch-up
     seen_orders: frozenset[str] = frozenset()
     seen_positions: frozenset[str] = frozenset()
+
+
+def _keep_known_facts(row: _E, known: _E | None) -> _E:
+    """The facts of an entity that never change once known, kept when a row states none of them (dto-contracts.md
+    §2, fix 2026-11-21): an order's parent link (a link is an identity: a row without one, such as a history row
+    that could not link a leg, or a stream row of a mapper that has not learnt the parent yet, means "not known",
+    never "no parent") with its reduce-only flag, and its entry price; a position's entry price and opening order.
+    A row that states the fact always wins, so a correction still applies. Stops, take-profits, units and status are
+    never inherited: their absence can be real."""
+    if known is None or known.adapter_id != row.adapter_id or known.entity_key != row.entity_key:
+        return row
+    if isinstance(row, OrderDTO) and isinstance(known, OrderDTO):
+        changes: dict[str, object] = {}
+        if row.linked_position_id is None and known.linked_position_id is not None and known.is_reduce_only:
+            changes.update(is_reduce_only=True, linked_position_id=known.linked_position_id)
+        if row.entry_price is None and known.entry_price is not None:
+            changes["entry_price"] = known.entry_price
+        return replace(row, **changes) if changes else row   # type: ignore[arg-type]
+    if isinstance(row, PositionDTO) and isinstance(known, PositionDTO):
+        pchanges: dict[str, object] = {}
+        if row.entry_price is None and known.entry_price is not None:
+            pchanges["entry_price"] = known.entry_price
+        if row.opened_by_client_order_id is None and known.opened_by_client_order_id is not None:
+            pchanges["opened_by_client_order_id"] = known.opened_by_client_order_id
+        return replace(row, **pchanges) if pchanges else row  # type: ignore[arg-type]
+    return row
 
 
 def _keep_known_entry(row: PositionDTO, known: PositionDTO | None) -> PositionDTO:
@@ -1008,6 +1052,10 @@ class IngestionOrchestrator:
         if decl.has_broker_seq and bseq is None:
             bseq = rt.broker_seq.get(dto.entity_key)
         if isinstance(dto, OrderDTO):
+            dto = _keep_known_facts(dto, rt.orders.get(dto.entity_key))
+        elif isinstance(dto, PositionDTO):
+            dto = _keep_known_facts(dto, rt.positions.get(dto.entity_key))
+        if isinstance(dto, OrderDTO):
             kind = self._order_kind(rt, dto)
             if kind != dto.order_kind:
                 dto = replace(dto, order_kind=kind)        # a payload field: the checksum is re-sealed
@@ -1374,6 +1422,28 @@ class IngestionOrchestrator:
                     self._seed_broker_seq(rt, a)
         rt.local_loaded = True
 
+    async def _load_stored(self, rt: AdapterRuntime, order_ids: Iterable[str], position_ids: Iterable[str]) -> None:
+        """Hold in memory the stored rows of these entities that this term does not hold yet (any status), so the
+        rows about to be applied are compared with them and inherit their known facts (`_keep_known_facts`). A
+        reader without `stored_entities` changes nothing. A read error propagates: the caller's pass fails and is
+        retried, rather than applying rows blind (fail closed)."""
+        reader = getattr(self._local_state, "stored_entities", None)
+        if not callable(reader):
+            return
+        want_o = sorted({i for i in order_ids if f"{rt.adapter_id}:{i}" not in rt.orders})
+        want_p = sorted({i for i in position_ids if f"{rt.adapter_id}:{i}" not in rt.positions})
+        if not want_o and not want_p:
+            return
+        orders, positions = await reader(rt.adapter_id, want_o, want_p)
+        for o in orders:
+            if o.adapter_id == rt.adapter_id and o.entity_key not in rt.orders:
+                rt.orders.put(o.entity_key, o)
+                self._seed_broker_seq(rt, o)
+        for p in positions:
+            if p.adapter_id == rt.adapter_id and p.entity_key not in rt.positions:
+                rt.positions.put(p.entity_key, p)
+                self._seed_broker_seq(rt, p)
+
     @staticmethod
     def _seed_broker_seq(rt: AdapterRuntime, stored: StatefulDTO) -> None:
         """The stored row's broker_seq becomes the entity's last seen one, and a stored order's known kind its
@@ -1494,6 +1564,10 @@ class IngestionOrchestrator:
         sent = rest_sent_ms()
         if fresh is None:
             return RereadResult(RereadStatus.NOT_FOUND, sent_ms=sent)
+        if isinstance(fresh, OrderDTO):                       # compared with the stored row even after a restart
+            await self._load_stored(rt, [fresh.broker_order_id], [])
+        elif isinstance(fresh, PositionDTO):
+            await self._load_stored(rt, [], [fresh.position_id])
         return self._reread_row(rt, fresh, origin, send_seq, send_ms, wm, stream, sent)
 
     def _reread_row(self, rt: AdapterRuntime, fresh: StatefulDTO, origin: Origin, send_seq: int, send_ms: int,
@@ -1647,6 +1721,9 @@ class IngestionOrchestrator:
         aid = fetch.adapter_id
         rt = self._runtimes[aid]
         res = CatchupPass(aid)
+        rows = tuple(getattr(fetch.history, "orders", ()) or ()) + tuple(getattr(fetch.history, "positions", ()) or ())
+        await self._load_stored(rt, [*(o.broker_order_id for o in rows if isinstance(o, OrderDTO)), *recheck_orders],
+                                [*(p.position_id for p in rows if isinstance(p, PositionDTO)), *recheck_positions])
         commits = self._commits
         bpass = commits.open(f"catchup:{aid}") if commits is not None else None
         published: list[tuple[int, StreamKind]] = []

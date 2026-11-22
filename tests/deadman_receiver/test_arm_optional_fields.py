@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from src.deadman_receiver.evaluate import BeatError, Evaluator, Thresholds, parse_beat
+from src.deadman_receiver.evaluate import SOURCE_LIVE_MS, BeatError, Evaluator, Thresholds, parse_beat
 from src.runtime.deadman import AdapterBeat, ArmFailedBeat, DeadmanPayload, build_payload
 
 T0 = 1_700_000_000_000
@@ -218,7 +218,9 @@ def test_a_leader_change_before_the_episode_was_recorded_latches_the_page() -> N
               T0 + 30_000)
     active = ev.active(T0 + 30_000)
     assert "arm_failed_unrecorded" in active and "leader change" in active["arm_failed_unrecorded"].summary
-    assert "arm_failed" not in active                                    # the new leader reports nothing
+    # the old leader's last beat still counts until SOURCE_LIVE_MS after it (review round 5), marked as its own
+    assert "(from node-a epoch 7)" in active["arm_failed"].detail
+    assert "arm_failed" not in ev.active(T0 + SOURCE_LIVE_MS + 1_000)    # the new leader reports nothing
     assert "arm_failed_unrecorded" in ev.active(T0 + 30_000 + 600_000)
     ev.accept(parse_beat(_beat(T0 + 30_000 + 600_001, node="node-b", epoch="8", failed=ArmFailedBeat(0, False, 0))),
               T0 + 30_000 + 600_001)

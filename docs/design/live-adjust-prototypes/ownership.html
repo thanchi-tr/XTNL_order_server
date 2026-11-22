@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#04080f">
+<title>Stop ownership · XTNL live adjust (prototype)</title>
+<link rel="stylesheet" href="theme.css">
+<script src="proto.js" defer></script>
+</head>
+<body data-page="ownership">
+<div class="banners" id="banners"></div>
+<main class="wrap" id="main">
+  <div class="pagehead">
+    <div>
+      <div class="eyebrow">D2 · a stop you move is yours until you hand it back</div>
+      <h1>Stop ownership</h1>
+      <p class="lede">If you move a stop yourself, tighter or looser, the order-server stops sending moves for it. It keeps advising you. Hand the stop back here when you want the server to manage it again.</p>
+    </div>
+    <span class="meta">Every hand-back is an audited request</span>
+  </div>
+
+  <section class="panel" aria-labelledby="ownH">
+    <div class="panel-head"><h2 id="ownH">Stops on open positions</h2><span class="meta" id="ownMeta">3 positions · 2 yours</span></div>
+    <div class="tbl-wrap" role="region" aria-labelledby="ownH" tabindex="0">
+      <table class="tbl">
+        <thead><tr><th>Position</th><th>Stop</th><th>Level</th><th>Owner</th><th>Since</th><th>Server will</th><th><span class="sr-only">Action</span></th></tr></thead>
+        <tbody>
+          <tr id="row-1">
+            <td data-label="Position"><span>Order 1 · EURUSD long<br><span class="meta">1039712204</span></span></td><td data-label="Stop">stop child 1039712205</td><td data-label="Level">1.09800</td>
+            <td class="owner" data-label="Owner"><span class="who who--server"><svg viewBox="0 0 12 12" aria-hidden="true"><rect x="1.5" y="1.5" width="9" height="4" rx="1"/><rect x="1.5" y="6.5" width="9" height="4" rx="1"/></svg>Server</span></td>
+            <td class="since" data-label="Since">armed 10:03:22</td><td class="wrap-cell will" data-label="Server will">propose moves at bar ends (Phase 3: you approve)</td><td class="act"><span class="meta">—</span></td>
+          </tr>
+          <tr id="row-4" class="human">
+            <td data-label="Position"><span>Order 4 · EURUSD long<br><span class="meta">1039712420</span></span></td><td data-label="Stop">stop child 1039712421</td><td data-label="Level">1.10000</td>
+            <td class="owner" data-label="Owner"><span class="who who--you"><svg viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="3.8" r="2.2"/><path d="M1.8 11c.5-2.4 2.2-3.6 4.2-3.6s3.7 1.2 4.2 3.6"/></svg>You</span></td>
+            <td class="since" data-label="Since">you tightened 1.09960 → 1.10000 · 10:44:40</td><td class="wrap-cell will" data-label="Server will">advise only — send nothing for this stop</td>
+            <td class="act"><button class="btn btn-ghost btn-sm" type="button" data-handback data-row="4" data-order="Order 4 · EURUSD long · stop 1.10000">Hand back…</button></td>
+          </tr>
+          <tr id="row-3" class="human">
+            <td data-label="Position"><span>Order 3 · GBPUSD long<br><span class="meta">1039713050</span></span></td><td data-label="Stop">stop child 1039713051</td><td data-label="Level">1.26300</td>
+            <td class="owner" data-label="Owner"><span class="who who--you"><svg viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="3.8" r="2.2"/><path d="M1.8 11c.5-2.4 2.2-3.6 4.2-3.6s3.7 1.2 4.2 3.6"/></svg>You</span></td>
+            <td class="since" data-label="Since">you loosened 1.26400 → 1.26300 · 10:52:10</td><td class="wrap-cell will" data-label="Server will">advise only — send nothing for this stop</td>
+            <td class="act"><button class="btn btn-ghost btn-sm" type="button" data-handback data-row="3" data-order="Order 3 · GBPUSD long · stop 1.26300">Hand back…</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="panel-foot">Rows with a blue edge are yours. Ownership is per stop, not per position.</div>
+  </section>
+
+  <div class="grid-2">
+    <section class="panel" aria-labelledby="advH">
+      <div class="panel-head"><h2 id="advH">Order 4 since you took it over</h2><span class="chip chip-info">ADVICE ONLY</span></div>
+      <div class="panel-body stack">
+        <div class="story" data-tone="info"><div class="story-meta">10:44:40 <span class="who who--you"><svg viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="3.8" r="2.2"/><path d="M1.8 11c.5-2.4 2.2-3.6 4.2-3.6s3.7 1.2 4.2 3.6"/></svg>You</span></div><div class="story-text">Tightened the stop 1.09960 → 1.10000 in the broker platform. The server marked this stop as yours. No move was open; none will be made for it until you hand it back.</div></div>
+        <div class="story" data-tone="warn"><div class="story-meta">10:45:11 <span class="who who--server"><svg viewBox="0 0 12 12" aria-hidden="true"><rect x="1.5" y="1.5" width="9" height="4" rx="1"/><rect x="1.5" y="6.5" width="9" height="4" rx="1"/></svg>Server</span></div><div class="story-text">Bar-end advice: break-even 1.10010 would apply (trigger met). <b>Not sent</b> — this stop is yours. Shown to you as advice.</div></div>
+        <div class="story"><div class="story-meta">11:00:11 <span class="who who--server"><svg viewBox="0 0 12 12" aria-hidden="true"><rect x="1.5" y="1.5" width="9" height="4" rx="1"/><rect x="1.5" y="6.5" width="9" height="4" rx="1"/></svg>Server</span></div><div class="story-text">Advice repeated. Still yours; nothing sent.</div></div>
+      </div>
+    </section>
+    <section class="panel" aria-labelledby="rulesH">
+      <div class="panel-head"><h2 id="rulesH">How ownership works</h2></div>
+      <div class="panel-body">
+        <div class="check"><span class="check-glyph ok" aria-hidden="true">✓</span><div><div class="check-title">Any manual move makes the stop yours</div><div class="check-sub">Tighter or looser, in any platform. The server sees it on the broker stream and tells it apart from its own amends.</div></div></div>
+        <div class="check"><span class="check-glyph ok" aria-hidden="true">✓</span><div><div class="check-title">The server never fights you</div><div class="check-sub">It keeps deciding and advising at each bar end, but sends nothing for a stop that is yours.</div></div></div>
+        <div class="check"><span class="check-glyph ok" aria-hidden="true">✓</span><div><div class="check-title">Hand back when you choose</div><div class="check-sub">An audited request with your reason. From the next bar end the server may move it again, only ever tighter than the stop at the broker at that time.</div></div></div>
+        <div class="check"><span class="check-glyph warn" aria-hidden="true">▲</span><div><div class="check-title">A move you make during a send</div><div class="check-sub">Caught by the confirming read: paged critical (stop loosened by a send) and the stop is blocked until resolved.</div></div></div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<div class="backdrop" id="backdrop"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="hbTitle" hidden>
+  <div class="eyebrow">Hand back to the order-server</div>
+  <h2 class="req-title" id="hbTitle">Hand back <span id="hbOrder"></span></h2>
+  <p class="muted">From the next bar end the server may propose moves for this stop again (Phase 3: you still approve each one). It only ever tightens from the stop as it is at the broker at that time; it never loosens.</p>
+  <div class="field">
+    <label for="reason">Reason (required, kept in the audit)</label>
+    <textarea id="reason" required aria-required="true" aria-describedby="reasonErr" placeholder="e.g. done adjusting manually"></textarea>
+  </div>
+  <div class="err" id="reasonErr" role="alert"></div>
+  <div class="mail-cta">
+    <button class="btn btn-primary" id="hbSubmit" type="button">Hand back</button>
+    <button class="btn btn-ghost" id="hbCancel" type="button">Cancel</button>
+  </div>
+</aside>
+</body>
+</html>

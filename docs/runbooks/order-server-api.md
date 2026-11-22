@@ -48,8 +48,11 @@ Anything else is `404 {}`. Protections, all in `src/api/`:
 * **Least privilege for the one network-facing process**: `start-xtnl.ps1` starts the API without any name of
   its `$ApiDropEnv` list: the broker credentials and settings (`STONE_X_*`, `CTRADER_*`, `BROKER_ENV`), the
   engine's `ORDER_SERVER_DSN` and `REDIS_URL`, the market-data / ARM settings and secrets (`XTNL_MD_*`,
-  `XTNL_ARM_*`), the alert channel credentials (`XTNL_SMTP_*`, `XTNL_SES_*`, `XTNL_PUSH_*`) and the dead-man token
-  `XTNL_DEADMAN_TOKEN`. The API refuses to start (exit 78) if it sees any of them (the same list:
+  `XTNL_ARM_*`), the alert channel credentials (`XTNL_SMTP_*`, `XTNL_SES_*`, `XTNL_PUSH_*`), the dead-man token
+  `XTNL_DEADMAN_TOKEN`, the live view's `XTNL_LIVEVIEW_DSN`, the heartbeat copy `XTNL_HEARTBEAT_COPY_URL` /
+  `XTNL_HEARTBEAT_COPY_TOKEN` (home-server plan W2: on the home server a Healthchecks.io ping URL, a secret) and any
+  backup credential (`XTNL_BACKUP_*`, `RCLONE_*`, `B2_*`, which belong to the separate backup account). The API
+  refuses to start (exit 78) if it sees any of them (the same list:
   `src/api/settings.py` `FORBIDDEN_PREFIXES` / `FORBIDDEN_NAMES`). It uses `XTNL_API_DSN` (role `xtnl_api`, Windows User environment) and its own
   Redis (`XTNL_API_REDIS_URL`). It still runs as your Windows user, so a full code-execution bug in it could read
   what that user can (the Windows User environment included); running it under a separate low-privilege Windows
@@ -200,7 +203,8 @@ If any of them is missing, the website shows the gateway as disabled and never c
 * `[api]` exit 78 in the log: configuration refused (missing / weak secret, certificate missing, `XTNL_API_DSN` or
   `XTNL_API_REDIS_URL` missing, or a name of `$ApiDropEnv` in its environment: `STONE_X_*`, `CTRADER_*`,
   `BROKER_ENV`, `ORDER_SERVER_DSN`, `REDIS_URL`, `XTNL_MD_*`, `XTNL_ARM_*`, `XTNL_SMTP_*`, `XTNL_SES_*`,
-  `XTNL_PUSH_*`, `XTNL_DEADMAN_TOKEN`); start-xtnl.ps1
+  `XTNL_PUSH_*`, `XTNL_DEADMAN_TOKEN`, `XTNL_LIVEVIEW_DSN`, `XTNL_HEARTBEAT_COPY_URL`, `XTNL_HEARTBEAT_COPY_TOKEN`,
+  `XTNL_BACKUP_*`, `RCLONE_*`, `B2_*`); start-xtnl.ps1
   disables the API until the next start. Any other exit is restarted after 5 s, doubling to 5 min.
 * `"event":"connection_refused"` (at most one line per 10 s, `suppressed` = refusals not logged): a client hit the
   connection caps; the thesis website keeps one or two connections at most.

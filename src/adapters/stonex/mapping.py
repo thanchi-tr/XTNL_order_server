@@ -200,7 +200,8 @@ def map_open_position(raw: JsonObj, *, account_id: str, lookup: SpecLookup,
 def map_stop_limit_order(raw: JsonObj, *, account_id: str, lookup: SpecLookup, parent_id: str | None,
                          default_side: str | None = None, default_qty: Decimal | None = None,
                          default_market_id: str | None = None, strict_status: bool = False,
-                         order_kind: OrderKind | None = None, adapter_id: str = ADAPTER_ID) -> OrderDTO:
+                         order_kind: OrderKind | None = None, default_status: OrderStatus | None = None,
+                         default_ts: int = 0, adapter_id: str = ADAPTER_ID) -> OrderDTO:
     """ApiActiveStopLimitOrderDTO (or a position's StopOrder / LimitOrder) -> OrderDTO.
     A child (parent_id set) is reduce-only with linked_position_id = the parent OrderId.
     ``order_kind`` (design PR1) is the caller's typing when it knows better than the row (a child nested in a
@@ -208,7 +209,10 @@ def map_stop_limit_order(raw: JsonObj, *, account_id: str, lookup: SpecLookup, p
     (``stop_limit_type``: 2 -> STOP, 3 -> LIMIT, anything else -> None).
     On the active list (or nested in a position) a missing Status means WORKING. With ``strict_status`` (a
     by-id read, which also returns orders that are no longer active) a missing or unrecognised Status is
-    unmappable: the adapter never invents a status (IMPLEMENTATION_PLAN 8.1)."""
+    unmappable: the adapter never invents a status (IMPLEMENTATION_PLAN 8.1).
+    ``default_status`` / ``default_ts`` are for an if-done child nested in a working entry's row, which carries
+    neither: the stream states such a child Pending, and the row it is nested in carries the broker time
+    (``AttachedOrder.parent_ts``), so a snapshot agrees with the stream instead of reading WORKING untimed."""
     order_id = to_id(get_ci(raw, "OrderId"))
     side = parse_side(get_ci(raw, "Direction")) or parse_side(default_side)
     if order_id is None or side is None:
@@ -219,7 +223,7 @@ def map_stop_limit_order(raw: JsonObj, *, account_id: str, lookup: SpecLookup, p
     code = parse_status(raw_status)
     if code is None and strict_status:
         raise UnmappableError(f"stop/limit order {order_id} with unrecognised Status {str(raw_status)[:20]!r}")
-    status = canonical_status(code) if code is not None else OrderStatus.WORKING
+    status = canonical_status(code) if code is not None else (default_status or OrderStatus.WORKING)
     qty = to_decimal(get_ci(raw, "Quantity", "Qauantity"))
     u = to_units(spec, qty if qty is not None else default_qty)
     remaining = Decimal(0) if status == OrderStatus.FILLED else u.units
@@ -230,7 +234,7 @@ def map_stop_limit_order(raw: JsonObj, *, account_id: str, lookup: SpecLookup, p
         ordered_units=u.units, remaining_units=remaining if not u.instrument_unknown else None,
         instrument_unknown=u.instrument_unknown, raw_qty=u.raw_qty,
         is_reduce_only=parent_id is not None, linked_position_id=parent_id,
-        broker_updated_at_ms=_rest_ts(raw), source="REST",
+        broker_updated_at_ms=_rest_ts(raw) or default_ts, source="REST",
         order_kind=order_kind if order_kind is not None else order_kind_of(stop_limit_type(raw)),
     )
 
@@ -276,6 +280,8 @@ class AttachedOrder:
     parent_side: str | None
     parent_qty: Decimal | None
     parent_market_id: str | None
+    if_done: bool = False   # nested in the parent's IfDone list (an entry's bracket), not directly in it
+    parent_ts: int = 0      # the parent row's LastChangedDateTimeUTC (0 when it has none)
 
 
 def attached_orders(parent: JsonObj) -> list[AttachedOrder]:
@@ -286,6 +292,7 @@ def attached_orders(parent: JsonObj) -> list[AttachedOrder]:
     side = get_ci(parent, "Direction")
     qty = to_decimal(get_ci(parent, "Quantity", "Qauantity"))
     market_id = to_id(get_ci(parent, "MarketId"))
+    parent_ts = _rest_ts(parent)
     found: list[AttachedOrder] = []
     holders = [parent, *get_list(parent, "IfDone")]
     for holder in holders:
@@ -294,7 +301,7 @@ def attached_orders(parent: JsonObj) -> list[AttachedOrder]:
             child = get_obj(holder, key)
             if child is not None and to_id(get_ci(child, "OrderId")) is not None:
                 found.append(AttachedOrder(child, parent_id, kind, str(side) if side is not None else None,
-                                           qty, market_id))
+                                           qty, market_id, if_done=holder is not parent, parent_ts=parent_ts))
     return found
 
 

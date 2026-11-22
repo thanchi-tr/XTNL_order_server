@@ -21,6 +21,13 @@ SQL_ADAPTER_OPEN_POSITIONS: Final = (
     f"SELECT {POSITION_COLS} FROM positions_state WHERE adapter_id = $1 AND status = 'OPEN' ORDER BY position_id"
 )
 
+SQL_ADAPTER_ORDERS_BY_ID: Final = (
+    f"SELECT {ORDER_COLS} FROM orders_state WHERE adapter_id = $1 AND broker_order_id = ANY($2::text[])"
+)
+SQL_ADAPTER_POSITIONS_BY_ID: Final = (
+    f"SELECT {POSITION_COLS} FROM positions_state WHERE adapter_id = $1 AND position_id = ANY($2::text[])"
+)
+
 
 class PgLocalStateReader:
     def __init__(self, db: EngineDb) -> None:
@@ -30,4 +37,15 @@ class PgLocalStateReader:
         async with self._db.source.acquire() as conn:
             orders = [order_from_row(r) for r in await conn.fetch(SQL_ADAPTER_OPEN_ORDERS, adapter_id)]
             positions = [position_from_row(r) for r in await conn.fetch(SQL_ADAPTER_OPEN_POSITIONS, adapter_id)]
+        return orders, positions
+
+    async def stored_entities(self, adapter_id: str, order_ids: Sequence[str],
+                              position_ids: Sequence[str]) -> tuple[Sequence[OrderDTO], Sequence[PositionDTO]]:
+        """The stored rows (any status) of these orders and positions, so a catch-up after a restart compares its
+        rows with them (`IngestionOrchestrator._load_stored`)."""
+        async with self._db.source.acquire() as conn:
+            orders = [order_from_row(r) for r in await conn.fetch(SQL_ADAPTER_ORDERS_BY_ID, adapter_id,
+                                                                    list(order_ids))] if order_ids else []
+            positions = [position_from_row(r) for r in await conn.fetch(SQL_ADAPTER_POSITIONS_BY_ID, adapter_id,
+                                                                          list(position_ids))] if position_ids else []
         return orders, positions

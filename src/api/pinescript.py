@@ -30,6 +30,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Protocol
 
 from src.db.pg import AsyncpgConnection, PgConnection, init_connection, is_connection_error
+from src.db.readonly_role import SQL_ROLE_CHECK as _SHARED_ROLE_CHECK
 from src.reports.export import plan_pinescript, plan_texts
 from src.reports.lifecycle import Window
 
@@ -43,14 +44,7 @@ FAILED_TTL_S: Final = 900
 COMPILE_TIMEOUT_S: Final = 150.0
 APPLICATION_NAME: Final = "xtnl-api"
 #: (role, superuser?, session default_transaction_read_only, number of tables the role could write).
-SQL_ROLE_CHECK: Final = (
-    "SELECT current_user::text, r.rolsuper, current_setting('default_transaction_read_only'), "
-    "(SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-    "WHERE c.relkind IN ('r', 'p') AND n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%' "
-    "AND (has_table_privilege(c.oid, 'INSERT') OR has_table_privilege(c.oid, 'UPDATE') "
-    "OR has_table_privilege(c.oid, 'DELETE') OR has_table_privilege(c.oid, 'TRUNCATE'))) "
-    "FROM pg_roles r WHERE r.rolname = current_user"
-)
+SQL_ROLE_CHECK: Final = _SHARED_ROLE_CHECK   # src/db/readonly_role.py (views count as writable too)
 
 Clock = Callable[[], int]
 #: (window, now_ms) -> ((symbol, Pine Script source), ...)

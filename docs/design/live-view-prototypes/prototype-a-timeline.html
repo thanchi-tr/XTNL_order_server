@@ -1,0 +1,896 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live View Timeline</title>
+<style>
+/* Prototype A - Timeline. Flat: solid fills, 1px borders, no gradients, no shadows. */
+:root {
+  --bg: #fbfaf8;
+  --surface: #ffffff;
+  --surface-2: #f3f2ef;
+  --text: #1f2328;
+  --text-2: #4b5260;
+  --muted: #7d8592;
+  --line: #e4e2dd;
+  --line-strong: #d3d0c9;
+  --focus: #3b6ea8;
+  --hl: #fff1c2;
+
+  --ok: #2f8a57;
+  --ok-bg: #e6f3eb;
+  --warn: #9a6400;
+  --warn-dot: #d99a1e;
+  --warn-bg: #fdf3dc;
+  --warn-bd: #f0d79a;
+  --alert: #b3362d;
+  --alert-dot: #d6453b;
+  --alert-bg: #fbe9e7;
+  --alert-bd: #f1c3be;
+
+  --c-orders: #3b6ea8;
+  --c-positions: #2b8a7e;
+  --c-account: #7a808c;
+  --c-risk: #8458ad;
+  --c-halt: #3d4757;
+  --c-alerts: #b0538a;
+  --c-operator: #5d7d36;
+  --c-dlq: #956840;
+  --c-engine: #4c5aa0;
+  --c-catchup: #3f93b0;
+  --c-streams: #3a8c5c;
+
+  --timecol: 92px;
+  --strip-h: 56px;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #16181c; --surface: #1d2025; --surface-2: #24282e; --text: #e7e9ec; --text-2: #c0c5cd;
+    --muted: #8d95a1; --line: #2d3138; --line-strong: #3a3f47; --focus: #7fa9da; --hl: #3d3418;
+    --ok: #6cc391; --ok-bg: #1d3327; --warn: #e9b955; --warn-dot: #e0a838; --warn-bg: #33291a; --warn-bd: #5a4520;
+    --alert: #f08a80; --alert-dot: #ea6a5f; --alert-bg: #3a2120; --alert-bd: #63302c;
+    --c-orders: #78a6dc; --c-positions: #5cc0b2; --c-account: #a3a9b4; --c-risk: #b392d6; --c-halt: #a9b4c6;
+    --c-alerts: #dc8bba; --c-operator: #9cc06a; --c-dlq: #cc9c70; --c-engine: #8f9be0; --c-catchup: #74c0db; --c-streams: #6cc391;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #16181c; --surface: #1d2025; --surface-2: #24282e; --text: #e7e9ec; --text-2: #c0c5cd;
+  --muted: #8d95a1; --line: #2d3138; --line-strong: #3a3f47; --focus: #7fa9da; --hl: #3d3418;
+  --ok: #6cc391; --ok-bg: #1d3327; --warn: #e9b955; --warn-dot: #e0a838; --warn-bg: #33291a; --warn-bd: #5a4520;
+  --alert: #f08a80; --alert-dot: #ea6a5f; --alert-bg: #3a2120; --alert-bd: #63302c;
+  --c-orders: #78a6dc; --c-positions: #5cc0b2; --c-account: #a3a9b4; --c-risk: #b392d6; --c-halt: #a9b4c6;
+  --c-alerts: #dc8bba; --c-operator: #9cc06a; --c-dlq: #cc9c70; --c-engine: #8f9be0; --c-catchup: #74c0db; --c-streams: #6cc391;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  overflow-x: hidden;
+}
+.mono { font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, "Liberation Mono", monospace; font-variant-numeric: tabular-nums; }
+button, input { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.wrap { max-width: 1320px; margin: 0 auto; padding: 0 32px; }
+
+/* Header */
+header.top { padding: 28px 0 18px; }
+.top-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.brand h1 { margin: 0; font-size: 28px; line-height: 1.2; font-weight: 650; letter-spacing: -0.01em; }
+.brand p { margin: 4px 0 0; color: var(--muted); font-size: 15px; }
+.top-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.proto-label {
+  font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--text-2); background: var(--surface-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px;
+}
+.ghost-btn {
+  background: transparent; border: 1px solid var(--line-strong); border-radius: 6px; padding: 4px 10px; font-size: 13px; color: var(--text-2);
+}
+.ghost-btn:hover { background: var(--surface-2); }
+
+/* Sticky status strip */
+.strip { position: sticky; top: 0; z-index: 10; background: var(--bg); border-bottom: 1px solid var(--line); border-top: 1px solid var(--line); }
+.strip .wrap { padding-left: 24px; padding-right: 24px; display: flex; flex-wrap: wrap; gap: 5px; padding-top: 10px; padding-bottom: 10px; max-width: 1600px; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; min-height: 30px; padding: 3px 10px;
+  border-radius: 999px; border: 1px solid var(--line); background: var(--surface);
+  font-size: 12px; white-space: nowrap; color: var(--text-2);
+}
+.pill b { color: var(--text); font-weight: 600; }
+.pill .k { color: var(--muted); }
+.pill .sub, .pill .sub2 { color: var(--muted); }
+@media (min-width: 641px) and (max-width: 1580px) { .pill .sub2 { display: none; } }
+.sdot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.pill.ok .sdot { background: var(--ok); }
+.pill.warn { background: var(--warn-bg); border-color: var(--warn-bd); color: var(--warn); }
+.pill.warn .sdot { background: var(--warn-dot); }
+.pill.warn b, .pill.warn .k, .pill.warn .sub { color: var(--warn); }
+.pill.alert { background: var(--alert-bg); border-color: var(--alert-bd); color: var(--alert); }
+.pill.alert .sdot { background: var(--alert-dot); }
+.pill.alert b, .pill.alert .k, .pill.alert .sub { color: var(--alert); }
+.streams-mini { display: inline-flex; gap: 10px; }
+.streams-mini span { display: inline-flex; align-items: center; gap: 5px; }
+.streams-mini span.lost { color: var(--warn); font-weight: 600; }
+.streams-mini span .sdot { width: 7px; height: 7px; background: var(--ok); }
+.streams-mini span.lost .sdot { background: var(--warn-dot); }
+
+/* Layout */
+.layout { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 56px; padding-top: 28px; padding-bottom: 48px; align-items: start; }
+.feed-col { width: 100%; max-width: 780px; justify-self: center; min-width: 0; }
+aside.open { position: sticky; top: calc(var(--strip-h) + 24px); min-width: 0; }
+
+/* Controls */
+.controls { margin-bottom: 22px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px 5px 10px; border-radius: 999px;
+  border: 1px solid var(--line-strong); background: var(--surface); font-size: 14px; color: var(--text-2); line-height: 1.3;
+}
+.chip .cdot { width: 9px; height: 9px; border-radius: 50%; background: var(--cat, var(--muted)); }
+.chip .n { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.chip[aria-pressed="false"] { background: transparent; color: var(--muted); border-style: dashed; }
+.chip[aria-pressed="false"] .cdot { background: transparent; border: 1.5px solid var(--cat, var(--muted)); }
+.chip.all[aria-pressed="true"] { background: var(--text); color: var(--bg); border-color: var(--text); }
+.chip.all[aria-pressed="true"] .n { color: var(--bg); opacity: 0.7; }
+.row2 { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.search { flex: 1 1 260px; min-width: 0; position: relative; }
+.search input {
+  width: 100%; height: 40px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface);
+  padding: 0 34px 0 38px; font-size: 15px;
+}
+.search input::placeholder { color: var(--muted); }
+.search svg { position: absolute; left: 12px; top: 12px; width: 16px; height: 16px; stroke: var(--muted); fill: none; stroke-width: 2; }
+.search .clear { position: absolute; right: 6px; top: 6px; width: 28px; height: 28px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font-size: 18px; line-height: 1; display: none; }
+.search.has .clear { display: block; }
+.btn {
+  height: 40px; padding: 0 16px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--surface);
+  font-size: 15px; font-weight: 550; display: inline-flex; align-items: center; gap: 8px; white-space: nowrap;
+}
+.btn:hover { background: var(--surface-2); }
+.btn.paused { background: var(--warn-bg); border-color: var(--warn-bd); color: var(--warn); }
+.btn svg { width: 14px; height: 14px; fill: currentColor; }
+.switch { display: inline-flex; align-items: center; gap: 10px; font-size: 15px; color: var(--text-2); cursor: pointer; user-select: none; height: 40px; }
+.switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.switch .track { width: 38px; height: 22px; border-radius: 999px; background: var(--line-strong); position: relative; flex: none; transition: background-color .15s; }
+.switch .track::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--surface); transition: transform .15s; }
+.switch input:checked + .track { background: var(--c-orders); }
+.switch input:checked + .track::after { transform: translateX(16px); }
+.switch input:focus-visible + .track { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+.feed-meta { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; margin: 0 0 6px; color: var(--muted); font-size: 14px; }
+.feed-meta strong { color: var(--text); font-size: 18px; font-weight: 600; }
+.paused-banner {
+  display: none; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  margin: 10px 0 8px; padding: 10px 14px; border-radius: 8px; background: var(--warn-bg); border: 1px solid var(--warn-bd); color: var(--warn); font-size: 15px;
+}
+.paused-banner.show { display: flex; }
+.paused-banner button { border: 1px solid var(--warn-bd); background: var(--surface); color: var(--warn); border-radius: 6px; padding: 4px 12px; font-weight: 600; font-size: 14px; }
+
+/* Timeline */
+.tl { list-style: none; margin: 0; padding: 0; position: relative; }
+.tl::before { content: ""; position: absolute; left: calc(var(--timecol) + 16px + 11px); top: 6px; bottom: 6px; width: 2px; background: var(--line); }
+.hour, .ev { display: grid; grid-template-columns: var(--timecol) 24px minmax(0, 1fr); column-gap: 16px; position: relative; }
+.hour { padding: 26px 0 10px; align-items: center; }
+.hour:first-child { padding-top: 12px; }
+.hour .h-time { font-size: 22px; font-weight: 650; text-align: right; letter-spacing: -0.01em; }
+.hour .h-mark { width: 14px; height: 14px; margin: 0 auto; background: var(--bg); border: 2px solid var(--line-strong); border-radius: 3px; position: relative; z-index: 1; }
+.hour .h-sub { color: var(--muted); font-size: 14px; }
+.hour .h-sub b { color: var(--text-2); font-weight: 600; }
+.ev { padding: 3px 0; }
+.ev .t { text-align: right; padding-top: 9px; line-height: 1.25; }
+.ev .t .u { font-size: 15px; color: var(--text-2); }
+.ev .t .m { display: block; font-size: 12px; color: var(--muted); margin-top: 2px; }
+.ev .dotcell { display: flex; justify-content: center; padding-top: 12px; }
+.ev .dot { width: 14px; height: 14px; border-radius: 50%; background: var(--cat); border: 3px solid var(--bg); position: relative; z-index: 1; box-sizing: content-box; margin-top: -3px; }
+.ev.sev-alert .dot { outline: 2px solid var(--alert-dot); outline-offset: 0; }
+.ev.sev-warn .dot { outline: 2px solid var(--warn-dot); outline-offset: 0; }
+.body { padding: 8px 12px; border: 1px solid transparent; border-radius: 8px; min-width: 0; }
+.ev.sev-alert .body { background: var(--alert-bg); border-color: var(--alert-bd); }
+.ev.sev-warn .body { background: var(--warn-bg); border-color: var(--warn-bd); }
+.title { font-size: 17px; line-height: 1.45; overflow-wrap: anywhere; }
+.ev.sev-notice .title { font-weight: 600; }
+.tag { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; border-radius: 4px; padding: 1px 6px; margin-right: 8px; vertical-align: 2px; }
+.tag.alert { background: var(--alert-dot); color: #fff; }
+.tag.warn { background: var(--warn-dot); color: #1f1a10; }
+.meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 4px; font-size: 13px; }
+.cat { color: var(--cat); font-weight: 600; }
+.idbtn {
+  border: 1px solid var(--line); background: var(--surface-2); border-radius: 5px; padding: 0 7px; font-size: 12.5px; line-height: 20px; color: var(--text-2);
+}
+.idbtn .lbl { color: var(--muted); margin-right: 4px; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+.idbtn:hover { border-color: var(--line-strong); color: var(--text); }
+.ev.hk .title { color: var(--muted); font-style: italic; font-size: 15px; }
+.ev.hk .dot { background: transparent; border: 2px solid var(--line-strong); width: 10px; height: 10px; margin-top: -1px; outline: 3px solid var(--bg); }
+.ev.hk .t .u { color: var(--muted); }
+.hk-tag { font-size: 11px; color: var(--muted); border: 1px dashed var(--line-strong); border-radius: 4px; padding: 0 6px; }
+@keyframes arrive { from { background-color: var(--hl); } to { background-color: transparent; } }
+.ev.fresh .body { animation: arrive 2.6s ease-out both; }
+.ev.fresh.sev-alert .body, .ev.fresh.sev-warn .body { animation: none; }
+.ev.fresh .new { display: inline-block; }
+.new { display: none; font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--c-orders); margin-left: 6px; }
+.empty { padding: 40px 20px; text-align: center; color: var(--muted); border: 1px dashed var(--line-strong); border-radius: 10px; }
+.empty button { margin-top: 10px; }
+
+/* Open now */
+.open h2 { margin: 0 0 4px; font-size: 20px; font-weight: 650; }
+.open .lede { margin: 0 0 18px; color: var(--muted); font-size: 14px; }
+.sec { margin-bottom: 24px; }
+.sec h3 { margin: 0 0 10px; font-size: 12px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); display: flex; justify-content: space-between; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; }
+.card.fresh { animation: arrive 2.6s ease-out both; }
+.card-h { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.card-h .what { font-size: 17px; font-weight: 650; }
+.card-h .what .side { display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: .05em; border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 6px; margin-right: 8px; vertical-align: 2px; color: var(--text-2); }
+.status { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; border-radius: 4px; padding: 2px 7px; }
+.status.open, .status.working { background: var(--ok-bg); color: var(--ok); }
+.status.pending { background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); }
+.status.flag { background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn-bd); }
+.card .sub-id { margin-top: 2px; font-size: 13px; color: var(--muted); }
+.levels { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+.lv { background: var(--surface-2); border-radius: 6px; padding: 7px 9px; min-width: 0; }
+.lv.fresh { animation: arrive 2.6s ease-out both; }
+.lv .l { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-weight: 600; }
+.lv .v { font-size: 15px; font-weight: 600; }
+.lv .be { display: block; font-size: 11px; color: var(--c-positions); font-weight: 600; margin-top: 1px; }
+.kids { list-style: none; margin: 12px 0 0; padding: 0 0 0 14px; border-left: 2px solid var(--line); }
+.kids li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 0 5px 10px; position: relative; font-size: 14px; flex-wrap: wrap; }
+.kids li::before { content: ""; position: absolute; left: -14px; top: 50%; width: 18px; height: 2px; background: var(--line); }
+.kids .kname { color: var(--text-2); }
+.breach .rule { font-size: 15px; font-weight: 600; font-family: ui-monospace, Consolas, monospace; }
+.breach .why { margin-top: 6px; font-size: 14px; color: var(--text-2); }
+.none { color: var(--muted); font-size: 14px; padding: 6px 0; }
+.linkish { background: none; border: 0; padding: 0; color: var(--text-2); text-decoration: underline; text-decoration-color: var(--line-strong); text-underline-offset: 3px; font-size: inherit; }
+.linkish:hover { color: var(--text); }
+
+footer { border-top: 1px solid var(--line); padding: 18px 0 32px; color: var(--muted); font-size: 13px; }
+footer .wrap { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+@media (max-width: 1100px) {
+  .layout { grid-template-columns: minmax(0, 1fr); gap: 40px; }
+  aside.open { position: static; max-width: 780px; width: 100%; justify-self: center; }
+  .open .cards-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 0 12px; }
+}
+@media (max-width: 640px) {
+  :root { --timecol: 64px; }
+  .wrap { padding: 0 16px; }
+  header.top { padding: 18px 0 12px; }
+  .brand h1 { font-size: 22px; }
+  .brand p { font-size: 13px; }
+  .strip .wrap { gap: 6px; padding: 8px 16px; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; overscroll-behavior-x: contain; }
+  .strip .wrap::-webkit-scrollbar { display: none; }
+  .pill { font-size: 12px; min-height: 28px; padding: 2px 10px; gap: 5px; flex: none; }
+  .pill[data-k="halt"] { order: 0; } .pill[data-k="breach"] { order: 1; } .pill[data-k="streams"] { order: 2; }
+  .pill[data-k="conn"] { order: 3; } .pill[data-k="leader"], .pill[data-k="engine"], .pill[data-k="dlq"] { order: 4; }
+  .ev .t .m .z { display: none; }
+  .layout { padding-top: 18px; }
+  .chip { font-size: 13px; padding: 4px 10px 4px 8px; }
+  .hour, .ev { column-gap: 8px; }
+  .tl::before { left: calc(var(--timecol) + 8px + 11px); }
+  .hour .h-time { font-size: 18px; }
+  .ev .t .u { font-size: 13px; }
+  .ev .t .m { font-size: 11px; }
+  .title { font-size: 15.5px; }
+  .body { padding: 7px 9px; }
+  .btn { padding: 0 12px; }
+  .levels { gap: 6px; }
+  .lv { padding: 6px 7px; }
+  .lv .v { font-size: 14px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ev.fresh .body, .card.fresh, .lv.fresh { animation: none; }
+  .switch .track, .switch .track::after { transition: none; }
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap top-row">
+    <div class="brand">
+      <h1>Live view</h1>
+      <p id="today">order-server on this PC &middot; read-only</p>
+    </div>
+    <div class="top-actions">
+      <span class="proto-label">Prototype A - Timeline</span>
+      <button class="ghost-btn" id="themeBtn" type="button" title="Switch light / dark">Theme: auto</button>
+    </div>
+  </div>
+</header>
+
+<div class="strip" id="strip" role="region" aria-label="Status">
+  <div class="wrap" id="pills"></div>
+</div>
+
+<main class="wrap layout">
+  <section class="feed-col" aria-label="Activity">
+    <div class="controls">
+      <div class="chips" id="chips" role="group" aria-label="Categories"></div>
+      <div class="row2">
+        <label class="search" id="searchWrap">
+          <span class="sr">Filter by id or symbol</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+          <input id="q" type="text" autocomplete="off" spellcheck="false" placeholder="Filter by id or symbol, e.g. 1039712001 or EURUSD">
+          <button class="clear" id="qClear" type="button" aria-label="Clear filter">&times;</button>
+        </label>
+        <button class="btn" id="pauseBtn" type="button" aria-pressed="false"></button>
+        <label class="switch">
+          <input type="checkbox" id="hk">
+          <span class="track" aria-hidden="true"></span>
+          <span id="hkLabel">Housekeeping</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="feed-meta">
+      <span><strong>Today</strong> <span id="dateLine"></span></span>
+      <span id="showing"></span>
+    </div>
+    <div class="paused-banner" id="pausedBanner" role="status">
+      <span id="pausedText"></span>
+      <button type="button" id="bannerResume">Resume</button>
+    </div>
+    <ol class="tl" id="feed" role="log" aria-label="Activity feed, newest first"></ol>
+  </section>
+
+  <aside class="open" id="openNow" aria-label="Open now"></aside>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Mockup with sample data only: no server, nothing here is live, and no order can be sent from this page.</span>
+    <button class="linkish" type="button" id="restart">Restart demo stream</button>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ---------- helpers ---------- */
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    return n;
+  }
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+  var DAY = Date.UTC(2026, 10, 21);
+  function T(h, m, s) { return DAY + ((h * 60 + m) * 60 + s) * 1000; }
+  function utc(t, withSec) {
+    var d = new Date(t);
+    return pad(d.getUTCHours()) + ":" + pad(d.getUTCMinutes()) + (withSec === false ? "" : ":" + pad(d.getUTCSeconds()));
+  }
+  var melFmt = null, melFmtShort = null;
+  try {
+    melFmt = new Intl.DateTimeFormat("en-GB", { timeZone: "Australia/Melbourne", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+    melFmtShort = new Intl.DateTimeFormat("en-GB", { timeZone: "Australia/Melbourne", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  } catch (e) { melFmt = null; }
+  function mel(t, withSec) {
+    if (melFmt) return (withSec === false ? melFmtShort : melFmt).format(new Date(t));
+    return utc(t + 11 * 3600000, withSec);
+  }
+  function fullStamp(t) { return "21 Nov 2026 " + utc(t) + " UTC  /  " + mel(t) + " Melbourne"; }
+
+  /* ---------- categories ---------- */
+  var CATS = [
+    ["orders", "Orders"], ["positions", "Positions"], ["account", "Account"], ["risk", "Risk"], ["halt", "Halt"],
+    ["alerts", "Alerts"], ["operator", "Operator"], ["dlq", "DLQ"], ["engine", "Engine"], ["catchup", "Catch-up"], ["streams", "Streams"]
+  ];
+  var CAT_LABEL = {};
+  CATS.forEach(function (c) { CAT_LABEL[c[0]] = c[1]; });
+
+  /* ---------- sample events ---------- */
+  var nextId = 1;
+  function E(t, cat, title, o) {
+    o = o || {};
+    return { id: nextId++, at: t, cat: cat, sev: o.sev || "info", title: title, ids: o.ids || [], hk: !!o.hk };
+  }
+  var events = [
+    E(T(1, 44, 59), "engine", "Engine started on pc1", { ids: [["node", "pc1"]] }),
+    E(T(1, 46, 10), "engine", "pc1 is LEADER (epoch 150031)", { ids: [["node", "pc1"], ["epoch", "150031"]] }),
+    E(T(1, 46, 16), "catchup", "Catch-up (startup) complete: 0 orders seen, nothing new"),
+    E(T(1, 46, 16), "streams", "StoneX orders stream reconciled", { ids: [["stream", "orders"]] }),
+    E(T(5, 25, 2), "operator", "Operator claude-session: record repair stonex:1039708845 (applied)", { sev: "notice", ids: [["order", "1039708845"]] }),
+    E(T(7, 58, 41), "orders", "Sell stop order 1039712001 placed: EURUSD, entry 1.08120, stop 1.08420, take-profit 1.07520", { ids: [["order", "1039712001"], ["symbol", "EURUSD"]] }),
+    E(T(7, 58, 41), "orders", "Stop-loss 1039712002 for order 1039712001 is pending", { ids: [["order", "1039712002"], ["parent", "1039712001"]] }),
+    E(T(7, 58, 41), "orders", "Take-profit 1039712003 for order 1039712001 is pending", { ids: [["order", "1039712003"], ["parent", "1039712001"]] }),
+    E(T(8, 12, 9), "orders", "Order 1039712001 filled", { sev: "notice", ids: [["order", "1039712001"], ["symbol", "EURUSD"]] }),
+    E(T(8, 12, 9), "positions", "Position 1039712001 opened (SELL EURUSD at 1.08120)", { sev: "notice", ids: [["position", "1039712001"], ["symbol", "EURUSD"]] }),
+    E(T(8, 12, 10), "orders", "Stop-loss 1039712002 is working (linked to position 1039712001)", { ids: [["order", "1039712002"], ["position", "1039712001"]] }),
+    E(T(8, 12, 10), "orders", "Take-profit 1039712003 is working (linked to position 1039712001)", { ids: [["order", "1039712003"], ["position", "1039712001"]] }),
+    E(T(8, 12, 11), "risk", "Rule max_daily_loss FLAG on account 401648225 (transfers_unverified)", { ids: [["account", "401648225"], ["rule", "max_daily_loss"]] }),
+    E(T(9, 40, 33), "positions", "Position 1039712001 stop moved 1.08420 -> 1.08120", { sev: "notice", ids: [["position", "1039712001"], ["symbol", "EURUSD"]] }),
+    E(T(9, 41, 2), "streams", "StoneX prices stream lost", { sev: "warn", ids: [["stream", "prices"]] }),
+    E(T(9, 41, 9), "streams", "StoneX prices stream reconciled", { ids: [["stream", "prices"]] }),
+    E(T(10, 2, 47), "risk", "Rule missing_stop_loss raised to SOFT on position 1039712001", { sev: "alert", ids: [["position", "1039712001"], ["rule", "missing_stop_loss"]] }),
+    E(T(10, 2, 47), "halt", "Halt level NONE -> SOFT (missing_stop_loss)", { sev: "alert", ids: [["rule", "missing_stop_loss"]] }),
+    E(T(10, 2, 48), "alerts", "Alert queued (SOFT): SOFT missing_stop_loss position:1039712001", { ids: [["position", "1039712001"]] }),
+    E(T(10, 2, 51), "alerts", "Alert sent (email, push)"),
+    E(T(10, 3, 20), "risk", "Rule missing_stop_loss resolved on position 1039712001", { ids: [["position", "1039712001"], ["rule", "missing_stop_loss"]] }),
+    E(T(10, 3, 20), "halt", "Halt level SOFT -> NONE (resolved)", { sev: "notice" }),
+    E(T(10, 15, 0), "dlq", "Event parked in DLQ: ORDER 1039712003 (illegal_transition)", { sev: "warn", ids: [["order", "1039712003"], ["dlq row", "3"]] }),
+    E(T(10, 15, 31), "dlq", "DLQ row 3 resolved", { ids: [["dlq row", "3"]] }),
+    E(T(10, 20, 0), "account", "Account record updated", { sev: "debug", hk: true, ids: [["account", "401648225"]] }),
+    E(T(10, 20, 5), "orders", "Stale broker read ignored for order 1039712002", { sev: "debug", hk: true, ids: [["order", "1039712002"]] })
+  ];
+
+  /* ---------- open now + status ---------- */
+  var positions = [{
+    id: "1039712001", side: "SELL", sym: "EURUSD", status: "OPEN", entry: "1.08120", stop: "1.08120", tp: "1.07520",
+    kids: [{ kind: "Stop-loss", id: "1039712002", status: "WORKING" }, { kind: "Take-profit", id: "1039712003", status: "WORKING" }]
+  }];
+  var orders = [{
+    id: "1039712010", side: "BUY", type: "LIMIT", sym: "GBPUSD", status: "WORKING", entry: "1.26500", stop: "1.26200", tp: "1.27100",
+    kids: [{ kind: "Stop-loss", id: "1039712011", status: "PENDING" }, { kind: "Take-profit", id: "1039712012", status: "PENDING" }]
+  }];
+  var breaches = [{ rule: "max_daily_loss", level: "FLAG", subject: "account 401648225", subjectId: "401648225", reason: "transfers_unverified", since: T(8, 12, 11) }];
+  var changed = {}; // key -> arrival time, for flat highlight
+
+  var st = {
+    halt: "NONE", latch: false, safeHold: false,
+    leader: "pc1", epoch: "150031", leaderSince: T(1, 46, 10),
+    engineStart: T(1, 44, 59), engineSeen: 3,
+    streams: { orders: "LIVE", account: "LIVE", prices: "LIVE" }, lostSince: {},
+    dlqQ: 0, dlqQuar: 0, conn: "Live", lastPoll: 1
+  };
+
+  /* ---------- simulated live stream ---------- */
+  var extra = [
+    { t: T(10, 21, 14), cat: "positions", sev: "notice", title: "Position 1039712001 take-profit moved 1.07520 -> 1.07400",
+      ids: [["position", "1039712001"], ["symbol", "EURUSD"]],
+      fx: function () { positions[0].tp = "1.07400"; changed["pos:1039712001:tp"] = Date.now(); } },
+    { t: T(10, 21, 15), cat: "orders", title: "Take-profit 1039712003 moved to 1.07400 (linked to position 1039712001)",
+      ids: [["order", "1039712003"], ["position", "1039712001"]] },
+    { t: T(10, 22, 5), cat: "streams", sev: "warn", title: "StoneX account stream lost", ids: [["stream", "account"]],
+      fx: function (t) { st.streams.account = "LOST"; st.lostSince.account = t; } },
+    { t: T(10, 22, 12), cat: "streams", title: "StoneX account stream reconciled", ids: [["stream", "account"]],
+      fx: function () { st.streams.account = "LIVE"; delete st.lostSince.account; } },
+    { t: T(10, 22, 13), cat: "catchup", title: "Catch-up (reconnect) complete: 3 orders seen, nothing new" },
+    { t: T(10, 23, 40), cat: "account", sev: "debug", hk: true, title: "Account record updated", ids: [["account", "401648225"]] },
+    { t: T(10, 24, 2), cat: "alerts", title: "Alert queued (FLAG): FLAG max_daily_loss account:401648225", ids: [["account", "401648225"]] },
+    { t: T(10, 24, 5), cat: "alerts", title: "Alert sent", ids: [["channel", "email"]] },
+    { t: T(10, 25, 47), cat: "orders", sev: "notice", title: "Order 1039712010 cancelled", ids: [["order", "1039712010"], ["symbol", "GBPUSD"]],
+      fx: function () { orders = orders.filter(function (o) { return o.id !== "1039712010"; }); } },
+    { t: T(10, 25, 47), cat: "orders", title: "Stop-loss 1039712011 for order 1039712010 cancelled", ids: [["order", "1039712011"], ["parent", "1039712010"]] },
+    { t: T(10, 25, 47), cat: "orders", title: "Take-profit 1039712012 for order 1039712010 cancelled", ids: [["order", "1039712012"], ["parent", "1039712010"]] },
+    { t: T(10, 26, 30), cat: "orders", sev: "debug", hk: true, title: "Stale broker read ignored for order 1039712003", ids: [["order", "1039712003"]] },
+    { t: T(10, 28, 0), cat: "risk", title: "Rule max_daily_loss resolved on account 401648225", ids: [["account", "401648225"], ["rule", "max_daily_loss"]],
+      fx: function () { breaches = []; } }
+  ];
+  var extraIdx = 0;
+
+  /* ---------- view state ---------- */
+  var active = {};
+  CATS.forEach(function (c) { active[c[0]] = true; });
+  var query = "";
+  var paused = false;
+  var buffer = [];
+  var showHK = false;
+  var arrived = {}; // event id -> arrival ms
+
+  /* ---------- status strip ---------- */
+  var pillsEl = document.getElementById("pills");
+  var P = {};
+  function makePill(key, label) {
+    var p = el("div", "pill");
+    p.appendChild(el("span", "sdot"));
+    if (label) p.appendChild(el("span", "k", label));
+    var body = el("span", "pv");
+    p.appendChild(body);
+    pillsEl.appendChild(p);
+    p.setAttribute("data-k", key);
+    P[key] = { root: p, body: body };
+    return P[key];
+  }
+  function setPill(key, tone, parts, title) {
+    var p = P[key];
+    p.root.className = "pill" + (tone ? " " + tone : "");
+    p.root.title = title || "";
+    while (p.body.firstChild) p.body.removeChild(p.body.firstChild);
+    parts.forEach(function (part, i) {
+      if (i) p.body.appendChild(document.createTextNode(" "));
+      var cls = part[1] || "";
+      p.body.appendChild(part[2] ? el(part[2], cls, part[0]) : el("span", cls, part[0]));
+    });
+  }
+  makePill("halt", "Halt");
+  makePill("leader", "Leader");
+  makePill("engine", "Engine");
+  // streams pill has custom content
+  (function () {
+    var p = el("div", "pill ok");
+    p.appendChild(el("span", "k", "StoneX"));
+    var mini = el("span", "streams-mini");
+    ["orders", "account", "prices"].forEach(function (s) {
+      var sp = el("span");
+      sp.appendChild(el("span", "sdot"));
+      sp.appendChild(el("span", "", s));
+      mini.appendChild(sp);
+      P["s_" + s] = sp;
+    });
+    p.appendChild(mini);
+    p.setAttribute("data-k", "streams");
+    pillsEl.appendChild(p);
+    P.streams = { root: p };
+  })();
+  makePill("dlq", "DLQ");
+  makePill("breach", "Breaches");
+  makePill("conn", "Page");
+
+  function renderStatus() {
+    setPill("halt", st.halt === "HARD" ? "alert" : ((st.halt !== "NONE" || st.safeHold) ? "warn" : "ok"),
+      [[st.halt, "", "b"], [st.latch ? "hard latch ON" : "latch off", "sub"], ["· SAFE_HOLD", "k"], [st.safeHold ? "ON" : "off", "", "b"]],
+      "Halt level " + st.halt + ", hard latch " + (st.latch ? "on" : "off") + "; SAFE_HOLD " + (st.safeHold ? "on" : "off"));
+    setPill("leader", "ok", [[st.leader, "", "b"], ["epoch " + st.epoch, "hide-sm"], ["since " + utc(st.leaderSince, false), "sub2"]],
+      "Leader " + st.leader + ", epoch " + st.epoch + ", since " + fullStamp(st.leaderSince));
+    setPill("engine", st.engineSeen > 20 ? "alert" : "ok", [["seen " + st.engineSeen + " s ago", "", "b"], ["run " + utc(st.engineStart, false), "sub"]],
+      "Engine run started " + fullStamp(st.engineStart) + "; last seen " + st.engineSeen + " s ago");
+    var anyLost = false, tip = [];
+    ["orders", "account", "prices"].forEach(function (s) {
+      var sp = P["s_" + s], lost = st.streams[s] !== "LIVE";
+      if (lost) anyLost = true;
+      sp.className = lost ? "lost" : "";
+      sp.lastChild.textContent = lost ? s + " LOST" : s;
+      tip.push(s + " " + (lost ? "LOST since " + utc(st.lostSince[s]) + " UTC" : "LIVE"));
+    });
+    P.streams.root.className = "pill " + (anyLost ? "warn" : "ok");
+    P.streams.root.title = "StoneX streams: " + tip.join(", ");
+    setPill("dlq", (st.dlqQ || st.dlqQuar) ? "warn" : "ok", [[st.dlqQ + " queued · " + st.dlqQuar + " quarantined", "", "b"]],
+      "Dead-letter queue: " + st.dlqQ + " queued, " + st.dlqQuar + " quarantined");
+    var counts = {};
+    breaches.forEach(function (b) { counts[b.level] = (counts[b.level] || 0) + 1; });
+    var parts = Object.keys(counts).map(function (k) { return counts[k] + " " + k; });
+    setPill("breach", breaches.length ? "warn" : "ok", [[parts.length ? parts.join(", ") : "none", "", "b"]],
+      breaches.length ? "Open rule breaches: " + parts.join(", ") : "No open rule breaches");
+    setPill("conn", st.conn === "Live" ? "ok" : "alert", [[st.conn, "", "b"], ["· poll " + st.lastPoll + " s ago", ""]],
+      "Page connection " + st.conn + "; last poll " + st.lastPoll + " s ago");
+  }
+
+  /* ---------- chips ---------- */
+  var chipsEl = document.getElementById("chips");
+  var chipEls = {};
+  function buildChips() {
+    var all = el("button", "chip all");
+    all.type = "button";
+    all.appendChild(el("span", "", "All"));
+    all.appendChild(el("span", "n"));
+    all.addEventListener("click", function () {
+      CATS.forEach(function (c) { active[c[0]] = true; });
+      renderAll();
+    });
+    chipsEl.appendChild(all);
+    chipEls.__all = all;
+    CATS.forEach(function (c) {
+      var b = el("button", "chip");
+      b.type = "button";
+      b.style.setProperty("--cat", "var(--c-" + c[0] + ")");
+      b.appendChild(el("span", "cdot"));
+      b.appendChild(el("span", "", c[1]));
+      b.appendChild(el("span", "n"));
+      b.addEventListener("click", function () {
+        var allOn = CATS.every(function (x) { return active[x[0]]; });
+        if (allOn) { CATS.forEach(function (x) { active[x[0]] = x[0] === c[0]; }); }
+        else { active[c[0]] = !active[c[0]]; }
+        if (!CATS.some(function (x) { return active[x[0]]; })) CATS.forEach(function (x) { active[x[0]] = true; });
+        renderAll();
+      });
+      chipsEl.appendChild(b);
+      chipEls[c[0]] = b;
+    });
+  }
+  function renderChips() {
+    var allOn = CATS.every(function (x) { return active[x[0]]; });
+    var total = 0;
+    CATS.forEach(function (c) {
+      var n = events.filter(function (e) { return e.cat === c[0] && (showHK || !e.hk); }).length;
+      total += n;
+      var b = chipEls[c[0]];
+      b.setAttribute("aria-pressed", active[c[0]] ? "true" : "false");
+      b.lastChild.textContent = String(n);
+    });
+    chipEls.__all.setAttribute("aria-pressed", allOn ? "true" : "false");
+    chipEls.__all.lastChild.textContent = String(total);
+  }
+
+  /* ---------- feed ---------- */
+  var feedEl = document.getElementById("feed");
+  function matches(e) {
+    if (!query) return true;
+    var hay = e.title.toLowerCase();
+    e.ids.forEach(function (p) { hay += " " + p[1].toLowerCase(); });
+    return query.split(/\s+/).every(function (w) { return !w || hay.indexOf(w) !== -1; });
+  }
+  function setQuery(v) {
+    var inp = document.getElementById("q");
+    inp.value = v;
+    query = v.trim().toLowerCase();
+    document.getElementById("searchWrap").classList.toggle("has", !!v);
+    renderFeed();
+  }
+  function renderFeed() {
+    var vis = events.filter(function (e) { return (showHK || !e.hk) && active[e.cat] && matches(e); });
+    vis.sort(function (a, b) { return b.at - a.at || b.id - a.id; });
+    var shownBase = events.filter(function (e) { return showHK || !e.hk; }).length;
+    document.getElementById("showing").textContent = "Showing " + vis.length + " of " + shownBase + " events";
+    while (feedEl.firstChild) feedEl.removeChild(feedEl.firstChild);
+    if (!vis.length) {
+      var li = el("li", "empty");
+      li.appendChild(el("div", "", "No events match these filters."));
+      var b = el("button", "btn", "Clear filters");
+      b.type = "button";
+      b.addEventListener("click", function () { CATS.forEach(function (c) { active[c[0]] = true; }); setQuery(""); renderAll(); });
+      li.appendChild(b);
+      feedEl.appendChild(li);
+      return;
+    }
+    var groups = [], cur = null;
+    vis.forEach(function (e) {
+      var h = new Date(e.at).getUTCHours();
+      if (!cur || cur.h !== h) { cur = { h: h, at: DAY + h * 3600000, items: [] }; groups.push(cur); }
+      cur.items.push(e);
+    });
+    var now = Date.now();
+    groups.forEach(function (g) {
+      var hl = el("li", "hour");
+      hl.appendChild(el("div", "h-time mono", pad(g.h) + ":00"));
+      hl.appendChild(el("div", "h-mark"));
+      var sub = el("div", "h-sub");
+      sub.appendChild(el("b", "", "UTC"));
+      sub.appendChild(document.createTextNode("  ·  " + mel(g.at, false) + " Melbourne  ·  " + g.items.length + (g.items.length === 1 ? " event" : " events")));
+      hl.appendChild(sub);
+      feedEl.appendChild(hl);
+      g.items.forEach(function (e) { feedEl.appendChild(renderEvent(e, now)); });
+    });
+  }
+  function renderEvent(e, now) {
+    var li = el("li", "ev sev-" + e.sev + (e.hk ? " hk" : ""));
+    li.style.setProperty("--cat", "var(--c-" + e.cat + ")");
+    var a = arrived[e.id];
+    if (a && now - a < 2600) {
+      li.classList.add("fresh");
+      setTimeout(function () { li.classList.remove("fresh"); }, 2600 - (now - a));
+    }
+    var tcell = el("div", "t mono");
+    tcell.title = fullStamp(e.at);
+    tcell.appendChild(el("span", "u", utc(e.at)));
+    var m = el("span", "m", mel(e.at));
+    m.appendChild(el("span", "z", " Mel"));
+    tcell.appendChild(m);
+    li.appendChild(tcell);
+    var dc = el("div", "dotcell");
+    dc.appendChild(el("span", "dot"));
+    li.appendChild(dc);
+    var body = el("div", "body");
+    if (a && now - a < 2600) body.style.animationDelay = -(now - a) + "ms";
+    var title = el("div", "title");
+    if (e.sev === "alert") title.appendChild(el("span", "tag alert", "Alert"));
+    if (e.sev === "warn") title.appendChild(el("span", "tag warn", "Warning"));
+    title.appendChild(document.createTextNode(e.title));
+    title.appendChild(el("span", "new", "new"));
+    body.appendChild(title);
+    var meta = el("div", "meta");
+    meta.appendChild(el("span", "cat", CAT_LABEL[e.cat]));
+    if (e.hk) meta.appendChild(el("span", "hk-tag", "housekeeping"));
+    e.ids.forEach(function (p) {
+      var b = el("button", "idbtn mono");
+      b.type = "button";
+      b.title = "Filter the feed by " + p[1];
+      b.appendChild(el("span", "lbl", p[0]));
+      b.appendChild(document.createTextNode(p[1]));
+      b.addEventListener("click", function () { setQuery(p[1]); });
+      meta.appendChild(b);
+    });
+    body.appendChild(meta);
+    li.appendChild(body);
+    return li;
+  }
+
+  /* ---------- open now ---------- */
+  var openEl = document.getElementById("openNow");
+  function idLink(id) {
+    var b = el("button", "linkish mono", id);
+    b.type = "button";
+    b.title = "Filter the feed by " + id;
+    b.addEventListener("click", function () { setQuery(id); document.getElementById("q").focus(); });
+    return b;
+  }
+  function isFresh(key) { return changed[key] && Date.now() - changed[key] < 2600; }
+  function levelCell(label, value, key, extraNote) {
+    var c = el("div", "lv");
+    if (key && isFresh(key)) { c.classList.add("fresh"); c.style.animationDelay = -(Date.now() - changed[key]) + "ms"; }
+    c.appendChild(el("span", "l", label));
+    c.appendChild(el("span", "v mono", value));
+    if (extraNote) c.appendChild(el("span", "be", extraNote));
+    return c;
+  }
+  function kidsList(kids) {
+    var ul = el("ul", "kids");
+    kids.forEach(function (k) {
+      var li = el("li");
+      var left = el("span", "kname");
+      left.appendChild(document.createTextNode(k.kind + " "));
+      left.appendChild(idLink(k.id));
+      li.appendChild(left);
+      li.appendChild(el("span", "status " + k.status.toLowerCase(), k.status));
+      ul.appendChild(li);
+    });
+    return ul;
+  }
+  function entityCard(x, kind) {
+    var c = el("div", "card");
+    var h = el("div", "card-h");
+    var what = el("div", "what");
+    what.appendChild(el("span", "side", x.side + (x.type ? " " + x.type : "")));
+    what.appendChild(document.createTextNode(x.sym));
+    h.appendChild(what);
+    h.appendChild(el("span", "status " + x.status.toLowerCase(), x.status));
+    c.appendChild(h);
+    var sub = el("div", "sub-id");
+    sub.appendChild(document.createTextNode((kind === "pos" ? "Position " : "Entry order ")));
+    sub.appendChild(idLink(x.id));
+    c.appendChild(sub);
+    var lv = el("div", "levels");
+    var key = (kind === "pos" ? "pos:" : "ord:") + x.id;
+    lv.appendChild(levelCell("Entry", x.entry, key + ":entry"));
+    lv.appendChild(levelCell("Stop", x.stop, key + ":stop", kind === "pos" && x.stop === x.entry ? "break-even" : ""));
+    lv.appendChild(levelCell("Take-profit", x.tp, key + ":tp"));
+    c.appendChild(lv);
+    c.appendChild(kidsList(x.kids));
+    return c;
+  }
+  function section(title, count, nodes, emptyText) {
+    var s = el("div", "sec");
+    var h = el("h3");
+    h.appendChild(el("span", "", title));
+    h.appendChild(el("span", "", String(count)));
+    s.appendChild(h);
+    if (!nodes.length) s.appendChild(el("div", "none", emptyText));
+    nodes.forEach(function (n) { s.appendChild(n); });
+    return s;
+  }
+  function renderOpen() {
+    while (openEl.firstChild) openEl.removeChild(openEl.firstChild);
+    openEl.appendChild(el("h2", "", "Open now"));
+    openEl.appendChild(el("p", "lede", "Levels only. Children are grouped under their parent."));
+    var grid = el("div", "cards-grid");
+    grid.appendChild(section("Positions", positions.length, positions.map(function (p) { return entityCard(p, "pos"); }), "No open positions."));
+    grid.appendChild(section("Working orders", orders.length, orders.map(function (o) { return entityCard(o, "ord"); }), "No working entry orders."));
+    var bcards = breaches.map(function (b) {
+      var c = el("div", "card breach");
+      var h = el("div", "card-h");
+      h.appendChild(el("span", "rule", b.rule));
+      h.appendChild(el("span", "status flag", b.level));
+      c.appendChild(h);
+      var why = el("div", "why");
+      why.appendChild(document.createTextNode("Account "));
+      why.appendChild(idLink(b.subjectId));
+      why.appendChild(document.createTextNode(" · " + b.reason));
+      c.appendChild(why);
+      var since = el("div", "sub-id mono", "since " + utc(b.since) + " UTC · " + mel(b.since) + " Melbourne");
+      c.appendChild(since);
+      return c;
+    });
+    grid.appendChild(section("Open breaches", breaches.length, bcards, "No open rule breaches."));
+    openEl.appendChild(grid);
+  }
+
+  /* ---------- pause / housekeeping ---------- */
+  var pauseBtn = document.getElementById("pauseBtn");
+  function renderPause() {
+    while (pauseBtn.firstChild) pauseBtn.removeChild(pauseBtn.firstChild);
+    var ns = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", "0 0 14 14");
+    svg.setAttribute("aria-hidden", "true");
+    if (paused) {
+      var tri = document.createElementNS(ns, "path"); tri.setAttribute("d", "M3 1.5v11l9-5.5z"); svg.appendChild(tri);
+    } else {
+      var r1 = document.createElementNS(ns, "rect"); r1.setAttribute("x", "2.5"); r1.setAttribute("y", "1.5"); r1.setAttribute("width", "3.2"); r1.setAttribute("height", "11");
+      var r2 = document.createElementNS(ns, "rect"); r2.setAttribute("x", "8.3"); r2.setAttribute("y", "1.5"); r2.setAttribute("width", "3.2"); r2.setAttribute("height", "11");
+      svg.appendChild(r1); svg.appendChild(r2);
+    }
+    pauseBtn.appendChild(svg);
+    pauseBtn.appendChild(document.createTextNode(paused ? "Resume" + (buffer.length ? " (" + buffer.length + " new)" : "") : "Pause"));
+    pauseBtn.className = "btn" + (paused ? " paused" : "");
+    pauseBtn.setAttribute("aria-pressed", paused ? "true" : "false");
+    var banner = document.getElementById("pausedBanner");
+    banner.classList.toggle("show", paused);
+    document.getElementById("pausedText").textContent = buffer.length
+      ? "Feed paused. " + buffer.length + (buffer.length === 1 ? " new event is" : " new events are") + " waiting."
+      : "Feed paused. New events will wait here; the status bar keeps updating.";
+  }
+  function togglePause() {
+    paused = !paused;
+    if (!paused && buffer.length) {
+      var now = Date.now();
+      buffer.forEach(function (e) { events.push(e); arrived[e.id] = now; });
+      buffer = [];
+      renderAll();
+    }
+    renderPause();
+  }
+  pauseBtn.addEventListener("click", togglePause);
+  document.getElementById("bannerResume").addEventListener("click", togglePause);
+  document.getElementById("hk").addEventListener("change", function (ev) { showHK = ev.target.checked; renderAll(); });
+  function renderHKLabel() {
+    var n = events.filter(function (e) { return e.hk; }).length;
+    document.getElementById("hkLabel").textContent = "Housekeeping (" + n + ")";
+  }
+
+  /* ---------- search ---------- */
+  document.getElementById("q").addEventListener("input", function (ev) { setQuery(ev.target.value); });
+  document.getElementById("qClear").addEventListener("click", function () { setQuery(""); document.getElementById("q").focus(); });
+
+  /* ---------- theme ---------- */
+  var themeBtn = document.getElementById("themeBtn");
+  var themes = ["auto", "light", "dark"], themeIdx = 0;
+  try { var saved = localStorage.getItem("lv-proto-theme"); if (saved && themes.indexOf(saved) > -1) themeIdx = themes.indexOf(saved); } catch (e) {}
+  function applyTheme() {
+    var t = themes[themeIdx];
+    if (t === "auto") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", t);
+    themeBtn.textContent = "Theme: " + t;
+  }
+  themeBtn.addEventListener("click", function () {
+    themeIdx = (themeIdx + 1) % themes.length;
+    try { localStorage.setItem("lv-proto-theme", themes[themeIdx]); } catch (e) {}
+    applyTheme();
+  });
+  applyTheme();
+
+  document.getElementById("restart").addEventListener("click", function () { location.reload(); });
+
+  /* ---------- sticky offset ---------- */
+  var strip = document.getElementById("strip");
+  function syncStrip() { document.documentElement.style.setProperty("--strip-h", strip.offsetHeight + "px"); }
+  if (window.ResizeObserver) new ResizeObserver(syncStrip).observe(strip);
+  window.addEventListener("resize", syncStrip);
+
+  document.getElementById("dateLine").textContent = "· Sat 21 Nov 2026 · UTC, Melbourne below";
+
+  function renderAll() { renderChips(); renderHKLabel(); renderFeed(); renderOpen(); renderStatus(); }
+
+  /* ---------- clocks ---------- */
+  setInterval(function () {
+    st.lastPoll += 1;
+    st.engineSeen = st.engineSeen >= 5 ? 1 : st.engineSeen + 1;
+    renderStatus();
+  }, 1000);
+
+  setInterval(function () {
+    st.lastPoll = 0;
+    if (extraIdx >= extra.length) { renderStatus(); return; }
+    var x = extra[extraIdx++];
+    var e = E(x.t, x.cat, x.title, { sev: x.sev, ids: x.ids, hk: x.hk });
+    var hadOpen = x.fx ? true : false;
+    if (x.fx) x.fx(x.t);
+    if (paused) {
+      buffer.push(e);
+      renderPause();
+      if (hadOpen) { renderOpen(); }
+      renderStatus();
+      return;
+    }
+    events.push(e);
+    arrived[e.id] = Date.now();
+    renderChips(); renderHKLabel(); renderFeed();
+    if (hadOpen) renderOpen();
+    renderStatus();
+  }, 4000);
+
+  buildChips();
+  renderPause();
+  renderAll();
+  syncStrip();
+})();
+</script>
+</body>
+</html>

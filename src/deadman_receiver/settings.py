@@ -10,6 +10,11 @@ Service:
 * XTNL_RECEIVER_PATH         the heartbeat path (default /xtnl/heartbeat, the path of XTNL_DEADMAN_URL).
 * XTNL_RECEIVER_TEST_PAGE_UTC  HH:MM of the daily test page (default 22:00 UTC = morning in Melbourne).
 * XTNL_RECEIVER_REPAGE_S     re-page interval while a condition stays active (default 900, 60..86400).
+* XTNL_RECEIVER_TWO_ENGINES_WINDOW_S  W19: window in which beats from two engine sources (node, epoch) that
+                             interleave page `two_engines` (default 60, 45..600; below 45 s a 15 s cadence leaves
+                             too few beats in the window for the rate rule). The interleave test looks back over at
+                             least 90 s whatever the window, and the page is held for one window after its last
+                             detection (review round 4, evaluate.py).
 * XTNL_RECEIVER_CERTS        K5: name=path list of the certificates on this Melbourne host the receiver watches
                              (e.g. dashboard-redis-client=/etc/xtnl/dashboard/redis-client.crt): each pages
                              `cert:<name>` when unreadable or within 30 days of expiry. Its own TLS certificate is
@@ -57,6 +62,7 @@ PATH_VAR: Final = "XTNL_RECEIVER_PATH"
 TEST_PAGE_VAR: Final = "XTNL_RECEIVER_TEST_PAGE_UTC"
 REPAGE_VAR: Final = "XTNL_RECEIVER_REPAGE_S"
 CERTS_VAR: Final = "XTNL_RECEIVER_CERTS"
+TWO_ENGINES_WINDOW_VAR: Final = "XTNL_RECEIVER_TWO_ENGINES_WINDOW_S"
 #: The channel variables: XTNL_RECEIVER_<X> is read as the engine's XTNL_<X> by src.notifications.settings.
 CHANNEL_VARS: Final = (
     "XTNL_RECEIVER_ALERT_EMAIL_TO",
@@ -73,6 +79,10 @@ DEFAULT_LISTEN: Final = "127.0.0.1:8443"
 DEFAULT_PATH: Final = "/xtnl/heartbeat"
 DEFAULT_TEST_PAGE: Final = (22, 0)
 DEFAULT_REPAGE_S: Final = 900
+DEFAULT_TWO_ENGINES_WINDOW_S: Final = 60
+#: 45 s holds three beats of each engine at the 15 s cadence, the fewest that can show an interleave (two of each
+#: inside the other's span); 600 s keeps a stopped engine's beats from lingering for longer than 10 min.
+TWO_ENGINES_WINDOW_BOUNDS: Final = (45, 600)
 MIN_TOKEN_CHARS: Final = 16
 _PATH: Final = re.compile(r"^/[A-Za-z0-9._~/-]{0,200}$")
 
@@ -96,6 +106,7 @@ class ReceiverSettings:
     token_next: str | None = field(default=None, repr=False)
     token_overlap_s: int = 1_800
     certs: tuple[tuple[str, str], ...] = ()     # K5: (name, path) of the watched Melbourne certificates
+    two_engines_window_s: int = DEFAULT_TWO_ENGINES_WINDOW_S   # W19
 
     @property
     def tls(self) -> bool:
@@ -128,6 +139,8 @@ class ReceiverSettings:
             errors.append(f"{PATH_VAR} must be an absolute URL path (not /healthz)")
         test_page = _hhmm(_get(e, TEST_PAGE_VAR), errors)
         repage = _int(_get(e, REPAGE_VAR), DEFAULT_REPAGE_S, 60, 86_400, REPAGE_VAR, errors)
+        window = _int(_get(e, TWO_ENGINES_WINDOW_VAR), DEFAULT_TWO_ENGINES_WINDOW_S, *TWO_ENGINES_WINDOW_BOUNDS,
+                      TWO_ENGINES_WINDOW_VAR, errors)
         channels = channel_settings(e)
         if channels.email is None and channels.push is None:
             errors.append("no paging channel outside eu-west-2 is configured (XTNL_RECEIVER_SES_* / "
@@ -139,7 +152,7 @@ class ReceiverSettings:
             raise ReceiverConfigError("; ".join(errors))
         assert token is not None
         return cls(host, port, token, channels, cert, key, path, test_page, repage, channels.issues, token_next,
-                   overlap, tuple(sorted(certs.items())))
+                   overlap, tuple(sorted(certs.items())), window)
 
 
 def receiver_secrets_source(env: Mapping[str, str] | None = None) -> SecretsSource:

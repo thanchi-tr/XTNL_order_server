@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#04080f">
+<title>Alerts · XTNL live adjust (prototype)</title>
+<link rel="stylesheet" href="theme.css">
+<script src="proto.js" defer></script>
+</head>
+<body data-page="alerts" data-phase="3">
+<div class="banners" id="banners"></div>
+<main class="wrap" id="main">
+  <div class="pagehead">
+    <div>
+      <div class="eyebrow">D1 · safety alerts cannot be switched off</div>
+      <h1>Alerts</h1>
+      <p class="lede">In Phase 5 you can turn routine notices off. The safety list always reaches you by email and push, whatever you set here.</p>
+    </div>
+    <span class="meta">Email + push · operator-needed alerts re-page every 30 min until resolved</span>
+  </div>
+
+  <div class="grid-2">
+    <section class="panel" aria-labelledby="routH">
+      <div class="panel-head"><h2 id="routH">Routine notices</h2><span class="meta" id="routineState">Phase 3–4: all routine notices are sent</span></div>
+      <div class="panel-body">
+        <div class="setrow">
+          <button class="switch" id="routineMaster" type="button" role="switch" aria-checked="true" aria-labelledby="rmT" aria-describedby="routineState"></button>
+          <div class="setrow-text"><div class="setrow-title" id="rmT">All routine notices</div><div class="setrow-sub">Available in Phase 5 only; Phases 3 and 4 send every routine notice.</div></div>
+        </div>
+        <div class="routine">
+          <div class="setrow"><button class="switch" type="button" role="switch" aria-checked="true" aria-labelledby="r1" aria-describedby="routineState"></button><div class="setrow-text"><div class="setrow-title" id="r1">Heads-up (40 s before bar end)</div><div class="setrow-sub">Provisional; never acts.</div></div><div class="chans"><span class="chip chip-muted">EMAIL</span></div></div>
+          <div class="setrow"><button class="switch" type="button" role="switch" aria-checked="true" aria-labelledby="r2" aria-describedby="routineState"></button><div class="setrow-text"><div class="setrow-title" id="r2">Bar-end advice and outcomes</div><div class="setrow-sub">Below trigger, not confirmed, ADJUST, released.</div></div><div class="chans"><span class="chip chip-muted">EMAIL</span></div></div>
+          <div class="setrow"><button class="switch" type="button" role="switch" aria-checked="true" aria-labelledby="r3" aria-describedby="routineState"></button><div class="setrow-text"><div class="setrow-title" id="r3">Stop moved (confirmed)</div><div class="setrow-sub">Before and after level, times.</div></div><div class="chans"><span class="chip chip-muted">EMAIL</span><span class="chip chip-muted">PUSH</span></div></div>
+          <div class="setrow"><button class="switch" type="button" role="switch" aria-checked="true" aria-labelledby="r4" aria-describedby="routineState"></button><div class="setrow-text"><div class="setrow-title" id="r4">Position ended</div><div class="setrow-sub">Closed by stop or take profit; any open move cancelled.</div></div><div class="chans"><span class="chip chip-muted">EMAIL</span></div></div>
+          <div class="setrow"><button class="switch" type="button" role="switch" aria-checked="true" aria-labelledby="r5" aria-describedby="routineState"></button><div class="setrow-text"><div class="setrow-title" id="r5">Hourly “ARM alive” and daily test</div><div class="setrow-sub">Proves the channels work.</div></div><div class="chans"><span class="chip chip-muted">EMAIL</span></div></div>
+        </div>
+        <div class="locked"><svg viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg>Approval requests stay on while Phase 3 is active (you could not approve otherwise)<span class="chip chip-warn">P3</span></div>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="safeH">
+      <div class="panel-head"><h2 id="safeH">Safety alerts — always on</h2><span class="chip chip-ok">✓ D1 FULL LIST</span></div>
+      <div class="panel-body">
+        <div class="setrow"><svg class="lockico" viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg><div class="setrow-text"><div class="setrow-title">Dead-man: no heartbeat<span class="sr-only"> — always on, cannot be switched off</span></div><div class="setrow-sub">From the off-PC receiver, so it works when the PC is off, asleep or the supervisor died.</div></div><span class="chip chip-bad">✕ CRITICAL</span></div>
+        <div class="setrow"><svg class="lockico" viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg><div class="setrow-text"><div class="setrow-title">Engine not recording (no leader for 10 min)<span class="sr-only"> — always on</span></div><div class="setrow-sub">Sent directly from the PC while it is up.</div></div><span class="chip chip-bad">✕ CRITICAL</span></div>
+        <div class="setrow"><svg class="lockico" viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg><div class="setrow-text"><div class="setrow-title">Operator needed: unknown send outcome · ack not confirmed in 30 s<span class="sr-only"> — always on</span></div><div class="setrow-sub">Never re-sent; the stop is blocked until resolved. Re-pages every 30 min.</div></div><span class="chip chip-bad">✕ CRITICAL</span></div>
+        <div class="setrow"><svg class="lockico" viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg><div class="setrow-text"><div class="setrow-title">Stop loosened by a send · no stop after a send<span class="sr-only"> — always on</span></div><div class="setrow-sub">The confirming read found a looser or missing stop.</div></div><span class="chip chip-bad">✕ CRITICAL</span></div>
+        <div class="setrow"><svg class="lockico" viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg><div class="setrow-text"><div class="setrow-title">SAFE_HOLD set · ARM FAILED<span class="sr-only"> — always on</span></div><div class="setrow-sub">Nothing is sent until it clears.</div></div><span class="chip chip-bad">✕ CRITICAL</span></div>
+        <div class="setrow"><svg class="lockico" viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg><div class="setrow-text"><div class="setrow-title">SAFE_HOLD auto-resumed<span class="sr-only"> — always on</span></div><div class="setrow-sub">Live moves come back with the engine (D6).</div></div><span class="chip chip-warn">▲ HIGH</span></div>
+        <div class="setrow"><svg class="lockico" viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg><div class="setrow-text"><div class="setrow-title">Broker rejected a move · move blocked by an open move<span class="sr-only"> — always on</span></div><div class="setrow-sub">Once per stop and reason.</div></div><span class="chip chip-warn">▲ HIGH</span></div>
+        <div class="setrow"><svg class="lockico" viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg><div class="setrow-text"><div class="setrow-title">Move refused · move expired<span class="sr-only"> — always on</span></div><div class="setrow-sub">Refusals for “price through level” are routine.</div></div><span class="chip chip-warn">▲ HIGH</span></div>
+        <div class="setrow"><svg class="lockico" viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="6" width="9" height="6.5" rx="1.2"/><path d="M4.5 6V4.3a2.5 2.5 0 0 1 5 0V6"/></svg><div class="setrow-text"><div class="setrow-title">Two ADJUSTs in a row with no move<span class="sr-only"> — always on</span></div><div class="setrow-sub">A position the server keeps advising but never moves.</div></div><span class="chip chip-warn">▲ HIGH</span></div>
+      </div>
+      <div class="panel-foot">These rows have no switch on purpose (D1). Channels: email + push for every row.</div>
+    </section>
+  </div>
+</main>
+<div class="demo" role="region" aria-label="Prototype controls">
+  <span class="demo-label">Prototype</span>
+  <button class="seg" type="button" data-show-phase="3" aria-pressed="true">Show as Phase 3</button>
+  <button class="seg" type="button" data-show-phase="5" aria-pressed="false">Show as Phase 5</button>
+</div>
+</body>
+</html>

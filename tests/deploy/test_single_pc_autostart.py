@@ -40,6 +40,9 @@ MD_ARM_SECRETS = {"XTNL_MD_REDIS_URL", "XTNL_MD_REDIS_READER_URL", "XTNL_MD_HMAC
                   "XTNL_ARM_PUSH_TOKEN", "XTNL_ARM_PUSH_USER"}
 OVERSEE_SECRETS = {"XTNL_SMTP_USERNAME", "XTNL_SMTP_PASSWORD", "XTNL_SES_ACCESS_KEY_ID", "XTNL_SES_SECRET_ACCESS_KEY",
                    "XTNL_SES_SESSION_TOKEN", "XTNL_PUSH_TOKEN", "XTNL_PUSH_USER", "XTNL_DEADMAN_TOKEN"}
+# Home-server plan W2: the heartbeat copy URL is a capability URL (Healthchecks.io: holding it keeps the check green);
+# it and its token come only from the Windows User environment on the PC (the AWS engine.env keeps both in its file).
+HEARTBEAT_COPY_SECRETS = {"XTNL_HEARTBEAT_COPY_URL", "XTNL_HEARTBEAT_COPY_TOKEN"}
 
 
 def _compose(path: Path = COMPOSE) -> dict[str, str]:
@@ -327,13 +330,16 @@ def test_start_script_drains_on_ctrl_c_and_leaves_no_orphans() -> None:
 def test_start_script_refuses_credentials_in_the_env_file() -> None:
     text = _script("start-xtnl.ps1")
     assert _forbidden_in_file() == (set(CREDENTIALS) | {"XTNL_API_SECRET", "XTNL_API_DSN"}
-                                    | MD_ARM_SECRETS | OVERSEE_SECRETS)
+                                    | MD_ARM_SECRETS | OVERSEE_SECRETS | {"XTNL_LIVEVIEW_DSN"}
+                                    | HEARTBEAT_COPY_SECRETS)
     m = re.search(r"\$UserVarNames = @\(([^)]*)\)", text, re.S)
     assert m is not None
     names = set(re.findall(r"'([A-Z_]+)'", m.group(1)))
     assert set(CREDENTIALS) | {"BROKER_ENV", "STONE_X_BASE_URL", "STONE_X_STREAM_URL"} <= names
     # design C2: every market-data / ARM secret and Oversee channel credential is copied from the User environment
     assert MD_ARM_SECRETS | OVERSEE_SECRETS <= names
+    assert "XTNL_LIVEVIEW_DSN" in names                  # the live view's login (docs/design/live-view.md s5)
+    assert HEARTBEAT_COPY_SECRETS <= names                # home-server plan W2: the engine reads them
 
 
 @pytest.mark.parametrize("name", SCRIPTS)
@@ -405,9 +411,30 @@ def test_runbook_carry_over_restores_with_the_dashboard_role() -> None:
     assert "DROP DATABASE IF EXISTS xtnl" in carry
     assert carry.index("src.db.migrate") > restore
     assert "--from-cluster-id" in carry and "--approver" in carry
-    # The role step pipes the migration up to the end of its DO block (line 26 is "$$;").
+    # The role step pipes the migration through its last ALTER ROLE ... SET line (line 30, review round 3: line 26
+    # ended at the DO block and left out the role-level SET values, which a dump does not carry).
     lines = (ROOT / "src" / "db" / "migrations" / "0011_dashboard_role.sql").read_text(encoding="utf-8").splitlines()
-    assert "-TotalCount 26" in carry and lines[25].strip() == "$$;"
+    assert "0011_dashboard_role.sql -TotalCount 30" in carry and lines[25].strip() == "$$;"
+    assert lines[29].startswith("ALTER ROLE xtnl_dashboard SET") and not lines[30].strip()
+
+
+def test_runbook_carry_over_restores_with_the_liveview_role() -> None:
+    # The same for xtnl_liveview (migration 0021, docs/design/live-view.md s3.6): its role block comes first and is
+    # piped through its last ALTER ROLE line, before pg_restore. Role-level ALTER ROLE ... SET values are not in a
+    # dump, and piping the whole file would fail (the views name tables not restored yet).
+    text = (ROOT / "docs" / "runbooks" / "single-pc-autostart.md").read_text(encoding="utf-8")
+    carry = text[text.index("## Carry over"):text.index("## Rollback")]
+    step = ("Get-Content src\\db\\migrations\\0021_liveview_role.sql -TotalCount 32 | docker exec -i "
+            "xtnl-local-postgres-1 psql -U xtnl -d xtnl -v ON_ERROR_STOP=1 -q")
+    assert step in carry
+    assert carry.index("0011_dashboard_role.sql") < carry.index(step) < carry.index("pg_restore")
+    lines = (ROOT / "src" / "db" / "migrations" / "0021_liveview_role.sql").read_text(encoding="utf-8").splitlines()
+    role_lines = [i for i, ln in enumerate(lines, 1) if ln.startswith("ALTER ROLE xtnl_liveview SET")]
+    assert role_lines and role_lines[-1] == 32 == max(i for i, ln in enumerate(lines, 1) if "ALTER ROLE" in ln
+                                                      and not ln.lstrip().startswith("--"))
+    head = [ln for ln in lines[:32] if not ln.lstrip().startswith("--")]
+    assert any("CREATE ROLE xtnl_liveview NOLOGIN" in ln for ln in head)
+    assert not [ln for ln in head if re.search(r"\b(VIEW|INDEX|PASSWORD)\b", ln, re.I)]   # role block only
 
 
 # ---------------------------------------------------------------------------------------------- redis-md (plan S36)
