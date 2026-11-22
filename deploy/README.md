@@ -32,7 +32,10 @@ dashboard, dead-man receiver and on-call in Melbourne.
 | `env/dashboard-heartbeat.json.example` | `/etc/xtnl/dashboard/heartbeat.json` (0640 root:xtnl; `envsubst` `DASHBOARD_VPN_IP`, token = the engine's `XTNL_HEARTBEAT_COPY_TOKEN`): the leader heartbeat listener, https on `:8444` with `/etc/xtnl/dashboard/heartbeat.crt` / `.key` (0640 root:xtnl), inbound 8444 from node A and node B only | Melbourne host |
 | `systemd/xtnl-dashboard.service` | `/etc/systemd/system/xtnl-dashboard.service`: the read-only dashboard (`python -m src.dashboard`) | Melbourne host |
 | `systemd/xtnl-deadman-receiver.service` | `/etc/systemd/system/xtnl-deadman-receiver.service`: the dead-man receiver (`python -m src.deadman_receiver`) | Melbourne host |
-| `env/deadman-receiver.env.example` | `/etc/xtnl/deadman-receiver.env` (0600 root; paging channel outside eu-west-2) | Melbourne host |
+| `env/deadman-receiver.env.example` | `/etc/xtnl/deadman-receiver.env` (0600 root; paging channel outside eu-west-2) | Melbourne host, home VPS |
+| `systemd/xtnl-deadman-receiver.home.service` | `/etc/systemd/system/xtnl-deadman-receiver.service` (installed under the AWS unit's name): the home-server receiver on plain `127.0.0.1:8443` behind `tailscale serve`, `XTNL_SECRETS_SOURCE=env`, tokens read at start only (rotation with restarts; `docs/runbooks/deadman-receiver-home.md`) | home VPS |
+| `systemd/xtnl-deadman-healthz.service`, `.timer` | `/etc/systemd/system/` (timer enabled, every minute): curls the receiver's `/healthz` and pings Healthchecks.io check B (its `/fail` on a failed probe) | home VPS |
+| `env/deadman-healthz.env.example` | `/etc/xtnl/deadman-healthz.env` (0600 root:root; check B's ping URL is a secret) | home VPS |
 | `observability/metrics.md` | the metric contract the engine exports on `:9464/metrics` | - |
 | `observability/prometheus/xtnl-alerts.rules.yml` | AMP rule groups namespace / Prometheus `rule_files` (generated) | monitoring account |
 | `observability/alertmanager/alertmanager.yml` | AMP alert manager definition / Alertmanager config (`envsubst`) | monitoring account |

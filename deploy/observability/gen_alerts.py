@@ -143,6 +143,10 @@ DEFINED_METRICS: tuple[Metric, ...] = tuple(Metric(n, t, tuple(ls.split())) for 
     ("xtnl_offline_gap_seconds", "gauge", "node"),
     ("xtnl_catchup_runs_total", "counter", "node adapter complete"),
     ("xtnl_catchup_rows_total", "counter", "node adapter kind"),
+    # dead-man receiver acknowledgement (home-server plan W1); the engine pages it through the outbox itself
+    ("xtnl_deadman_configured", "gauge", "node"),
+    ("xtnl_deadman_consecutive_failures", "gauge", "node"),
+    ("xtnl_deadman_last_ok_age_seconds", "gauge", "node"),
     # optional market-data and ARM services (plan S32); absent while the flags are off
     ("xtnl_md_series", "gauge", "node state"),
     ("xtnl_md_indicators", "gauge", "node state"),

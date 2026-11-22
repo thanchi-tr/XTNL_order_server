@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#04080f">
+<title>Notices · XTNL live adjust (prototype)</title>
+<link rel="stylesheet" href="theme.css">
+<script src="proto.js" defer></script>
+</head>
+<body data-page="notices">
+<div class="banners" id="banners"></div>
+<main class="wrap" id="main">
+  <div class="pagehead">
+    <div>
+      <div class="eyebrow">What reaches you</div>
+      <h1>Notices</h1>
+      <p class="lede">Sample push and email notices for live stop moves. They hold levels, R values, ids and times only — never account values, money, pip size or spreads.</p>
+    </div>
+    <span class="meta">Illustrative · scenarios A and D</span>
+  </div>
+
+  <div class="grid-2">
+    <section class="stack" aria-labelledby="ph3H">
+      <h2 class="section-h" id="ph3H">Phone · Phase 3 (routine on)</h2>
+      <div class="phone" role="group" aria-labelledby="ph3H">
+        <div class="phone-bar"><span>11:00</span><span>XTNL</span></div>
+        <div class="push"><div class="push-head"><span class="push-app"><svg viewBox="0 0 80 80" aria-hidden="true"><line x1="27" y1="8" x2="63" y2="52" stroke="#00cc7a" stroke-width="8" stroke-linecap="round"/><line x1="51" y1="13" x2="17" y2="52" stroke="#00cc7a" stroke-width="7" stroke-linecap="round"/></svg></span>XTNL ARM<span class="push-time">11:00:51</span></div>
+          <div class="push-title">✓ Stop moved</div>
+          <div class="push-body">Order 1 EURUSD long: stop now 1.10000 (was 1.09800). Approved by you 11:00:50.</div>
+          <div class="push-prio"><span class="chip chip-info">INFO</span></div></div>
+        <div class="push"><div class="push-head"><span class="push-app"><svg viewBox="0 0 80 80" aria-hidden="true"><line x1="27" y1="8" x2="63" y2="52" stroke="#00cc7a" stroke-width="8" stroke-linecap="round"/><line x1="51" y1="13" x2="17" y2="52" stroke="#00cc7a" stroke-width="7" stroke-linecap="round"/></svg></span>XTNL ARM<span class="push-time">11:00:12</span></div>
+          <div class="push-title">Approve stop move? Expires 11:01:11</div>
+          <div class="push-body">Order 1 EURUSD long: stop 1.09800 → 1.10000 (break-even). Approve on the order-server PC (local approval page).</div>
+          <div class="push-prio"><span class="chip chip-warn">▲ HIGH</span></div></div>
+        <div class="push"><div class="push-head"><span class="push-app"><svg viewBox="0 0 80 80" aria-hidden="true"><line x1="27" y1="8" x2="63" y2="52" stroke="#00cc7a" stroke-width="8" stroke-linecap="round"/><line x1="51" y1="13" x2="17" y2="52" stroke="#00cc7a" stroke-width="7" stroke-linecap="round"/></svg></span>XTNL ARM<span class="push-time">10:31:11</span></div>
+          <div class="push-title">○ Move expired</div>
+          <div class="push-body">Order 3 GBPUSD long: no answer in 60 s. Stop stays 1.26400. The next bar end proposes again.</div>
+          <div class="push-prio"><span class="chip chip-warn">▲ HIGH</span></div></div>
+      </div>
+    </section>
+
+    <section class="stack" aria-labelledby="ph5H">
+      <h2 class="section-h" id="ph5H">Phone · Phase 5 (routine off — safety only)</h2>
+      <div class="phone" role="group" aria-labelledby="ph5H">
+        <div class="phone-bar"><span>14:22</span><span>XTNL</span></div>
+        <div class="push"><div class="push-head"><span class="push-app"><svg viewBox="0 0 80 80" aria-hidden="true"><line x1="27" y1="8" x2="63" y2="52" stroke="#f03a57" stroke-width="8" stroke-linecap="round"/><line x1="51" y1="13" x2="17" y2="52" stroke="#f03a57" stroke-width="7" stroke-linecap="round"/></svg></span>XTNL DEADMAN<span class="push-time">14:22:40</span></div>
+          <div class="push-title">✕ No heartbeat for 75 s</div>
+          <div class="push-body">The order-server PC is silent. Stops at the broker still protect your positions. Open moves: 0 awaiting, 0 held, 0 unknown, 0 operator; oldest unresolved: none. At 120 s live moves drop to advice and unsent moves are cancelled.</div>
+          <div class="push-prio"><span class="chip chip-bad">✕ CRITICAL</span></div></div>
+        <div class="push"><div class="push-head"><span class="push-app"><svg viewBox="0 0 80 80" aria-hidden="true"><line x1="27" y1="8" x2="63" y2="52" stroke="#f03a57" stroke-width="8" stroke-linecap="round"/><line x1="51" y1="13" x2="17" y2="52" stroke="#f03a57" stroke-width="7" stroke-linecap="round"/></svg></span>XTNL ARM<span class="push-time">13:05:31</span></div>
+          <div class="push-title">✕ Operator needed: send outcome unknown</div>
+          <div class="push-body">Order 7 EURUSD long, intent 41c0aa7e. Never re-sent; this stop is blocked until you resolve it.</div>
+          <div class="push-prio"><span class="chip chip-bad">✕ CRITICAL</span></div></div>
+        <div class="push"><div class="push-head"><span class="push-app"><svg viewBox="0 0 80 80" aria-hidden="true"><line x1="27" y1="8" x2="63" y2="52" stroke="#f03a57" stroke-width="8" stroke-linecap="round"/><line x1="51" y1="13" x2="17" y2="52" stroke="#f03a57" stroke-width="7" stroke-linecap="round"/></svg></span>XTNL ARM<span class="push-time">12:30:14</span></div>
+          <div class="push-title">✕ Stop loosened by a send</div>
+          <div class="push-body">Order 5: you set 1.10120 during our send; it now shows 1.10050. Stop blocked; check it in your platform.</div>
+          <div class="push-prio"><span class="chip chip-bad">✕ CRITICAL</span></div></div>
+        <div class="push"><div class="push-head"><span class="push-app"><svg viewBox="0 0 80 80" aria-hidden="true"><line x1="27" y1="8" x2="63" y2="52" stroke="#f0a030" stroke-width="8" stroke-linecap="round"/><line x1="51" y1="13" x2="17" y2="52" stroke="#f0a030" stroke-width="7" stroke-linecap="round"/></svg></span>XTNL ARM<span class="push-time">11:42:05</span></div>
+          <div class="push-title">▲ SAFE_HOLD auto-resumed</div>
+          <div class="push-body">After a crash loop (auto-resume 2 of 6 in 24 h). Live moves resume only if ARM is not FAILED(unclean_restarts); every send still passes all checks (D6).</div>
+          <div class="push-prio"><span class="chip chip-warn">▲ HIGH</span></div></div>
+      </div>
+    </section>
+  </div>
+
+  <div class="grid-2">
+    <section class="stack" aria-labelledby="mailH">
+      <h2 class="section-h" id="mailH">Email · approval request</h2>
+      <div class="mail">
+        <div class="mail-hdr"><b>Subject:</b> [XTNL ARM] Approve stop move? Order 1 EURUSD · expires 11:01:11 UTC (22:01:11 Melbourne)<br><b>Priority:</b> high · intent 7f3a91c2</div>
+        <div class="mail-body">
+          <div class="move" role="group" aria-label="Stop move from 1.09800 to 1.10000">
+            <div class="move-side"><div class="move-label">Stop now</div><div class="move-value num">1.09800</div><div class="move-sub">−1.00R from entry</div></div>
+            <div class="move-arrow"><svg viewBox="0 0 28 28" aria-hidden="true"><path d="M4 14h19M17 8l6 6-6 6"/></svg></div>
+            <div class="move-side"><div class="move-label">Proposed</div><div class="move-value num target">1.10000</div><div class="move-sub">break-even · 0R</div></div>
+          </div>
+          <dl>
+            <div class="kv"><dt>Why</dt><dd>bar 3 close 1.15R &gt; risk 1R</dd></div>
+            <div class="kv"><dt>Decided</dt><dd>11:00:11 UTC</dd></div>
+            <div class="kv"><dt>Expires</dt><dd>11:01:11 UTC (at most 60 s after the decision)</dd></div>
+          </dl>
+          <p class="muted">Email cannot approve: approving happens only on the local approval page, signed in. If you do nothing, the stop stays where it is.</p>
+        </div>
+      </div>
+    </section>
+    <section class="stack" aria-labelledby="endH">
+      <h2 class="section-h" id="endH">Email · position ended (new, E19)</h2>
+      <div class="mail">
+        <div class="mail-hdr"><b>Subject:</b> [XTNL ARM] Ended: Order 6 EURUSD closed by stop · 10:44:43 UTC<br><b>Priority:</b> info · as in scenario A, order 2</div>
+        <div class="mail-body">
+          <dl>
+            <div class="kv"><dt>Closed by</dt><dd>stop at 1.09940 (broker fill)</dd></div>
+            <div class="kv"><dt>Fill</dt><dd>beyond the stop level (fast market)</dd></div>
+            <div class="kv"><dt>Open stop move</dt><dd>none (5e0b77d1 had expired 10:31:11)</dd></div>
+            <div class="kv"><dt>Earlier heads-up</dt><dd>10:44:20 — no longer applies</dd></div>
+          </dl>
+          <p class="muted">Order levels and times only. The server sent nothing during the move.</p>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+</body>
+</html>

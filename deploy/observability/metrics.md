@@ -121,6 +121,21 @@ Counts and durations only: no series carries an amount. No alert uses them yet (
 | `xtnl_catchup_runs_total` | counter | `node`, `adapter`, `complete` | any | downtime catch-ups finished by this process per adapter, `complete` = `true` / `false` (an incomplete one also pages "downtime catch-up incomplete") |
 | `xtnl_catchup_rows_total` | counter | `node`, `adapter`, `kind` | any | rows the catch-ups changed, per `kind`: `order_new`, `order_updated`, `position_new`, `position_closed`, `cash_flow_new`, `anomaly` (a stored working order / OPEN position the broker no longer knows by id) |
 
+### Dead-man receiver acknowledgement (home-server plan W1; operations.md §9 push dead-man's switch)
+
+The receiver cannot report its own outage, so the leader watches whether its 15 s beats are acknowledged (any
+2xx). Counts and ages only. No off-node rule uses them yet: the engine itself pages "dead-man receiver not
+acknowledging" (PAGE[high], once per episode, through `notification_outbox`) after the main beat has failed
+without a break for `XTNL_DEADMAN_ALERT_AFTER_S` (60..3600 s, default 300), and "dead-man receiver acknowledging
+again" (PAGE[info]) at the first good beat after it. The series come from the leader term's sender, so they start
+afresh with each term and are absent outside a term.
+
+| Name | Type | Labels | Role | Meaning |
+|---|---|---|---|---|
+| `xtnl_deadman_configured` | gauge | `node` | leader | 1 when `XTNL_DEADMAN_URL` is set, 0 when not (a single PC without a receiver: no beat is sent and the two series below are absent) |
+| `xtnl_deadman_consecutive_failures` | gauge | `node` | leader | main heartbeat POSTs that failed in a row (transport error, timeout or a non-2xx answer such as 401); 0 after an acknowledged beat. Heartbeat-copy failures never count. Absent until the sender starts (LEADER_INIT step 7) |
+| `xtnl_deadman_last_ok_age_seconds` | gauge | `node` | leader | seconds since the last acknowledged main beat (its build time, engine wall clock). **Absent** until the term's first acknowledged beat (no sentinel value): a term that never reached the receiver shows `xtnl_deadman_consecutive_failures` > 0 and no age |
+
 ### Market data and ARM (optional services, plan S32; design §B14, §C2)
 
 Exported by the leader only while `XTNL_MD_ENABLED=1` (the ARM rows also need `XTNL_ARM_ENABLED=1` and a running
@@ -224,6 +239,7 @@ Its etcd member is covered by `xtnl_etcd_endpoint_healthy{member="witness"}` fro
 | clock | `XtnlClockOffset` | `xtnl-clock-offset-*` | `xtnl_clock_offset_seconds` |
 | ARM FAILED scopes (design §B14 backstop) | `XtnlArmFailed` | `xtnl-arm-failed` | `xtnl_arm_failed_scopes` |
 | redis-md memory 70 % (design §A2) | `XtnlRedisMdMemoryHigh` | `xtnl-redis-md-memory-*` | `xtnl_md_redis_used_memory_ratio` |
+| dead-man receiver not acknowledging (W1; runbook deadman-alert.md, "Receiver not acknowledging") | none (the engine pages through its outbox, once per episode kept in `notification_dedupe`) | none | `xtnl_deadman_consecutive_failures`, `xtnl_deadman_last_ok_age_seconds`, `xtnl_deadman_configured` |
 | inhibition: epoch change, RTO + 30 s | `XtnlEpochChangeSettling` (source of `inhibit_rules`) | `xtnl-epoch-change-settling` (`ActionsSuppressor`) | `xtnl_epoch_change_age_seconds` |
 
 ## CloudWatch notes

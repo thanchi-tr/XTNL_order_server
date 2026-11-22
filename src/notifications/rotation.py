@@ -20,6 +20,7 @@ from collections.abc import Callable, Mapping
 
 import httpx
 
+from src.notifications.email_html import FooterSource
 from src.notifications.errors import safe_error
 from src.notifications.factory import OVERSEE_CHANNEL_NAMES, ChannelSet, build_channels
 from src.notifications.mail import SmtpFactory, default_smtp_factory
@@ -43,9 +44,11 @@ class RotatingChannels:
                  smtp_factory: SmtpFactory = default_smtp_factory,
                  invalidate: Callable[[], None] = lambda: None,
                  initial: NotificationSettings | None = None,
-                 names: tuple[str, str] = OVERSEE_CHANNEL_NAMES) -> None:
+                 names: tuple[str, str] = OVERSEE_CHANNEL_NAMES,
+                 footer: FooterSource | None = None) -> None:
         self._load = load
         self._names = names
+        self._footer = footer
         self._client = client
         self._smtp_factory = smtp_factory
         self._invalidate = invalidate
@@ -54,7 +57,8 @@ class RotatingChannels:
         self.rebuilds = 0
 
     def _build(self, settings: NotificationSettings) -> ChannelSet:
-        return build_channels(settings, self._client, smtp_factory=self._smtp_factory, names=self._names)
+        return build_channels(settings, self._client, smtp_factory=self._smtp_factory, names=self._names,
+                              footer=self._footer)
 
     @property
     def current(self) -> ChannelSet:

@@ -44,7 +44,9 @@ USER_ENVIRONMENT_ONLY = {"XTNL_API_SECRET", "XTNL_API_DSN",
                          "XTNL_ARM_CONFIG_DSN",
                          "XTNL_ARM_SMTP_USERNAME", "XTNL_ARM_SMTP_PASSWORD", "XTNL_ARM_SES_ACCESS_KEY_ID",
                          "XTNL_ARM_SES_SECRET_ACCESS_KEY", "XTNL_ARM_SES_SESSION_TOKEN", "XTNL_ARM_PUSH_TOKEN",
-                         "XTNL_ARM_PUSH_USER"}
+                         "XTNL_ARM_PUSH_USER",
+                         # the live view's login (role xtnl_liveview; deploy/local/new-liveview-credentials.ps1)
+                         "XTNL_LIVEVIEW_DSN"}
 # Module-level `*_VAR` / `*_ENV` constants naming an environment variable: the pure settings parsers
 # (src/marketdata/config.py, src/riskmgr/config.py, src/armconfig/client.py) take the environment from their caller
 # and never touch os.environ themselves, so such a module is scanned too.
@@ -460,7 +462,8 @@ RUNBOOK_FILES = ("install-node.md", "failover-and-switchover.md", "safe-hold.md"
                  "disaster-restore-melbourne.md", "live-readonly-smoke-test.md", "halt-clear.md",
                  "ruleset-change.md", "partition-archive.md", "off-node-alerts.md", "broker-maintenance.md",
                  "downtime-catchup.md", "pinescript-export.md", "single-pc-autostart.md", "order-server-api.md",
-                 "marketdata.md", "arm.md")
+                 "marketdata.md", "arm.md", "live-view.md", "home-backup-restore.md",
+                 "deadman-receiver-home.md")
 
 
 def test_runbook_files_lists_every_runbook_on_disk() -> None:

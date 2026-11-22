@@ -173,7 +173,8 @@ PostItem = PartitionIndex | ValidateCheck | TableIndex
 
 #: Registered post-step work, in order: the 0015 / 0016 CHECKs and outbox index (S08), and the 0017 event_log index
 #: serving entry time and S_at_T (`(entity_type, entity_key, broker_time_ms)`, design PR8, S23), and the 0019
-#: `orders_state` index of the S_at_T linked-children read (`SQL_LINKED_STOP_CHILDREN`, plan S38d review).
+#: `orders_state` index of the S_at_T linked-children read (`SQL_LINKED_STOP_CHILDREN`, plan S38d review), and the 0021
+#: event_log `log_id` index of the live view's id cursor (docs/design/live-view.md s3.1).
 POST_STEP: Final[tuple[PostItem, ...]] = (
     ValidateCheck(15, "event_log", "event_log_origin_check"),
     PartitionIndex(16, "notification_outbox", "notification_outbox_arm_due_idx", "arm_due_idx",
@@ -183,6 +184,7 @@ POST_STEP: Final[tuple[PostItem, ...]] = (
                    "entity_type, entity_key, broker_time_ms"),
     TableIndex(19, "orders_state", "orders_state_linked_stop_idx", "adapter_id, linked_position_id",
                "is_reduce_only"),
+    PartitionIndex(21, "event_log", "event_log_log_id_idx", "log_id_idx", "log_id"),
 )
 
 

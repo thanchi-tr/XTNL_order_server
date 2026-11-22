@@ -81,6 +81,26 @@ ALLOWED: dict[str, frozenset[str]] = {
         "guards_hash", "config_doc_hash", "doc_hash", "chain_head", "row_hashes"}),
     "pinned config (strategy and guard params, specs)": frozenset({
         "strategy_params", "guards", "indicator_specs", "required_history", "document"}),
+    "live view (0021): ids, times, codes, counts, order levels": frozenset({
+        "acked", "activation_id", "active_since", "anomalies", "approver", "attempts", "below_soft_since",
+        "breach_id", "broker_ms", "broker_order_id", "broker_updated_at_ms", "bumped_at_ms", "by_whom", "cap",
+        "cash_flows_new", "client_order_id", "cluster_id", "command", "committed_at_ms", "complete", "conn_lost_at",
+        "cool_down_ms", "covered_from_ms", "delivered_at_ms", "delivery", "dlq_id", "dlq_reason", "effective_level",
+        "end_code", "end_reason", "ended_at", "entity_id", "entity_key", "entity_type", "ep_activation_id",
+        "ep_level", "ep_rule_id", "ep_subject_id", "ep_subject_type", "epoch_revision", "escalate_after_ms",
+        "escalated", "event_id", "event_type", "facts", "failed_at_ms", "failing_since_ms", "finished_at_ms",
+        "forced", "gap_end_ms", "gap_start_ms", "hard_latch", "hold_code", "hold_count", "info_class",
+        "is_reduce_only", "last_pass_at_ms", "last_resume_at", "last_seen_ms", "leg_kind", "level",
+        "linked_position_id", "log_id", "logged_at_ms", "next_retry_at_ms", "node_id", "offline_from_ms", "operator",
+        "orders_new", "orders_seen", "orders_updated", "origin_dlq_id", "parked_at_ms", "pending_level",
+        "pending_since", "positions_closed", "positions_new", "positions_seen", "quarantined_at_ms",
+        "reached_leader_at", "rearmed_at_ms", "reason_code", "reconciled_at", "reconciled_epoch",
+        "release_pending_since", "released_at_ms", "resolved_at", "resolved_by", "resumed_by", "retry_count",
+        "reviewed_event_id", "rule_id", "ruleset_version", "run_id", "safe_hold", "safe_hold_since", "sent_at_ms",
+        "seq_id", "severity", "started_at", "started_at_ms", "status", "stop_level", "stopped_at_ms", "stream",
+        "subject_id", "subject_type", "suspended_gaps", "sweep_id", "target_id", "term_id", "tr_rule_id",
+        "tr_subject_id", "tr_subject_type", "tr_transition", "transition", "uncapped_ms", "unknown_grace_ms",
+        "unknown_since", "version_path"}),
 }
 ALLOW_LIST: frozenset[str] = frozenset().union(*ALLOWED.values())
 
@@ -158,6 +178,31 @@ def test_the_scan_sees_every_kind_of_column() -> None:
     assert ("arm_decisions", "inputs_digest") in cols            # 0017 CREATE TABLE
     assert ("arm_decisions_view", "current_risk_r") in cols      # 0017 view
     assert ("arm_budget_counters", "streak_start_ms") in cols    # 0020 CREATE TABLE
+
+
+LIVEVIEW_VIEWS: Final = frozenset({
+    "lv_entity_events", "lv_oversee_events", "lv_halt_events", "lv_alerts", "lv_operator_actions", "lv_dlq",
+    "lv_catchups", "lv_engine_runs", "lv_leader_terms", "lv_stream_health", "lv_cluster_state", "lv_engine_epoch",
+    "lv_breaches", "lv_open_orders", "lv_open_positions", "lv_ruleset_timing", "lv_sweep_quarantine",
+    "lv_auth_state"})
+
+
+def test_the_scan_sees_all_18_live_view_views() -> None:
+    """docs/design/live-view.md s3.2 / s6: every lv_ view of 0021 is parsed by added_columns, so each of its columns
+    is checked against the allow-list (a view written with a column list or WITH (...) would hide them)."""
+    sql = (MIGRATIONS_DIR / "0021_liveview_role.sql").read_text(encoding="utf-8")
+    assert {rel for rel, _ in added_columns(sql)} == LIVEVIEW_VIEWS
+    code = _code(sql)
+    assert "WITH (" not in code
+    assert not re.search(r"CREATE (?:OR REPLACE )?VIEW \w+\s*\(", code)
+
+
+def test_the_live_view_group_is_exactly_the_new_names() -> None:
+    group = ALLOWED["live view (0021): ids, times, codes, counts, order levels"]
+    assert len(group) == 120
+    others = frozenset().union(*(v for k, v in ALLOWED.items() if not k.startswith("live view")))
+    assert not group & others
+    assert {c for c in group if looks_like_market_data(c)} == set()
 
 
 def test_named_exceptions_are_allowed_and_really_named_like_market_data() -> None:

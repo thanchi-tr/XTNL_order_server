@@ -25,6 +25,7 @@ Design reference: `docs/architecture/phase1_ingestion_arch.drawio` (architecture
   - The RiskSweep is level-triggered: every second it re-evaluates every account from one PostgreSQL snapshot plus current prices, and it is the only writer of rule states and the halt level. Deadlines (stop grace, confirm, escalation, cool-down) are durable timestamps; there are no Oversee timers.
   - Runs pluggable `Rule` strategies on orders and open positions, using shared pure risk functions (directional risk in the account currency, effective stop, clean-mid equity mark). Example: `MaxPositionRiskRule` (≤ 1.0 % (1R) PASS, 1.0–1.5 % FLAG, > 1.5 % SOFT_HALT).
   - Also holds `HaltSwitch`, `ActionGate`, and `NotificationDispatcher` (email + mobile push).
+- `src/liveview/`: local read-only live view, 127.0.0.1:8090, reads only the lv_ views of migration 0021 through the xtnl_liveview login; never sends orders, no write path.
 - `src/marketdata/`, `src/riskmgr/`, `src/armconfig/`: Stage 9 market-data layer and ARM (design `docs/design/automated-risk-manager.md`); advice only, nothing is sent to a broker.
 - **24/7 backbone:** the server runs unattended as the base of the future automated trading system.
   - Two London engine nodes in different AZs plus a witness.

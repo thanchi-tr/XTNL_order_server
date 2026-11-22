@@ -1,0 +1,141 @@
+<svg width="100%" viewBox="0 0 680 1003" role="img" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, system-ui, sans-serif" font-size="12">
+<title>Design 3 scenario A: heads-up, then the original stop is hit before bar end</title>
+<desc>A heads-up at 10:44:20, then a spike through both orders' stops before the bar ends. Order 1 never gets an intent; order 2's break-even move (Phase 4/5) limits its loss, while in Phase 3 without approval it closes at the original stop.</desc>
+<rect width="680" height="1003" fill="#ffffff"/>
+<rect x="40" y="12" width="12" height="12" rx="2" fill="#378ADD"/><text fill="#5F5E5A" x="58" y="22">Order 1</text>
+<rect x="118" y="12" width="12" height="12" rx="2" fill="#7F77DD"/><text fill="#5F5E5A" x="136" y="22">Order 2</text>
+<line x1="196" y1="18" x2="216" y2="18" stroke="#2C2C2A" stroke-width="1.2"/><text fill="#5F5E5A" x="222" y="22">Bid</text>
+<line x1="256" y1="18" x2="276" y2="18" stroke="#888780" stroke-width="2"/><text fill="#5F5E5A" x="282" y="22">Stop P4/P5</text>
+<line x1="358" y1="18" x2="378" y2="18" stroke="#888780" stroke-width="1.5" stroke-dasharray="4 2"/><text fill="#5F5E5A" x="384" y="22">Stop P3</text>
+<line x1="440" y1="18" x2="460" y2="18" stroke="#888780" stroke-width="1" stroke-dasharray="1 3"/><text fill="#5F5E5A" x="466" y="22">Entry</text>
+<polygon points="46,36 51,41 46,46 41,41" fill="#5F5E5A"/><text fill="#5F5E5A" x="58" y="45">Broker fills (stop / TP): position closed</text>
+<rect x="300" y="34" width="22" height="13" rx="3" fill="none" stroke="#D3D1C7" stroke-width="1" stroke-dasharray="3 2"/><text fill="#5F5E5A" x="328" y="45">Server</text>
+<rect x="384" y="34" width="22" height="13" rx="3" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="1.5"/>
+<text fill="#5F5E5A" x="412" y="45">You</text>
+<rect x="450" y="34" width="22" height="13" rx="3" fill="none" stroke="#888780" stroke-width="1"/><text fill="#5F5E5A" x="478" y="45">Broker</text>
+<rect x="70" y="64.0" width="87" height="236.0" fill="#F1EFE8"/>
+<text fill="#5F5E5A" x="113.5" y="78.0" text-anchor="middle">bar 0</text>
+<text fill="#5F5E5A" x="200.5" y="78.0" text-anchor="middle">bar 1</text>
+<rect x="244" y="64.0" width="87" height="236.0" fill="#F1EFE8"/>
+<text fill="#5F5E5A" x="287.5" y="78.0" text-anchor="middle">bar 2</text>
+<text fill="#5F5E5A" x="374.5" y="78.0" text-anchor="middle">bar 3</text>
+<rect x="418" y="64.0" width="87" height="236.0" fill="#F1EFE8"/>
+<text fill="#5F5E5A" x="461.5" y="78.0" text-anchor="middle">bar 4</text>
+<line x1="70.0" y1="274.7" x2="592.0" y2="274.7" stroke="#D3D1C7" stroke-width="0.5"/>
+<text fill="#5F5E5A" x="62" y="278.7" text-anchor="end">1.09800</text>
+<line x1="70.0" y1="232.6" x2="592.0" y2="232.6" stroke="#D3D1C7" stroke-width="0.5"/>
+<text fill="#5F5E5A" x="62" y="236.6" text-anchor="end">1.09900</text>
+<line x1="70.0" y1="190.4" x2="592.0" y2="190.4" stroke="#D3D1C7" stroke-width="0.5"/>
+<text fill="#5F5E5A" x="62" y="194.4" text-anchor="end">1.10000</text>
+<line x1="70.0" y1="148.3" x2="592.0" y2="148.3" stroke="#D3D1C7" stroke-width="0.5"/>
+<text fill="#5F5E5A" x="62" y="152.3" text-anchor="end">1.10100</text>
+<line x1="70.0" y1="106.1" x2="592.0" y2="106.1" stroke="#D3D1C7" stroke-width="0.5"/>
+<text fill="#5F5E5A" x="62" y="110.1" text-anchor="end">1.10200</text>
+<line x1="89.3" y1="190.4" x2="329.8" y2="190.4" stroke="#378ADD" stroke-width="1" stroke-dasharray="1 3"/>
+<path d="M89.3 274.7 H329.8" fill="none" stroke="#378ADD" stroke-width="1.5" stroke-dasharray="4 2" stroke-linejoin="round"/>
+<path d="M89.3 274.7 H329.8" fill="none" stroke="#378ADD" stroke-width="2" stroke-linejoin="round"/>
+<line x1="99" y1="182" x2="329.4" y2="182" stroke="#7F77DD" stroke-width="1" stroke-dasharray="1 3"/>
+<path d="M99 215.7 H329.4" fill="none" stroke="#7F77DD" stroke-width="1.5" stroke-dasharray="4 2" stroke-linejoin="round"/>
+<path d="M99 215.7 H245.2 V182 H329.1" fill="none" stroke="#7F77DD" stroke-width="2" stroke-linejoin="round"/>
+<polyline points="70,196.7 71.9,200.4 73.9,201 75.8,202.6 77.7,206.4 78.7,207.3 79.7,206.4 81.6,202.8 83.5,199 85.5,195.2 87.4,194.7 89.3,190.4 91.3,190.1 93.2,186.2 95.1,184.8 97.1,182.1 99,182 100.9,180.2 102.9,180.4 104.8,179.8 106.7,176 108.7,177.8 110.6,176 112.5,174.6 114.5,173.2 116.4,169.9 118.3,167.9 120.3,166.6 122.2,164.2 124.1,161.9 126.1,159.5 128,157.2 129.9,156.2 131.9,155.7 133.8,152.5 135.7,153.9 137.7,157.7 139.6,158.4 141.5,161.9 143.5,162 145.4,164.8 147.3,165.5 149.3,164.3 151.2,169.6 153.1,171.5 155.1,167.2 157,165.1 158.9,167.8 160.9,168.3 162.8,168.5 164.7,170.9 166.7,171.8 168.6,173.6 170.5,171.3 172.5,169.9 174.4,166.6 176.3,165.6 178.3,160.8 180.2,161 182.1,157.5 184.1,156.1 186,152.8 187.9,152.5 189.9,148.3 191.8,147.5 193.7,143.6 195.7,142.2 197.6,140.6 199.5,139.6 201.5,135.5 203.4,133.7 205.3,130.2 207.3,130.3 209.2,127.1 211.1,125 213.1,123.1 215,121 216.9,118.8 218.9,117 220.8,114.6 222.7,116.2 224.7,116.7 226.6,116.4 228.5,116.1 230.5,117.6 232.4,118.3 234.3,119.6 236.3,120.6 238.2,122 240.1,123 242.1,124.1 244,127.2 245.9,127.2 247.9,130.4 249.8,132.3 251.7,130.4 253.7,133.9 255.6,134.5 257.5,136.1 259.5,139.4 261.4,139.9 263.3,136.9 265.3,135.3 267.2,134.9 269.1,132.7 271.1,131.7 273,131.2 274.9,128.8 276.9,126.6 278.8,124 280.7,122.9 282.7,122.1 284.6,118.9 286.5,119.9 288.5,116.4 290.4,114.5 292.3,114.5 294.3,114.3 296.2,111.8 298.1,109.2 300.1,107.5 302,106.1 303.9,103.4 305.9,103.9 307.8,101.3 309.7,98.9 311.7,98.3 313.6,99.5 315.5,93.9 317.5,90.8 319.4,90.8 321.3,90.6 322.3,89.3 323.3,91.8 325.2,95.3 327.1,99.8 327.9,114.6 329.1,182 329.4,215.7 329.8,274.7 330,278.9 331,262.1 332.9,258.9 334.9,258.9 336.8,258.1 338.7,255.1 340.7,255.9 342.6,252.2 344.5,254 346.5,252.4 348.4,250.1 350.3,249.4 352.3,247.8 354.2,247.2 356.1,246.6 358.1,247.9 360,246 361.9,245.1 363.9,244.2 365.8,242 367.7,242.3 369.7,240 371.6,240.1 373.5,239.7 375.5,238.3 377.4,237.1 379.3,235.8 381.3,236.4 383.2,235.3 385.1,235.3 387.1,232.5 389,232.6 390.9,232.2 392.9,233.8 394.8,234.7 396.7,236.2 398.7,235.2 400.6,235.7 402.5,233.8 404.5,236.8 406.4,238.6 408.3,241.1 410.3,237.2 412.2,239.1 414.1,241.3 416.1,240.3 418,241 419.9,241 421.9,236.7 423.8,237.5 425.7,237 427.7,237 429.6,238.4 431.5,235.3 433.5,236.2 435.4,232.7 437.3,235.3 439.3,232.9 441.2,229.4 443.1,228.1 445.1,230.6 447,230 448.9,226.6 450.9,225.9 452.8,226.6 454.7,225.4 456.7,224.1 458.6,224.8 460.5,225.6 462.5,225.7 464.4,224.3 466.3,225.1 468.3,223.9 470.2,226.6 472.1,227 474.1,228.4 476,227.7 477.9,229.5 479.9,230.4 481.8,227.6 483.7,227.1 485.7,228.2 487.6,227.9 489.5,229.6 491.5,231 493.4,230.5 495.3,231.3 497.3,232.3 499.2,233 501.1,232.9 503.1,232.2 505,232.6 506.9,232 508.9,231.9 510.8,229.9 512.7,230.4 514.7,229.5 516.6,228.2 518.5,230 520.5,230.8 522.4,227.1 524.3,228.4 526.3,225.4 528.2,226.1 530.1,224.7 532.1,224.5 534,227.6 535.9,223.6 537.9,224.8 539.8,224.3 541.7,223.4 543.7,221.7 545.6,221.1 547.5,220.6 549.5,222.1 551.4,220.7 553.3,219.9 555.3,221.4 557.2,220.4 559.1,220 561.1,221.5 563,220.7 564.9,220.9 566.9,220.2 568.8,222.6 570.7,222.9 572.7,223 574.6,220 576.5,221.1 578.5,222.8 580.4,222.6 582.3,223 584.3,223.1 586.2,223.7 588.1,224 590.1,224.6 592,224.1" fill="none" stroke="#2C2C2A" stroke-width="1.2" stroke-linejoin="round"/>
+<circle cx="89.3" cy="190.4" r="4.5" fill="#378ADD"/>
+<polygon points="329.8,268.7 335.8,274.7 329.8,280.7 323.8,274.7" fill="#378ADD" stroke="#2C2C2A" stroke-width="1"/>
+<circle cx="99" cy="182" r="4.5" fill="#7F77DD"/>
+<polygon points="329.1,176 335.1,182 329.1,188 323.1,182" fill="#7F77DD" stroke="#2C2C2A" stroke-width="1"/>
+<polygon points="329.4,209.7 335.4,215.7 329.4,221.7 323.4,215.7" fill="#7F77DD" stroke="#2C2C2A" stroke-width="1"/>
+<line x1="70.0" y1="300.0" x2="592.0" y2="300.0" stroke="#D3D1C7" stroke-width="0.5"/>
+<text fill="#5F5E5A" x="70" y="316.0" text-anchor="middle">10:00</text>
+<text fill="#5F5E5A" x="157" y="316.0" text-anchor="middle">10:15</text>
+<text fill="#5F5E5A" x="244" y="316.0" text-anchor="middle">10:30</text>
+<text fill="#5F5E5A" x="331" y="316.0" text-anchor="middle">10:45</text>
+<text fill="#5F5E5A" x="418" y="316.0" text-anchor="middle">11:00</text>
+<text fill="#5F5E5A" x="505" y="316.0" text-anchor="middle">11:15</text>
+<text fill="#5F5E5A" x="592" y="316.0" text-anchor="middle">11:30</text>
+<rect x="64" y="331.0" width="3" height="84.0" fill="#378ADD"/>
+<text fill="#5F5E5A" x="58" y="344.0" text-anchor="end">O1 server</text>
+<line x1="70.0" y1="340.0" x2="592.0" y2="340.0" stroke="#D3D1C7" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text fill="#5F5E5A" x="58" y="366.0" text-anchor="end">O1 P4/5</text>
+<line x1="70.0" y1="362.0" x2="592.0" y2="362.0" stroke="#D3D1C7" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text fill="#5F5E5A" x="58" y="388.0" text-anchor="end">O1 P3</text>
+<line x1="70.0" y1="384.0" x2="592.0" y2="384.0" stroke="#D3D1C7" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text fill="#5F5E5A" x="58" y="410.0" text-anchor="end">O1 state</text>
+<line x1="70.0" y1="406.0" x2="592.0" y2="406.0" stroke="#D3D1C7" stroke-width="0.5" stroke-dasharray="2 4"/>
+<rect x="125.7" y="332.0" width="64.8" height="16" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/><text  fill="#444441" x="158.1" y="344.0" text-anchor="middle">below 1R</text>
+<rect x="212.7" y="332.0" width="64.8" height="16" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/><text  fill="#444441" x="245.1" y="344.0" text-anchor="middle">below 1R</text>
+<rect x="306.3" y="332.0" width="51.6" height="16" rx="8" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5"/><text  fill="#791F1F" x="332.1" y="344.0" text-anchor="middle">closed</text>
+<rect x="327.1" y="354.0" width="170.4" height="16" rx="3" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/><text  fill="#444441" x="412.3" y="366.0" text-anchor="middle">heads-up only: no intent</text>
+<rect x="327.1" y="376.0" width="170.4" height="16" rx="3" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/><text  fill="#444441" x="412.3" y="388.0" text-anchor="middle">heads-up only: no intent</text>
+<rect x="90.5" y="398.0" width="66.5" height="16" rx="4" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/><text  fill="#444441" x="123.8" y="410.0" text-anchor="middle">Armed</text>
+<rect x="159.1" y="398.0" width="169.8" height="16" rx="4" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/><text  fill="#444441" x="244" y="410.0" text-anchor="middle">Tracking</text>
+<rect x="330.8" y="398.0" width="260.2" height="16" rx="4" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5"/><text  fill="#791F1F" x="460.9" y="410.0" text-anchor="middle">Closed</text>
+<rect x="64" y="429.0" width="3" height="84.0" fill="#7F77DD"/>
+<text fill="#5F5E5A" x="58" y="442.0" text-anchor="end">O2 server</text>
+<line x1="70.0" y1="438.0" x2="592.0" y2="438.0" stroke="#D3D1C7" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text fill="#5F5E5A" x="58" y="464.0" text-anchor="end">O2 P4/5</text>
+<line x1="70.0" y1="460.0" x2="592.0" y2="460.0" stroke="#D3D1C7" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text fill="#5F5E5A" x="58" y="486.0" text-anchor="end">O2 P3</text>
+<line x1="70.0" y1="482.0" x2="592.0" y2="482.0" stroke="#D3D1C7" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text fill="#5F5E5A" x="58" y="508.0" text-anchor="end">O2 state</text>
+<line x1="70.0" y1="504.0" x2="592.0" y2="504.0" stroke="#D3D1C7" stroke-width="0.5" stroke-dasharray="2 4"/>
+<rect x="125.7" y="430.0" width="64.8" height="16" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/><text  fill="#444441" x="158.1" y="442.0" text-anchor="middle">below 1R</text>
+<rect x="219.3" y="430.0" width="51.6" height="16" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/><text  fill="#633806" x="245.1" y="442.0" text-anchor="middle">ADJUST</text>
+<rect x="306.3" y="430.0" width="51.6" height="16" rx="8" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5"/><text  fill="#791F1F" x="332.1" y="442.0" text-anchor="middle">closed</text>
+<rect x="245.1" y="452.0" width="104.4" height="16" rx="3" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/><text  fill="#085041" x="297.3" y="464.0" text-anchor="middle">moved 10:30:12</text>
+<rect x="245.2" y="479.0" width="5.7" height="6" rx="3" fill="#854F0B" opacity="0.55"/>
+<rect x="250.9" y="474.0" width="117.6" height="16" rx="3" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/><text  fill="#444441" x="309.7" y="486.0" text-anchor="middle">expired 10:31:11</text>
+<rect x="100.2" y="496.0" width="56.9" height="16" rx="4" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/><text  fill="#444441" x="128.6" y="508.0" text-anchor="middle">Armed</text>
+<rect x="159.1" y="496.0" width="85" height="16" rx="4" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/><text  fill="#444441" x="201.6" y="508.0" text-anchor="middle">Tracking</text>
+<rect x="246.1" y="496.0" width="82.1" height="16" rx="4" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/><text  fill="#633806" x="287.1" y="508.0" text-anchor="middle">Advice</text>
+<rect x="330.2" y="496.0" width="260.8" height="16" rx="4" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5"/><text  fill="#791F1F" x="460.6" y="508.0" text-anchor="middle">Closed</text>
+<text fill="#2C2C2A" font-weight="600" font-size="13" x="14" y="566.0">Time</text>
+<rect x="72" y="555.0" width="298" height="16" rx="3" fill="#378ADD" opacity="0.18"/>
+<text fill="#2C2C2A" font-weight="600" font-size="13" x="80" y="567.0">Order 1</text>
+<rect x="376" y="555.0" width="298" height="16" rx="3" fill="#7F77DD" opacity="0.18"/>
+<text fill="#2C2C2A" font-weight="600" font-size="13" x="384" y="567.0">Order 2</text>
+<text fill="#5F5E5A" x="14" y="598.0">10:03:20</text>
+<line x1="14" y1="578.0" x2="674" y2="578.0" stroke="#D3D1C7" stroke-width="0.5"/>
+<rect x="72" y="580.0" width="298" height="29" rx="5" fill="#E6F1FB" stroke="#185FA5" stroke-width="1.5"/><text  fill="#0C447C" x="80" y="598.0" font-weight="600">A1 · You go long: fill 1.10000, stop 1.09800</text>
+<text fill="#5F5E5A" x="14" y="631.0">10:05:00</text>
+<line x1="14" y1="611.0" x2="674" y2="611.0" stroke="#D3D1C7" stroke-width="0.5"/>
+<rect x="376" y="613.0" width="298" height="29" rx="5" fill="#EEEDFE" stroke="#534AB7" stroke-width="1.5"/><text  fill="#3C3489" x="384" y="631.0" font-weight="600">B1 · You go long: fill 1.10020, stop 1.09940</text>
+<text fill="#5F5E5A" x="14" y="664.0">10:30:11</text>
+<line x1="14" y1="644.0" x2="674" y2="644.0" stroke="#D3D1C7" stroke-width="0.5"/>
+<rect x="72" y="646.0" width="298" height="59" rx="5" fill="none" stroke="#378ADD" stroke-width="0.8" stroke-dasharray="3 2"/>
+<text fill="#5F5E5A" x="80" y="664.0">POST bar 1: 0.75R, below trigger.</text>
+<rect x="376" y="646.0" width="298" height="59" rx="5" fill="none" stroke="#7F77DD" stroke-width="0.8" stroke-dasharray="3 2"/>
+<text fill="#5F5E5A" x="384" y="664.0">POST bar 1: 1.62R > 1R → ADJUST, intent I2.</text>
+<text fill="#5F5E5A" x="384" y="679.0">P4/P5: CONFIRMED 10:30:12, stop 1.10020.</text>
+<text fill="#5F5E5A" x="384" y="694.0">P3: no answer in 60 s → EXPIRED 10:31:11.</text>
+<text fill="#5F5E5A" x="14" y="727.0">10:44:20</text>
+<line x1="14" y1="707.0" x2="674" y2="707.0" stroke="#D3D1C7" stroke-width="0.5"/>
+<rect x="72" y="709.0" width="298" height="44" rx="5" fill="none" stroke="#378ADD" stroke-width="0.8" stroke-dasharray="3 2"/>
+<text fill="#5F5E5A" x="80" y="727.0">PRE bar 2: 1.08R heads-up (provisional).</text>
+<text fill="#5F5E5A" x="80" y="742.0">No intent: a heads-up never acts.</text>
+<rect x="376" y="709.0" width="298" height="44" rx="5" fill="none" stroke="#7F77DD" stroke-width="0.8" stroke-dasharray="3 2"/>
+<text fill="#5F5E5A" x="384" y="727.0">P4/P5: at target, no PRE item.</text>
+<text fill="#5F5E5A" x="384" y="742.0">P3: heads-up (2.44R); still no intent sent.</text>
+<text fill="#5F5E5A" x="14" y="775.0">10:44:40</text>
+<line x1="14" y1="755.0" x2="674" y2="755.0" stroke="#D3D1C7" stroke-width="0.5"/>
+<rect x="376" y="757.0" width="298" height="44" rx="5" fill="none" stroke="#888780" stroke-width="1"/>
+<text fill="#5F5E5A" x="384" y="775.0">P4/P5: spike triggers the stop at 1.10020;</text>
+<text fill="#5F5E5A" x="384" y="790.0">fills at or below it: about break-even.</text>
+<text fill="#5F5E5A" x="14" y="823.0">10:44:43</text>
+<line x1="14" y1="803.0" x2="674" y2="803.0" stroke="#D3D1C7" stroke-width="0.5"/>
+<rect x="376" y="805.0" width="298" height="44" rx="5" fill="none" stroke="#888780" stroke-width="1"/>
+<text fill="#5F5E5A" x="384" y="823.0">P3: spike triggers the original 1.09940;</text>
+<text fill="#5F5E5A" x="384" y="838.0">about −1R or worse (I2 had expired).</text>
+<text fill="#5F5E5A" x="14" y="871.0">10:44:48</text>
+<line x1="14" y1="851.0" x2="674" y2="851.0" stroke="#D3D1C7" stroke-width="0.5"/>
+<rect x="72" y="853.0" width="298" height="44" rx="5" fill="none" stroke="#888780" stroke-width="1"/>
+<text fill="#5F5E5A" x="80" y="871.0">Spike triggers the stop at 1.09800; fills</text>
+<text fill="#5F5E5A" x="80" y="886.0">at or below it: about −1R. CLOSED.</text>
+<text fill="#5F5E5A" x="14" y="919.0">10:45:11</text>
+<line x1="14" y1="899.0" x2="674" y2="899.0" stroke="#D3D1C7" stroke-width="0.5"/>
+<rect x="72" y="901.0" width="298" height="44" rx="5" fill="none" stroke="#378ADD" stroke-width="0.8" stroke-dasharray="3 2"/>
+<text fill="#5F5E5A" x="80" y="919.0">Closed: no POST, no intent. The heads-up</text>
+<text fill="#5F5E5A" x="80" y="934.0">already sent cannot be retracted.*</text>
+<rect x="376" y="901.0" width="298" height="44" rx="5" fill="none" stroke="#7F77DD" stroke-width="0.8" stroke-dasharray="3 2"/>
+<text fill="#5F5E5A" x="384" y="919.0">Closed: no POST, no open intent.</text>
+<text fill="#5F5E5A" x="14" y="963.0">Only bar-end decisions act, so nothing can move order 1's stop between the heads-up and the spike.</text>
+<text fill="#5F5E5A" x="14" y="978.0">* Proposed 'ended' notice for closes by stop or TP (E19). Stop fills are market fills: slippage possible.</text>
+</svg>

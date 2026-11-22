@@ -31,7 +31,10 @@ Per tick (`tick()`, every `interval_s` from `run(stop, stamp)`):
    favour / risk only when the bar's keyed hash verifies; an unavailable bar, a failing read or a failing renderer
    gives the text without them (never at PRE, C5). A body that decodes but cannot be rendered even without them is
    finished `bad_body`, never sent. The rendered text exists only in memory and in the message sent: it is never
-   written back, logged or paged.
+   written back, logged or paged. The email's HTML part is built from the structured body
+   (`src.notifications.email_html_arm.render_arm_html`: the SL advice block with the order-state entry, current stop
+   and proposed stop; never favour R or favour / risk) and travels on the in-memory `OutboxRow.html` only; the
+   immediate ping gets none (the email channel classifies it as a critical ping).
 8. **Per-channel delivery:** each of the row's remaining channels (`arm_email`, `arm_push`) is tried on its own; a
    failed channel backs off min(60, 2^n) s; a channel that is not configured is retried at the cap (both channels
    are required before the ARM starts, §B14, so this only bridges a credential gap). A row with channels left is
@@ -51,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from decimal import Decimal
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Final, Literal, Protocol
@@ -62,6 +66,9 @@ from src.db.safe_errors import safe_db_error
 from src.marketdata.hashing import Keyring
 from src.marketdata.ports import BarsRead
 from src.marketdata.types import Bar, SeriesId
+from src.notifications.email_html import FooterSource
+from src.notifications.email_html_arm import render_arm_html
+from src.notifications.email_theme import PipUnit, pip_unit_from
 from src.notifications.errors import ChannelError, safe_error
 from src.notifications.factory import ARM_CHANNEL_NAMES, ChannelSet
 from src.notifications.relay import AUTH_FAST_POLL_MS, ChannelSource
@@ -113,6 +120,10 @@ class ArmRelayStore(Protocol):
 
     async def finish(self, row: ArmOutboxRow, at_ms: int, *, delivered: bool, status: str, error: str | None,
                      attempted: bool, superseded_by: int | None = None) -> bool: ...
+
+
+PointSizeSource = Callable[[Sequence[tuple[str, str]]], Awaitable[Mapping[tuple[str, str], object]]]
+"""`(adapter_id, symbol)` pairs -> each instrument's `point_size` (`src.db.instrument_reads.PgPointSizes`)."""
 
 
 class BarReadPort(Protocol):
@@ -341,8 +352,17 @@ class ArmRelay:
                  disabled: Sequence[str] = (), issues: Sequence[str] = (), policy: ArmRelayPolicy = ArmRelayPolicy(),
                  lease_valid: Callable[[], bool] = lambda: True, clock_ms: Callable[[], int] = _wall_ms,
                  drain_notices: Callable[[], bool] = lambda: False, channel_source: ChannelSource | None = None,
-                 page: PageFn | None = None, render_settings: RenderSettings | None = None) -> None:
+                 page: PageFn | None = None, render_settings: RenderSettings | None = None,
+                 footer: FooterSource | None = None, email_theme: str = "classic",
+                 point_sizes: PointSizeSource | None = None, point_size_timeout_s: float = 2.0) -> None:
         self._store = store
+        self._footer = footer
+        # The HTML part's look (XTNL_EMAIL_THEME) and, for the xtnl theme, the instruments' point sizes read at send
+        # time so an ADJUST item's levels show pips from the entry (never the size itself; a failed read only drops
+        # the pips).
+        self._theme = email_theme
+        self._point_sizes = point_sizes
+        self._point_size_timeout_s = point_size_timeout_s
         self._renderer = renderer
         self._policy = policy
         self._lease_valid = lease_valid
@@ -579,9 +599,44 @@ class ArmRelay:
             if rendered is None:
                 await self._bad_body(row, now, t, "cannot be rendered")
                 return
+            units = await self._pip_units(body)
             out = OutboxRow("info", NOTICE_SEVERITY, rendered.subject, rendered.text, row.created_ms,
-                            outbox_id=row.outbox_id)
+                            outbox_id=row.outbox_id, html=self._html(body, row.outbox_id, rendered.subject, units))
         await self._deliver(row, out, now, t)
+
+    async def _pip_units(self, body: NoticeBody) -> dict[tuple[str, str], PipUnit]:
+        """The pip unit of every ADJUST item's instrument (xtnl theme only); {} when there is no source, nothing to
+        read, or the read fails or times out (the email then shows the levels without pips)."""
+        if self._theme != "xtnl" or self._point_sizes is None:
+            return {}
+        keys = sorted({(i.adapter_id, i.symbol) for i in body.items if i.outcome == "ADJUST" and i.symbol})
+        if not keys:
+            return {}
+        try:
+            sizes = await asyncio.wait_for(self._point_sizes(keys), self._point_size_timeout_s)
+        except Exception as exc:   # the pips never cost a notice
+            log.debug("arm-relay: point sizes not read (%s); levels without pips", type(exc).__name__)
+            return {}
+        out: dict[tuple[str, str], PipUnit] = {}
+        for key, size in sizes.items():
+            try:
+                unit = pip_unit_from(Decimal(str(size)), key[1])
+            except (ArithmeticError, ValueError):
+                unit = None
+            if unit is not None:
+                out[key] = unit
+        return out
+
+    def _html(self, body: NoticeBody, outbox_id: int, subject: str,
+              units: Mapping[tuple[str, str], PipUnit] | None = None) -> str | None:
+        """The email's HTML part from the structured body (order-state levels only, never favour figures); None (the
+        email channel then renders a generic page from the text, or sends text only) when it cannot be built."""
+        try:
+            return render_arm_html(body, footer=self._footer, settings=self._fallback_settings, outbox_id=outbox_id,
+                                   title=subject, theme=self._theme, pip_units=units)
+        except Exception as exc:   # the HTML part never costs a notice
+            log.warning("arm-relay: HTML part of notice #%d not built (%s)", body.notice_id, type(exc).__name__)
+            return None
 
     async def _bad_body(self, row: ArmOutboxRow, now: int, t: _Tally, why: str) -> None:
         if await self._store.finish(row, now, delivered=False, status="bad_body", error="bad_body", attempted=False):

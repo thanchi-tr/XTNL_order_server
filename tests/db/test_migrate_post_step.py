@@ -158,11 +158,12 @@ EVENT_LOG_IDX = M.PartitionIndex(17, "event_log", "event_log_broker_time_idx", "
 #: 0019 (S38d review): the orders_state index of the S_at_T linked-children read, built concurrently.
 LINKED_IDX = M.TableIndex(19, "orders_state", "orders_state_linked_stop_idx", "adapter_id, linked_position_id",
                           "is_reduce_only")
+LOG_ID_IDX = M.PartitionIndex(21, "event_log", "event_log_log_id_idx", "log_id_idx", "log_id")
 
 
 def test_registered_items() -> None:
     assert M.POST_STEP == (M.ValidateCheck(15, "event_log", "event_log_origin_check"), IDX, CHK, EVENT_LOG_IDX,
-                           LINKED_IDX)
+                           LINKED_IDX, LOG_ID_IDX)
 
 
 async def test_the_0017_event_log_index_is_built_and_attached_per_partition(conn: FakeConn) -> None:
@@ -173,6 +174,18 @@ async def test_the_0017_event_log_index_is_built_and_attached_per_partition(conn
     assert ("CREATE INDEX CONCURRENTLY IF NOT EXISTS event_log_p202611_broker_time_idx ON event_log_p202611 "
             "(entity_type, entity_key, broker_time_ms)") in conn.sql
     assert "ALTER INDEX event_log_broker_time_idx ATTACH PARTITION event_log_p202611_broker_time_idx" in conn.sql
+
+
+async def test_the_0021_log_id_index_is_built_and_attached_per_partition(conn: FakeConn) -> None:
+    """The live view's id cursor index (docs/design/live-view.md s3.1): built concurrently on every partition, the
+    DEFAULT one included, then attached to the ON ONLY parent index that 0021 creates."""
+    conn.returns_all(M.SQL_PARTITIONS, [("event_log_default", "r"), ("event_log_p202611", "r")])
+    done = await M.post_step(conn, {21}, retries=0, sleep=nosleep)
+    assert done == ["attached event_log_default_log_id_idx to event_log_log_id_idx",
+                    "attached event_log_p202611_log_id_idx to event_log_log_id_idx"]
+    for part in ("event_log_default", "event_log_p202611"):
+        assert f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {part}_log_id_idx ON {part} (log_id)" in conn.sql
+        assert f"ALTER INDEX event_log_log_id_idx ATTACH PARTITION {part}_log_id_idx" in conn.sql
 
 
 async def test_migrate_runs_the_post_step_after_every_file_and_on_every_run(tmp_path: Path, conn: FakeConn) -> None:

@@ -77,6 +77,10 @@ CONTRACT: Final[Mapping[str, tuple[MetricType, tuple[str, ...]]]] = {
     "xtnl_offline_gap_seconds": ("gauge", ()),
     "xtnl_catchup_runs_total": ("counter", ("adapter", "complete")),
     "xtnl_catchup_rows_total": ("counter", ("adapter", "kind")),
+    # dead-man receiver acknowledgement (home-server plan W1; src/runtime/deadman.py)
+    "xtnl_deadman_configured": ("gauge", ()),
+    "xtnl_deadman_consecutive_failures": ("gauge", ()),
+    "xtnl_deadman_last_ok_age_seconds": ("gauge", ()),
     # optional market-data and ARM services (plan S32; absent while XTNL_MD_ENABLED / XTNL_ARM_ENABLED are off)
     "xtnl_md_series": ("gauge", ("state",)),
     "xtnl_md_indicators": ("gauge", ("state",)),

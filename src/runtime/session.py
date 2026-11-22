@@ -70,6 +70,11 @@ Runtime wiring (IMPLEMENTATION_PLAN 7.4):
   Redis live values only when their boot_id epoch is the latest heartbeat's; `oldest_risksweep_pass_age_ms` and
   `xtnl_risksweep_oldest_pass_age_seconds` cover every account the sweep lists, an account that never passed counting
   from when it was first listed (`risksweep_pass_ms`);
+* W1 (home-server plan): the sender pages "dead-man receiver not acknowledging" through `queue_page_durable()`
+  (the outbox, leader and lease checked, the insert awaited so a failed one is retried) after `SessionContext.deadman_alert_after_s` of failed main beats, once per
+  episode, plus an info page when beats are acknowledged again; the episode is kept in `notification_dedupe`
+  (`ports.dedupe`), so a new term neither re-pages it nor leaves it without its info page; `xtnl_deadman_*` gauges
+  from the sender (leader only);
 * metrics: `xtnl_frames_lost_total{stream}` from `orchestrator.frames_lost` (leader only);
 * 7.1: `SnapshotInputs.pnl_source` = `orchestrator.pnl_source`; every direct `fetch_cash_flows` (SM3 reconcile, DLQ
   check-before-retry) is reported with `note_cash_flows`; the term's LocalStateReader has `account_states`
@@ -134,6 +139,7 @@ from src.calendar.schedule import CalendarSchedule, MaintenanceWindow, ScheduleL
 from src.calendar.sessions import Phase, boundaries, phase_at
 from src.db.account_sampler import AccountLiveSampler, LiveSampleStore
 from src.db.epoch import Epoch
+from src.db.fence import EpochMismatch
 from src.db.gate_reader import GateInputs
 from src.db.lifecycle import LifecycleRunner, PartitionMaintenance
 from src.db.operator_requests import (
@@ -188,7 +194,9 @@ from src.pubsub.orchestrator import AdapterRefresher, IngestionOrchestrator
 from src.pubsub.spooler import DlqSpooler
 from src.runtime.catchup import CatchupCoordinator, CatchupMetrics, CatchupSettings, CatchupStore
 from src.runtime.cluster import ClusterControl
-from src.runtime.deadman import ArmFailedBeat, DeadmanSender, DeadmanTransport, HttpsDeadmanTransport
+from src.runtime.deadman import (
+    DEFAULT_ALERT_AFTER_S, ArmFailedBeat, DeadmanSender, DeadmanTransport, HttpsDeadmanTransport, deadman_samples,
+)
 from src.runtime.exits import ExitFn, hard_exit
 from src.runtime.ingestion_control import ConsumerSwitches, OrchestratorIngestionControl, OrchestratorReconciler
 from src.runtime.leader_init import LeaderInitDeps, SodOutcome, is_fence_loss
@@ -237,6 +245,9 @@ NO_BOOT_SIGNAL_MIN_S: Final = 1.0
 # K14: the dead-man beat re-reads the gate's halt / epoch inputs right before each POST, bounded by this; a read that
 # fails or overruns reports gate_state CLOSED and SM5 UNKNOWN for that beat (fail closed).
 BEAT_VIEW_REFRESH_S: Final = 2.0
+# W1 round-2 review: how long `queue_page_durable` waits for its outbox insert. Inside the beat's own budget (the
+# 15 s interval): a statement takes at most statement_timeout (5 s, operations.md §4) plus the connect timeout.
+PAGE_OUTBOX_TIMEOUT_S: Final = 8.0
 # K14: the gate probe the dead-man view reads engine_epoch through (a risk-reducing action on no account / adapter:
 # the reader's per-account and per-adapter inputs are unused, only engine_epoch is taken from it).
 _BEAT_GATE_PROBE: Final = Action(account_id="", adapter_id="", risk_increasing=False, description="dead-man gate_state")
@@ -441,6 +452,9 @@ class SessionContext:
     # their boot_id epoch is the latest leader heartbeat's; src/dashboard/heartbeat.py). url None = no copy.
     heartbeat_copy: DeadmanSettings = field(default_factory=DeadmanSettings)
     heartbeat_copy_token: Callable[[], str | None] | None = None
+    # W1 (home-server plan): the main beat failing without a break this long pages "dead-man receiver not
+    # acknowledging" through the outbox (XTNL_DEADMAN_ALERT_AFTER_S, 60..3600 s, src/runtime/deadman.py).
+    deadman_alert_after_s: float = DEFAULT_ALERT_AFTER_S
     # --- downtime catch-up (migration 0012; src/runtime/catchup.py) ------------------------------------------
     # Window settings (XTNL_CATCHUP_OVERLAP_S / XTNL_CATCHUP_FIRST_RUN_DAYS); the process-wide metrics (cumulative
     # across terms); this process's engine_runs.run_id (src/runtime/uptime.py), recorded on each catchup_runs row.
@@ -1620,6 +1634,10 @@ class EngineSession:
     def flag(self, code: str, detail: str) -> None:
         self.page("high", f"flag:{code}", detail)
 
+    def email_footer(self) -> tuple[str, str | None]:
+        """(node id, epoch label) for the HTML email footer (src/notifications/email_html.py)."""
+        return self.node_id, self.epoch.label
+
     def _start_notifications(self) -> None:
         self._http = self.ctx.http_client()
         loader = self.ctx.notification_settings
@@ -1628,10 +1646,11 @@ class EngineSession:
             # credentials_poll_ms and at once after an auth error. `initial=` never raises at build time.
             self.channels = RotatingChannels(loader, self._http, smtp_factory=self.ctx.smtp_factory,
                                              invalidate=self.ctx.invalidate_secrets or (lambda: None),
-                                             initial=self.ctx.notifications)
+                                             initial=self.ctx.notifications, footer=self.email_footer)
             cs = self.channels.current
         else:
-            cs = build_channels(self.ctx.notifications, self._http, smtp_factory=self.ctx.smtp_factory)
+            cs = build_channels(self.ctx.notifications, self._http, smtp_factory=self.ctx.smtp_factory,
+                                footer=self.email_footer)
         dispatcher = self.dispatcher
         self.relay = OutboxRelay(self.ports.outbox, self.ports.dedupe, cs.channels, disabled=cs.disabled,
                                  issues=cs.issues, lease_valid=self._lease_valid, clock_ms=self._clock,
@@ -1661,7 +1680,10 @@ class EngineSession:
                                      is_leader=self.ctx.lease.holds_lease, client=self._http,
                                      clock_ms=self._clock, token=self.ctx.deadman.token,
                                      token_source=self.ctx.deadman_token, on_auth_error=invalidate,
-                                     copies=copies, prepare=self.refresh_beat_view)
+                                     copies=copies, prepare=self.refresh_beat_view,
+                                     page=self.queue_page_durable,
+                                     alert_after_s=self.ctx.deadman_alert_after_s,
+                                     episodes=self.ports.dedupe)
         sender = self.deadman
         self._add(self._monitored("deadman", 60.0, lambda ctx: sender.run(self._stop, stamp=ctx.stamp),
                                   self_stamping=True))
@@ -2457,6 +2479,8 @@ class EngineSession:
         # 7.4: lost frames / skipped broker rows per stream (summed over adapters; cumulative for this term)
         for stream, n in sorted(self.orchestrator.frames_lost.items()):
             out.append(Sample("xtnl_frames_lost_total", float(n), {"stream": stream}))
+        # W1: whether the receiver acknowledges the beats (the sender exists from LEADER_INIT step 7, URL set)
+        out += deadman_samples(self.deadman, configured=self.ctx.deadman.url is not None, now_ms=now)
         view = self.optional_view
         if view is not None:
             try:
@@ -2492,6 +2516,39 @@ class EngineSession:
     def page(self, severity: str, title: str, body: str) -> None:
         """Operational page: logged, mirrored to the context's sink, and queued in notification_outbox
         (leader only; the relay delivers it)."""
+        self.queue_page(severity, title, body)
+
+    def queue_page(self, severity: str, title: str, body: str) -> bool:
+        """`page`, returning whether the outbox row was handed to the writer (False: closed session or no valid
+        lease, so only the log line exists). The insert runs as a background task: its failure is only logged, so a
+        caller that must know the row committed uses `queue_page_durable`."""
+        row = self._page_row(severity, title, body)
+        if row is None:
+            return False
+        self._background_task(self.ports.outbox.add([row]), "page outbox")
+        return True
+
+    async def queue_page_durable(self, severity: str, title: str, body: str) -> bool:
+        """`page`, awaiting the outbox insert (bounded by PAGE_OUTBOX_TIMEOUT_S). True only once the row committed.
+        W1 (round-2 review): the dead-man receiver-down episode marks itself paged and records its durable
+        'lost' row only on True, so an insert that fails (a statement timeout, a passing connection error) is tried
+        again on the next failed beat instead of leaving the episode paged with no page. A timeout is an unknown
+        outcome: the row may still commit and the retry then sends a second copy (a duplicate page, never none). A
+        lost fence propagates (the supervisor hard-exits)."""
+        row = self._page_row(severity, title, body)
+        if row is None:
+            return False
+        try:
+            await asyncio.wait_for(self.ports.outbox.add([row]), PAGE_OUTBOX_TIMEOUT_S)
+        except EpochMismatch:
+            raise
+        except Exception as exc:
+            log.warning("page outbox failed (the page is tried again): %s", type(exc).__name__)
+            return False
+        return True
+
+    def _page_row(self, severity: str, title: str, body: str) -> OutboxRow | None:
+        """Log and mirror one page; its outbox row, or None on a closed session or without a valid lease."""
         sev = _severity(severity)
         level = logging.CRITICAL if sev == "critical" else logging.ERROR if sev == "high" else logging.INFO
         log.log(level, "PAGE[%s] %s: %s", sev, title, body)
@@ -2499,11 +2556,10 @@ class EngineSession:
             with contextlib.suppress(Exception):
                 self.ctx.page_sink(sev, title, body)
         if self._closed or not self._lease_valid():
-            return
+            return None
         sev_out: Severity = sev
-        row = OutboxRow(kind="info", severity=sev_out, title=title[:200], body=body[:2000],
-                        created_ms=self._clock())
-        self._background_task(self.ports.outbox.add([row]), "page outbox")
+        return OutboxRow(kind="info", severity=sev_out, title=title[:200], body=body[:2000],
+                         created_ms=self._clock())
 
     def _oversee_page(self, p: Page) -> None:
         self.page(p.severity, f"oversee:{p.code}", f"account={p.account_id} {p.detail}".strip())

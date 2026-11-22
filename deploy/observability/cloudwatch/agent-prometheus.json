@@ -789,6 +789,48 @@
        "label_matcher": "^xtnl-engine$",
        "dimensions": [
         [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_deadman_configured$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_deadman_consecutive_failures$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
+         "node"
+        ]
+       ],
+       "metric_selectors": [
+        "^xtnl_deadman_last_ok_age_seconds$"
+       ]
+      },
+      {
+       "source_labels": [
+        "job"
+       ],
+       "label_matcher": "^xtnl-engine$",
+       "dimensions": [
+        [
          "node",
          "state"
         ]

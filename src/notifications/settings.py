@@ -28,6 +28,11 @@ Missing or invalid settings disable that channel and add a line to `issues` (nam
 `NotificationSettings.from_env(env, prefix=ARM_PREFIX)`. They feed the `arm_email` / `arm_push` channels of the
 ARM relay (a separate SMTP or SES account, ntfy with a token, or Pushover). The Oversee settings (`prefix` left at
 `XTNL_`) parse exactly as before, and neither prefix reads the other's variables.
+
+**Email format** (one switch for both channel sets, not a channel credential): `XTNL_EMAIL_HTML` = `1` (default:
+multipart/alternative, the plain text exactly as before plus an HTML part) or `0` (text only, exactly as before).
+`XTNL_EMAIL_THEME` = `xtnl` (default: the dark XTNL theme, `src/notifications/email_theme.py`) or `classic` (the
+light layouts of `email_html` / `email_html_arm`): the HTML part's look; the text part is the same either way.
 """
 from __future__ import annotations
 
@@ -61,6 +66,15 @@ def _var(prefix: str, suffix: str) -> str:
     if suffix not in _SUFFIXES:
         raise KeyError(suffix)
     return prefix + suffix
+
+
+EMAIL_HTML_VAR: Final = "XTNL_EMAIL_HTML"
+EMAIL_THEME_VAR: Final = "XTNL_EMAIL_THEME"
+EMAIL_THEMES: Final = ("xtnl", "classic")
+"""The HTML part's look (`XTNL_EMAIL_THEME`): `xtnl` (default, the dark XTNL theme of `email_theme`) or `classic`
+(the light layouts). One switch for both channel sets, like `XTNL_EMAIL_HTML`."""
+"""The HTML email switch, read under this one name whatever the prefix (a presentation setting, not a channel
+variable, so it is not in `CHANNEL_VARS`)."""
 PUSHOVER_DEFAULT_URL: Final = "https://api.pushover.net/1/messages.json"
 DEFAULT_TIMEOUT_S: Final = 10.0
 _LOOPBACK: Final = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -165,6 +179,10 @@ class NotificationSettings:
     email: EmailSettings | None = None
     push: PushSettings | None = None
     issues: tuple[str, ...] = ()
+    email_html: bool = True
+    """`XTNL_EMAIL_HTML`: add the HTML part to every email (the text part is unchanged either way)."""
+    email_theme: str = "xtnl"
+    """`XTNL_EMAIL_THEME`: the HTML part's look, `xtnl` (default) or `classic`."""
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None, *,
@@ -176,7 +194,9 @@ class NotificationSettings:
         issues: list[str] = []
         email = _email(e, issues, prefix)
         push = _push(e, issues, prefix)
-        return cls(email, push, tuple(issues))
+        html_on = _email_html(e, issues)
+        theme = _email_theme(e, issues)
+        return cls(email, push, tuple(issues), html_on, theme)
 
     @property
     def email_enabled(self) -> bool:
@@ -190,6 +210,26 @@ class NotificationSettings:
 def _get(e: Mapping[str, str], name: str) -> str | None:
     v = e.get(name)
     return v.strip() if v is not None and v.strip() else None
+
+
+def _email_html(e: Mapping[str, str], issues: list[str]) -> bool:
+    raw = _get(e, EMAIL_HTML_VAR)
+    if raw is None or raw == "1":
+        return True
+    if raw == "0":
+        return False
+    issues.append(f"{EMAIL_HTML_VAR} must be 0 or 1; using 1 (HTML part on)")
+    return True
+
+
+def _email_theme(e: Mapping[str, str], issues: list[str]) -> str:
+    raw = _get(e, EMAIL_THEME_VAR)
+    if raw is None:
+        return "xtnl"
+    if raw.lower() in EMAIL_THEMES:
+        return raw.lower()
+    issues.append(f"{EMAIL_THEME_VAR} must be xtnl or classic; using xtnl")
+    return "xtnl"
 
 
 def _float(e: Mapping[str, str], name: str, default: float, issues: list[str]) -> float:

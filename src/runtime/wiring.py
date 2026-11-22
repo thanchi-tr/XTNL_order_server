@@ -73,7 +73,7 @@ from src.oversee.config import OverseeConfig
 from src.db.uptime_store import PgUptimeStore
 from src.runtime.catchup import CatchupMetrics, CatchupSettings
 from src.runtime.cluster import ClusterControl
-from src.runtime.deadman import check_deadman_url
+from src.runtime.deadman import alert_after_s_from_env, check_deadman_url, deadman_token_problem
 from src.runtime.config import RuntimeConfig
 from src.runtime.etcd import EtcdClient, EtcdTls, HttpEtcdClient
 from src.runtime.exits import ExitFn, hard_exit
@@ -185,6 +185,8 @@ class EngineSettings:
     oversee: OverseeConfig = field(default_factory=OverseeConfig)
     warnings: tuple[str, ...] = ()
     heartbeat_copy: DeadmanSettings = field(default_factory=DeadmanSettings)   # 7.4: the dashboard's copy
+    # Logged at ERROR at start, never a stop (W1: a dead-man URL without its bearer token). Names only, no values.
+    errors: tuple[str, ...] = ()
     patroni_auth: tuple[str, str] | None = field(default=None, repr=False)
     etcd_tls: EtcdTls = field(default_factory=EtcdTls)
     token_kms: KmsSettings | None = None
@@ -286,6 +288,11 @@ def load_settings(config: RuntimeConfig, environ: Mapping[str, str] | None = Non
             except ValueError as exc:
                 raise WiringError(f"{var}: {exc}") from None
     warnings = list(notifications.issues)
+    # W1: checked on the resolved environment (the secret laid over it), so a token held only in AWS Secrets Manager
+    # counts. The engine still starts: the beat is refused (401) but every other duty runs, and the error line is
+    # what the operator greps for (home-server plan §3.1).
+    token_problem = deadman_token_problem(deadman.url, deadman.token)
+    errors = (token_problem,) if token_problem is not None else ()
     if heartbeat_copy.url is None:
         warnings.append(f"{HEARTBEAT_COPY_URL_VAR} is not set: the Melbourne dashboard gets no leader heartbeat and "
                         "shows every Redis live value as stale")
@@ -309,9 +316,18 @@ def load_settings(config: RuntimeConfig, environ: Mapping[str, str] | None = Non
         warnings.append("pepperstone: no KMS-backed token store is wired (XTNL_TOKEN_KMS_KEY_ID / XTNL_KMS_REGION "
                         "unset); token refresh is disabled and an expired token pair ends in AUTH_FAILED")
     return EngineSettings(config, storage, tuple(plans), notifications, deadman, warnings=tuple(warnings),
-                          heartbeat_copy=heartbeat_copy,
+                          heartbeat_copy=heartbeat_copy, errors=errors,
                           patroni_auth=patroni_auth, etcd_tls=etcd_tls, token_kms=token_kms,
                           secrets_source=secrets.kind, secrets_version=secrets.version_id)
+
+
+def log_config_issues(settings: EngineSettings) -> None:
+    """The start-up lines for what load_settings found: warnings at WARNING, `errors` (a misconfiguration the engine
+    runs through, W1) at ERROR. Names only, never a value."""
+    for w in settings.warnings:
+        log.warning("config: %s", w)
+    for e in settings.errors:
+        log.error("config: %s", e)
 
 
 # ======================================================================================== heartbeat (7.4)
@@ -709,8 +725,7 @@ def build_engine(config: RuntimeConfig, *, environ: Mapping[str, str] | None = N
     closers.append(close_creds)
     if source.kind != "env":
         source.start()
-    for w in settings.warnings:
-        log.warning("config: %s", w)
+    log_config_issues(settings)
     node = config.node_id
     clock_ms = h.clock_ms or _wall_ms
     exit_fn: ExitFn = h.exit_fn or hard_exit
@@ -748,6 +763,7 @@ def build_engine(config: RuntimeConfig, *, environ: Mapping[str, str] | None = N
         try:
             ping_s = ping_s_from_env(raw)
             catchup_settings = CatchupSettings.from_env(raw, ping_s=ping_s)
+            deadman_alert_after_s = alert_after_s_from_env(raw)
         except ValueError as exc:
             problem = str(exc)
     if problem is not None:
@@ -864,6 +880,7 @@ def build_engine(config: RuntimeConfig, *, environ: Mapping[str, str] | None = N
         heartbeat_copy=settings.heartbeat_copy,
         heartbeat_copy_token=heartbeat_copy_token_loader(source, raw) if source.kind != "env" else None,
         catchup=catchup_settings, catchup_metrics=CatchupMetrics(), engine_run_id=lambda: uptime.run_id,
+        deadman_alert_after_s=deadman_alert_after_s,
         optional_flags=optional_flags, sleep_log=sleep_log,
         optional_bootstrap=h.optional_bootstrap or _production_optional_bootstrap(
             optional_flags, raw, config, settings, control))
@@ -893,7 +910,7 @@ def build_engine(config: RuntimeConfig, *, environ: Mapping[str, str] | None = N
 
         direct_pager = DirectChannelPager(
             settings_from_secrets(source, raw) if source.kind != "env" else notification_settings,
-            h.http_client or _http_client, clock_ms=clock_ms)
+            h.http_client or _http_client, clock_ms=clock_ms, node_id=node)
         closers.append(direct_pager.aclose)
         log.warning("config: XTNL_SINGLE_PC=1: SAFE_HOLD auto-resumes after a %d s cool-down (doubling to %d s, at "
                     "most %d within %d h); single-PC deployments only", single_pc.resume_first_s,

@@ -378,14 +378,20 @@ class DirectChannelPager:
 
     def __init__(self, load: Callable[[], NotificationSettings], client: Callable[[], httpx.AsyncClient], *,
                  clock_ms: Callable[[], int], smtp_factory: SmtpFactory = default_smtp_factory,
-                 retry_s: tuple[float, ...] = DIRECT_RETRY_S, send_timeout_s: float = 60.0) -> None:
+                 retry_s: tuple[float, ...] = DIRECT_RETRY_S, send_timeout_s: float = 60.0,
+                 node_id: str | None = None) -> None:
         self._load = load
+        self._node_id = node_id or "single PC"
         self._client = client
         self._clock_ms = clock_ms
         self._smtp_factory = smtp_factory
         self._retry_s = retry_s
         self._send_timeout_s = send_timeout_s
         self._tasks: set[asyncio.Task[None]] = set()
+
+    def _footer(self) -> tuple[str, str | None]:
+        """The HTML email footer: this node, no epoch (a direct page has no leader term)."""
+        return self._node_id, None
 
     def page(self, severity: str, title: str, body: str) -> None:
         try:
@@ -425,7 +431,7 @@ class DirectChannelPager:
                 continue
             client = self._client()
             try:
-                cs = build_channels(settings, client, smtp_factory=self._smtp_factory)
+                cs = build_channels(settings, client, smtp_factory=self._smtp_factory, footer=self._footer)
                 route = [c for c in cs.channels if c.name in row.route and (todo is None or c.name in todo)]
                 if todo is None:
                     if not route:

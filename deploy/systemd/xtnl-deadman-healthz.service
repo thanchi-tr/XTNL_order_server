@@ -1,0 +1,57 @@
+# XTNL dead-man receiver watchdog (home-server-plan §3.1, W6): proves the receiver on this VPS answers, through
+# Healthchecks.io check B. Install as /etc/systemd/system/xtnl-deadman-healthz.service on the home receiver VPS,
+# with xtnl-deadman-healthz.timer (every minute). Runbook: docs/runbooks/deadman-receiver-home.md.
+#
+# It GETs the receiver's /healthz on loopback; on 200 it pings check B, otherwise check B's /fail URL and exits 1.
+# When the receiver, the VPS or its internet is down, check B stops getting pings and Healthchecks.io pages after
+# its grace time: the receiver cannot report its own death, this does. It never sends anything to a broker.
+#
+# Configuration: /etc/xtnl/deadman-healthz.env, 0600 root:root (deploy/env/deadman-healthz.env.example). The ping
+# URL is a secret (anyone holding it can keep check B green): systemd reads the file as root, the shell expands the
+# variable itself ($$ below, so systemd never sees or logs the value), and curl runs with -s and no -S, so it
+# prints no URL even on failure. The ping URL never reaches a command line: the shell's builtin echo writes it as a
+# curl config line ("url = ...") into the pipe and curl reads it with -K - from stdin, so other users of the VPS
+# cannot see it in /proc/<pid>/cmdline or ps (ProtectProc=invisible covers only this unit's own view). The URL is
+# checked first (https://, no space, quote, backslash or percent sign) so it is one safe config line. The messages
+# below name the step only.
+
+[Unit]
+Description=XTNL dead-man receiver /healthz check and Healthchecks.io ping (check B)
+Documentation=file:///opt/xtnl/order-server/docs/runbooks/deadman-receiver-home.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+EnvironmentFile=/etc/xtnl/deadman-healthz.env
+SyslogIdentifier=xtnl-deadman-healthz
+ExecStart=/bin/sh -c 'if [ -z "$${XTNL_HEALTHZ_PING_URL}" ]; then echo "XTNL_HEALTHZ_PING_URL is not set"; exit 78; fi; case "$${XTNL_HEALTHZ_PING_URL}" in https://*) ;; *) echo "XTNL_HEALTHZ_PING_URL must be an https:// URL"; exit 78;; esac; case "$${XTNL_HEALTHZ_PING_URL}" in *[!A-Za-z0-9._~:/?=+-]*) echo "XTNL_HEALTHZ_PING_URL holds characters a ping URL never has"; exit 78;; esac; if curl -fs --max-time 10 -o /dev/null "$${XTNL_HEALTHZ_URL:-http://127.0.0.1:8443/healthz}"; then echo "url = $${XTNL_HEALTHZ_PING_URL}" | curl -fs --max-time 10 -o /dev/null -K - || echo "receiver healthz ok; Healthchecks.io ping failed"; else echo "receiver healthz FAILED; sending the Healthchecks.io fail ping"; echo "url = $${XTNL_HEALTHZ_PING_URL}/fail" | curl -fs --max-time 10 -o /dev/null -K - || echo "Healthchecks.io fail ping failed"; exit 1; fi'
+TimeoutStartSec=40
+
+MemoryMax=64M
+TasksMax=8
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077

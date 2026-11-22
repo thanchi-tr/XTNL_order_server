@@ -18,9 +18,11 @@
 Least privilege: the API is the only network-facing process, so it must not hold anything of the engine's.
 from_env refuses to start (exit 78) while the environment carries a broker credential (STONE_X_*, CTRADER_*),
 the engine's storage (ORDER_SERVER_DSN, REDIS_URL), BROKER_ENV, a market-data / ARM setting or secret (XTNL_MD_*,
-XTNL_ARM_*), an alert channel setting or credential (XTNL_SMTP_*, XTNL_SES_*, XTNL_PUSH_*) or the dead-man token
-(XTNL_DEADMAN_TOKEN); deploy/local/start-xtnl.ps1 removes them from the API child's environment (names only are
-ever reported, never values).
+XTNL_ARM_*), an alert channel setting or credential (XTNL_SMTP_*, XTNL_SES_*, XTNL_PUSH_*), the dead-man token
+(XTNL_DEADMAN_TOKEN), the heartbeat copy URL / token (XTNL_HEARTBEAT_COPY_URL, XTNL_HEARTBEAT_COPY_TOKEN), the live
+view's DSN (XTNL_LIVEVIEW_DSN) or a backup credential (XTNL_BACKUP_*, RCLONE_*, B2_*: they belong to the separate
+backup Windows account, docs/design/home-server-plan.md s3.2); deploy/local/start-xtnl.ps1 removes them from the
+API child's environment (names only are ever reported, never values).
 """
 from __future__ import annotations
 
@@ -48,10 +50,18 @@ DSN_VAR: Final = "XTNL_API_DSN"
 REDIS_URL_VAR: Final = "XTNL_API_REDIS_URL"
 #: Never in the API's environment: broker credentials, the engine's own storage (writable role, engine Redis), the
 #: market-data / ARM settings and secrets (redis-md URLs, the content-hash key, the config DSN, the ARM channels), the
-#: Oversee alert channels, the dead-man token and the broker environment (design §C2 Secrets). Equal to
-#: deploy/local/start-xtnl.ps1 `$ApiDropEnv` (tests/deploy/test_order_server_api_assets.py).
-FORBIDDEN_PREFIXES: Final = ("STONE_X_", "CTRADER_", "XTNL_MD_", "XTNL_ARM_", "XTNL_SMTP_", "XTNL_SES_", "XTNL_PUSH_")
-FORBIDDEN_NAMES: Final = frozenset({"ORDER_SERVER_DSN", "REDIS_URL", "XTNL_DEADMAN_TOKEN", "BROKER_ENV"})
+#: Oversee alert channels, the dead-man token and the broker environment (design §C2 Secrets), and the backup
+#: credentials of the separate backup account (XTNL_BACKUP_, RCLONE_, B2_; home-server-plan s3.2). Every prefix ends
+#: in `_`, so none can match XTNL_API_DSN or another name the API needs. Equal to deploy/local/start-xtnl.ps1
+#: `$ApiDropEnv` (tests/deploy/test_order_server_api_assets.py).
+FORBIDDEN_PREFIXES: Final = ("STONE_X_", "CTRADER_", "XTNL_MD_", "XTNL_ARM_", "XTNL_SMTP_", "XTNL_SES_", "XTNL_PUSH_",
+                             "XTNL_BACKUP_", "RCLONE_", "B2_")
+#: XTNL_LIVEVIEW_DSN is refused by its exact name only (never an XTNL_LIVEVIEW_ prefix), so the non-secret live
+#: view settings (XTNL_LIVEVIEW_ADDR, ...) never make the API exit 78 (docs/design/live-view.md s5). The heartbeat
+#: copy URL is a capability URL (home server: a Healthchecks.io ping URL that anyone holding it can keep green), so
+#: it is refused like the dead-man token, and its token with it.
+FORBIDDEN_NAMES: Final = frozenset({"ORDER_SERVER_DSN", "REDIS_URL", "XTNL_DEADMAN_TOKEN", "BROKER_ENV",
+                                    "XTNL_LIVEVIEW_DSN", "XTNL_HEARTBEAT_COPY_URL", "XTNL_HEARTBEAT_COPY_TOKEN"})
 
 DEFAULT_PORT: Final = 47443
 DEFAULT_BIND: Final = "0.0.0.0"

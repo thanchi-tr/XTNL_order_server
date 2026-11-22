@@ -1,0 +1,73 @@
+# XTNL dead-man receiver, HOME variant (home-server-plan §3.1, W6). Install as
+# /etc/systemd/system/xtnl-deadman-receiver.service on the small VPS outside the house (never on the home PC: it
+# must keep paging while the house is dark). Runbook: docs/runbooks/deadman-receiver-home.md.
+#
+# A plain copy of xtnl-deadman-receiver.service without the LoadCredential= and TLS lines (rather than a drop-in
+# that tries to clear them): the receiver listens on plain 127.0.0.1:8443 (loopback needs no TLS files,
+# src/deadman_receiver/settings.py) and `tailscale serve` terminates HTTPS on 443 with the tailnet's certificate.
+# Everything else, the hardening included, is the same as the Melbourne unit (tests/deploy/test_home_receiver_assets.py
+# keeps the two equal). It accepts the engine leader's 15 s heartbeat (bearer token), pages through Pushover and an
+# SMTP relay after 60 s of silence or when a health field passes its threshold, and sends a daily test page. It
+# never touches PostgreSQL or Redis and never reaches a broker. Configuration: /etc/xtnl/deadman-receiver.env
+# (deploy/env/deadman-receiver.env.example, "Home VPS" block). Check with:
+#     sudo systemd-analyze verify /etc/systemd/system/xtnl-deadman-receiver.service
+
+[Unit]
+Description=XTNL dead-man receiver (home VPS, loopback behind tailscale serve)
+Documentation=file:///opt/xtnl/order-server/docs/runbooks/deadman-receiver-home.md
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/xtnl/order-server
+# XTNL_RECEIVER_TOKEN (+ _NEXT), XTNL_RECEIVER_LISTEN=127.0.0.1:8443, XTNL_RECEIVER_PATH, XTNL_RECEIVER_TEST_PAGE_UTC,
+# the Pushover and SMTP channel variables, XTNL_SECRETS_SOURCE=env. Both TLS variables stay empty (blank = unset).
+# The tokens are read only at start here: a rotation takes restarts (deadman-receiver-home.md, token rotation).
+# Exit 78 (config) from the main process is not restarted: one `configuration refused` line from the check
+# below, one from the main process, then the unit stays failed until the env file is fixed and it is started.
+EnvironmentFile=/etc/xtnl/deadman-receiver.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+SyslogIdentifier=xtnl-deadman-receiver
+# The '-' prefix (review round 1): RestartPreventExitStatus= tests only the MAIN process's exit status, so a
+# config check that failed the unit here would be restarted every 5 s for ever (the start limit, 5 in 10 s, is
+# never reached). The check's line is still logged; the main process then refuses the same configuration with
+# 78, which stops the unit, and a 75 (secret unreadable) is still restarted.
+ExecStartPre=-/opt/xtnl/order-server/.venv/bin/python -m src.deadman_receiver --check-config
+ExecStart=/opt/xtnl/order-server/.venv/bin/python -m src.deadman_receiver
+RestartPreventExitStatus=78
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+MemoryMax=256M
+TasksMax=32
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

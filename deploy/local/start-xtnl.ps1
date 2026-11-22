@@ -9,11 +9,19 @@
   Steps, each logged to var/logs/xtnl-<yyyy-MM-dd>.log (one file per day, files older than 14 days deleted):
     1. single-instance guard (named mutex Global\XTNL-engine-start + var/logs/start-xtnl.pid with this PID);
     2. loads deploy/env/local.env (refused if it assigns a credential of $ForbiddenInFile: STONE_X_USERNAME /
-       STONE_X_PASS / STONE_X_APP_KEY, the API's, the alert channels', the dead-man token or a market-data / ARM
-       secret);
-    3. copies STONE_X_*, BROKER_ENV, XTNL_API_SECRET, XTNL_API_DSN, the alert channel credentials, the dead-man
-       token and the market-data / ARM secrets ($UserVarNames) from the Windows User environment into this
-       process (names logged, values never);
+       STONE_X_PASS / STONE_X_APP_KEY, the API's, the alert channels', the dead-man token, the heartbeat copy URL /
+       token or a market-data / ARM secret; or any name starting with a backup prefix of $ForbiddenPrefixesInFile:
+       XTNL_BACKUP_, RCLONE_, B2_); warns (never refuses) while XTNL_NODE_ID is an example's name (pc1, node-a),
+       because the dead-man receiver tells two engines apart by node and epoch (W19);
+    3. copies STONE_X_*, BROKER_ENV, XTNL_API_SECRET, XTNL_API_DSN, XTNL_LIVEVIEW_DSN, the alert channel
+       credentials, the dead-man token, the heartbeat copy URL / token and the market-data / ARM secrets
+       ($UserVarNames) from the Windows User environment into this process (names logged, values never).
+       XTNL_HEARTBEAT_COPY_URL is a capability URL (on the home server a Healthchecks.io ping URL: anyone holding
+       it can keep the check green), so it is a secret like the dead-man token: User environment only, engine only.
+       XTNL_HEARTBEAT_COPY_TOKEN follows the same rule (on the home server leave it unset: it would be sent to
+       the copy URL's host). Backup credentials (XTNL_BACKUP_*, RCLONE_*, B2_*) belong to the separate backup
+       Windows account (docs/design/home-server-plan.md s3.2) and are never copied; when this process inherits
+       any, the log names them (never values) and they are removed from every child (engine, API, live view);
     4. waits up to 10 min for the Docker engine (`docker info`), one log line per minute;
     5. `docker compose -f deploy/local/docker-compose.local.yml up -d --wait` (postgres, redis, redis-api, etcd);
        5b. only when XTNL_MD_ENABLED is 1 as the engine reads it (trimmed, from the env file or inherited from the
@@ -39,15 +47,27 @@
        Without XTNL_API_SECRET or XTNL_API_DSN the log says the API is disabled and nothing listens.
        Least privilege: the API child is started WITHOUT the broker credentials and the engine's storage
        ($ApiDropEnv: STONE_X_*, CTRADER_*, ORDER_SERVER_DSN, REDIS_URL, BROKER_ENV, XTNL_MD_*, XTNL_ARM_*,
-       XTNL_SMTP_*, XTNL_SES_*, XTNL_PUSH_*, XTNL_DEADMAN_TOKEN are removed from its environment; it uses
-       XTNL_API_DSN = read-only role xtnl_api and XTNL_API_REDIS_URL = its own Redis, and refuses to start if
-       any removed name is present), and the engine child is started without XTNL_API_SECRET / XTNL_API_DSN.
+       XTNL_SMTP_*, XTNL_SES_*, XTNL_PUSH_*, XTNL_DEADMAN_TOKEN, XTNL_HEARTBEAT_COPY_URL,
+       XTNL_HEARTBEAT_COPY_TOKEN, XTNL_LIVEVIEW_DSN, XTNL_BACKUP_*, RCLONE_*, B2_* are removed from its
+       environment; it uses XTNL_API_DSN = read-only role xtnl_api and XTNL_API_REDIS_URL = its own Redis, and
+       refuses to start if any removed name is present), and the engine child is started without
+       XTNL_API_SECRET / XTNL_API_DSN / XTNL_LIVEVIEW_DSN or any backup name ($EngineDropEnv).
+       After the API, when XTNL_LIVEVIEW_DSN is set in the Windows User environment
+       (deploy/local/new-liveview-credentials.ps1) and -NoLiveView is not given, `python -m src.liveview
+       --stop-on-stdin-eof` (the local read-only live view on 127.0.0.1:8090, docs/runbooks/live-view.md; it never
+       sends orders and has no write path) runs as a third supervised child, lines prefixed [liveview], with the
+       same restart back-off (5 s doubling to 5 min) and the same exit 78 rule. It is started inside step 8 only,
+       so it is down whenever docker, the migrations or the clock wait are retrying. Its environment lacks every
+       name of $LiveViewDropEnv (the broker credentials, the engine's storage and DSNs, the API's, market-data /
+       ARM and alert channel settings and secrets, the dead-man token, the heartbeat copy URL and token, the
+       backup names XTNL_BACKUP_* / RCLONE_* / B2_*); it keeps XTNL_LIVEVIEW_DSN (read-only role xtnl_liveview,
+       migration 0021).
        The engine is started with XTNL_SINGLE_PC=1 (unless the env file or the Windows User environment sets it):
        a SAFE_HOLD is resumed by the engine itself after a cool-down (operations.md s4 / s17; runbook
        single-pc-autostart.md "SAFE_HOLD on this PC").
 
   Stop: Ctrl+C in the window running this script, or deploy/local/stop-xtnl.ps1 (sends Ctrl+C to this script's
-  hidden console). The engine drains on SIGINT and the API closes its listener; this script waits up to 60 s. Every child process is in a
+  hidden console). The engine drains on SIGINT and the API and the live view close their listeners; this script waits up to 60 s. Every child process is in a
   kill-on-close job object, so when the task is ended hard (Stop-ScheduledTask) nothing is left orphaned.
 
   Retries: Task Scheduler's restart-on-failure covers a task that fails to launch, not a script that exits
@@ -61,8 +81,8 @@
 
   Exit codes: 0 clean stop (or another copy is already running); 10 Docker engine not up within the wait;
   11 compose up failed; 12 migrations failed; 13 clock not within 50 ms within the wait (10-13 only with
-  -NoRetry); 78 configuration (missing env file / Windows User variables, credentials in the env file,
-  BROKER_ENV mismatch, no .venv, or run-local.ps1's --check-config refused); otherwise (-NoRetry)
+  -NoRetry); 78 configuration (missing env file / Windows User variables, credentials or backup names in the
+  env file, BROKER_ENV mismatch, no .venv, or run-local.ps1's --check-config refused); otherwise (-NoRetry)
   run-local.ps1's (the engine's) exit code.
 
 .EXAMPLE
@@ -77,9 +97,12 @@ param(
     [int]$RetryMaxS = 900,
     [int]$ApiRetryFirstS = 5,
     [int]$ApiRetryMaxS = 300,
+    [int]$LiveViewRetryFirstS = 5,
+    [int]$LiveViewRetryMaxS = 300,
     [int]$AlertAfterMinutes = 30,
     [switch]$NoRetry,
-    [switch]$NoApi
+    [switch]$NoApi,
+    [switch]$NoLiveView
 )
 $ErrorActionPreference = 'Stop'
 
@@ -104,24 +127,52 @@ $UserVarNames = @('STONE_X_USERNAME', 'STONE_X_PASS', 'STONE_X_APP_KEY', 'STONE_
                   'XTNL_MD_REDIS_URL', 'XTNL_MD_REDIS_READER_URL', 'XTNL_MD_HMAC_KEY', 'XTNL_MD_HMAC_KEY_PREV',
                   'XTNL_ARM_CONFIG_DSN', 'XTNL_ARM_SMTP_USERNAME', 'XTNL_ARM_SMTP_PASSWORD',
                   'XTNL_ARM_SES_ACCESS_KEY_ID', 'XTNL_ARM_SES_SECRET_ACCESS_KEY', 'XTNL_ARM_SES_SESSION_TOKEN',
-                  'XTNL_ARM_PUSH_TOKEN', 'XTNL_ARM_PUSH_USER')
+                  'XTNL_ARM_PUSH_TOKEN', 'XTNL_ARM_PUSH_USER', 'XTNL_LIVEVIEW_DSN',
+                  'XTNL_HEARTBEAT_COPY_URL', 'XTNL_HEARTBEAT_COPY_TOKEN')
 $RequiredUserVars = @('STONE_X_USERNAME', 'STONE_X_PASS', 'STONE_X_APP_KEY', 'BROKER_ENV')
-# Credentials live only in the Windows User environment, never in a file.
+# Credentials live only in the Windows User environment, never in a file. The heartbeat copy URL is one: on the
+# home server it is a Healthchecks.io capability URL (holding it is enough to keep the check green). The AWS
+# engine.env keeps both heartbeat copy names in its own env file: this refusal is for the local env file only.
 $ForbiddenInFile = @('STONE_X_USERNAME', 'STONE_X_PASS', 'STONE_X_APP_KEY', 'XTNL_API_SECRET', 'XTNL_API_DSN',
                      'XTNL_SMTP_USERNAME', 'XTNL_SMTP_PASSWORD', 'XTNL_SES_ACCESS_KEY_ID', 'XTNL_SES_SECRET_ACCESS_KEY',
                      'XTNL_SES_SESSION_TOKEN', 'XTNL_PUSH_TOKEN', 'XTNL_PUSH_USER', 'XTNL_DEADMAN_TOKEN',
                      'XTNL_MD_REDIS_URL', 'XTNL_MD_REDIS_READER_URL', 'XTNL_MD_HMAC_KEY', 'XTNL_MD_HMAC_KEY_PREV',
                      'XTNL_ARM_CONFIG_DSN', 'XTNL_ARM_SMTP_USERNAME', 'XTNL_ARM_SMTP_PASSWORD',
                      'XTNL_ARM_SES_ACCESS_KEY_ID', 'XTNL_ARM_SES_SECRET_ACCESS_KEY', 'XTNL_ARM_SES_SESSION_TOKEN',
-                     'XTNL_ARM_PUSH_TOKEN', 'XTNL_ARM_PUSH_USER')
+                     'XTNL_ARM_PUSH_TOKEN', 'XTNL_ARM_PUSH_USER', 'XTNL_LIVEVIEW_DSN',
+                     'XTNL_HEARTBEAT_COPY_URL', 'XTNL_HEARTBEAT_COPY_TOKEN')
+# Backup credentials (B2 key, rclone config, backup job settings) belong to the separate backup Windows account
+# (docs/design/home-server-plan.md s3.2) and never to this one: an env file assigning a name with one of these
+# prefixes is refused (exit 78), and every child drops them (the '<prefix>*' entries of the three drop lists
+# below). Explicit prefixes only, each ending in '_', so none can match a needed name such as XTNL_LIVEVIEW_DSN.
+$ForbiddenPrefixesInFile = @('XTNL_BACKUP_', 'RCLONE_', 'B2_')
+# The backup names that are not secret (review round 7). One of them alone in this account's environment is
+# still removed from every child and named in a warning, but needs no rotation and distrusts no check C run.
+$NonSecretBackupNames = @('XTNL_BACKUP_B2_BUCKET', 'XTNL_BACKUP_AGE_RECIPIENT', 'XTNL_BACKUP_EXCLUDE_MARKS',
+                          'XTNL_BACKUP_ARCHIVE_HOST')
 # Removed from the order-server API child's environment (wildcards; the same list src/api/settings.py refuses):
 # the network-facing process never holds the broker credentials, the engine's writable DSN or its Redis, the
-# market-data / ARM settings and secrets, the alert channel credentials or the dead-man token. Every
-# $UserVarNames name other than XTNL_API_* is covered (tests/deploy/test_order_server_api_assets.py).
+# market-data / ARM settings and secrets, the alert channel credentials, the dead-man token, the heartbeat copy
+# URL / token, the live view's DSN or a backup credential. Every $UserVarNames name other than XTNL_API_* is
+# covered (tests/deploy/test_order_server_api_assets.py).
 $ApiDropEnv = @('STONE_X_*', 'CTRADER_*', 'XTNL_MD_*', 'XTNL_ARM_*', 'XTNL_SMTP_*', 'XTNL_SES_*', 'XTNL_PUSH_*',
-                'ORDER_SERVER_DSN', 'REDIS_URL', 'XTNL_DEADMAN_TOKEN', 'BROKER_ENV')
-# Removed from the engine child's environment: the API's own credentials.
-$EngineDropEnv = @('XTNL_API_SECRET', 'XTNL_API_DSN')
+                'ORDER_SERVER_DSN', 'REDIS_URL', 'XTNL_DEADMAN_TOKEN', 'BROKER_ENV', 'XTNL_LIVEVIEW_DSN',
+                'XTNL_HEARTBEAT_COPY_URL', 'XTNL_HEARTBEAT_COPY_TOKEN', 'XTNL_BACKUP_*', 'RCLONE_*', 'B2_*')
+# Removed from the engine child's environment: the API's own credentials, the live view's DSN and the backup
+# credentials (the engine reads none of them).
+$EngineDropEnv = @('XTNL_API_SECRET', 'XTNL_API_DSN', 'XTNL_LIVEVIEW_DSN', 'XTNL_BACKUP_*', 'RCLONE_*', 'B2_*')
+# Removed from the live view child's environment: only the explicit prefixes and names of the refuse-list of
+# src/liveview/settings.py (docs/design/live-view.md s4.1). Never a wildcard such as XTNL_*DSN*: -like would also
+# remove XTNL_LIVEVIEW_DSN and the child would exit 78 on every start. The generic
+# XTNL_*(PASS|SECRET|TOKEN|DSN|KEY) rule lives only in settings.py. Every $UserVarNames name other than
+# XTNL_LIVEVIEW_DSN is covered (tests/deploy/test_order_server_api_assets.py).
+$LiveViewDropEnv = @('STONE_X_*', 'CTRADER_*', 'XTNL_MD_*', 'XTNL_ARM_*', 'XTNL_SMTP_*', 'XTNL_SES_*', 'XTNL_PUSH_*',
+                     'XTNL_API_*', 'ORDER_SERVER_DSN', 'REDIS_URL', 'BROKER_ENV', 'XTNL_DEADMAN_TOKEN',
+                     'XTNL_HEARTBEAT_COPY_TOKEN', 'XTNL_DASHBOARD_DSN', 'XTNL_HEARTBEAT_COPY_URL',
+                     'XTNL_BACKUP_*', 'RCLONE_*', 'B2_*')
+# Node names of the env examples (local-live.env.example, engine.env.example): still set on a box means it shares
+# its name with every other box started from the example (warning only; W19, Invoke-Main step 2).
+$ExampleNodeIds = @('pc1', 'node-a')
 # redis-md's ACL file (deploy/local/new-md-credentials.ps1), bound read-only into the container; outside the
 # repository and OneDrive.
 $MdAclFile = Join-Path $env:LOCALAPPDATA 'XTNL\redis-md\users.acl'
@@ -137,6 +188,8 @@ $script:ExitCode = $null
 $script:Engine = $null
 # Order-server API supervision state (Step-Api); Enabled only when XTNL_API_SECRET is set.
 $script:Api = @{ Enabled = $false; St = $null; Delay = $ApiRetryFirstS; NextStart = (Get-Date); StartedAt = (Get-Date) }
+# Live view supervision state (Step-LiveView); Enabled only when XTNL_LIVEVIEW_DSN is set and -NoLiveView is not given.
+$script:LiveView = @{ Enabled = $false; St = $null; Delay = $LiveViewRetryFirstS; NextStart = (Get-Date); StartedAt = (Get-Date) }
 # redis-md (compose profile md) is started only when XTNL_MD_ENABLED is on as the engine reads it
 # (src/runtime/optional_settings.py optional_flags_from_env: the process value trimmed, exactly 1 is on; unset or 0
 # is off; anything else is off and paged; Start-RedisMd). With the flag off a running redis-md is stopped (Stop-RedisMd).
@@ -316,6 +369,51 @@ function Stop-Api([int]$TimeoutS = 15) {
     $a.St = $null
 }
 
+# ------------------------------------------------------------------------------------------------ live view
+# python -m src.liveview: the third supervised child (docs/runbooks/live-view.md), local read-only page on
+# 127.0.0.1:8090; it never sends orders. Restarted with back-off; exit 78 (configuration or login refused) disables
+# it until the next start.
+function Start-LiveView {
+    Write-Log 'starting the live view: python -m src.liveview --stop-on-stdin-eof'
+    $script:LiveView.St = Start-Pumped $Py @('-m', 'src.liveview', '--stop-on-stdin-eof') '[liveview] ' -Stdin -DropEnv $LiveViewDropEnv
+    $script:LiveView.StartedAt = Get-Date
+}
+
+function Step-LiveView {
+    $l = $script:LiveView
+    if (-not $l.Enabled) { return }
+    if ($null -ne $l.St) {
+        if (-not (Step-Pumped $l.St)) { return }
+        [void]$l.St.Proc.WaitForExit(5000)
+        $code = Get-PumpedExit $l.St
+        $l.St = $null
+        if ($code -eq 78) {
+            Write-Log 'live view refused its configuration or its login (exit 78; see the [liveview] lines); disabled until the next start'
+            $l.Enabled = $false
+            return
+        }
+        if (((Get-Date) - $l.StartedAt).TotalMinutes -ge 10) { $l.Delay = $LiveViewRetryFirstS }
+        Write-Log ("live view exited (exit {0}); restarting it in {1} s" -f $code, $l.Delay)
+        $l.NextStart = (Get-Date).AddSeconds($l.Delay)
+        $l.Delay = [Math]::Min($l.Delay * 2, $LiveViewRetryMaxS)
+        return
+    }
+    if ((Get-Date) -ge $l.NextStart) { Start-LiveView }
+}
+
+# Graceful stop: close its stdin (it closes its streams and the listener and exits), end it after -TimeoutS.
+function Stop-LiveView([int]$TimeoutS = 15) {
+    $l = $script:LiveView
+    if ($null -eq $l.St) { return }
+    try { $l.St.Proc.StandardInput.Close() } catch { }
+    if (-not (Wait-Pumped $l.St $TimeoutS)) {
+        Write-Log "live view still running after $TimeoutS s; ending it"
+        Stop-Tree $l.St.Proc
+    }
+    Write-Log 'live view stopped'
+    $l.St = $null
+}
+
 # ------------------------------------------------------------------------------------------------ native helpers
 function Initialize-Native {
     if (-not ('XtnlStartNative' -as [type])) {
@@ -401,6 +499,15 @@ function Read-EnvFile([string]$Path) {
         $vars[$t.Substring(0, $i).Trim()] = $t.Substring($i + 1).Trim()
     }
     return $vars
+}
+
+# True for a name starting with one of $ForbiddenPrefixesInFile (case-insensitive, as Windows names are).
+function Test-BackupName([string]$Name) {
+    $upper = $Name.ToUpperInvariant()
+    foreach ($p in $ForbiddenPrefixesInFile) {
+        if ($upper.StartsWith($p, [System.StringComparison]::Ordinal)) { return $true }
+    }
+    return $false
 }
 
 function Find-Docker {
@@ -520,8 +627,20 @@ function Invoke-Main {
         Write-Log ("refused: {0} assigns {1}; credentials come only from the Windows User environment. Remove those lines." -f $EnvFile, ($bad -join ', '))
         $script:ExitCode = 78; return
     }
+    $badBackup = @($fileVars.Keys | Where-Object { Test-BackupName $_ })
+    if ($badBackup.Count -gt 0) {
+        Write-Log ("refused: {0} assigns {1}; backup credentials belong to the separate backup Windows account, never to the engine's. Remove those lines." -f $EnvFile, ($badBackup -join ', '))
+        $script:ExitCode = 78; return
+    }
     foreach ($k in $fileVars.Keys) { [Environment]::SetEnvironmentVariable($k, $fileVars[$k], 'Process') }
     Write-Log ("env file loaded: {0} ({1} settings)" -f $EnvFile, $fileVars.Count)
+    # W19: the receiver tells engines apart by (node, epoch), and the epoch is only the lease revision, so two boxes
+    # started from the same env file on fresh etcd volumes can look like one engine (home-server plan s4.8, s4.12).
+    # A warning, not a refusal: an existing PC keeps running while the operator picks a name per box.
+    $nodeId = ([string][Environment]::GetEnvironmentVariable('XTNL_NODE_ID', 'Process')).Trim()
+    if ($ExampleNodeIds -contains $nodeId) {
+        Write-Log ("warning: XTNL_NODE_ID is the example's '{0}'; give each machine its own name (for example home1 on the home server, from COMPUTERNAME {1}) so the dead-man receiver can tell two engines apart (deadman-alert.md, two engines); after the rename, one 'beating node changed' notice is expected and clears after 5 min" -f $nodeId, $env:COMPUTERNAME)
+    }
     # Read as the engine reads it (src/runtime/optional_settings.py): the process value, i.e. the env file's or one
     # inherited from the Windows User environment, trimmed; exactly 1 is on, anything else off.
     $mdRaw = ([string][Environment]::GetEnvironmentVariable('XTNL_MD_ENABLED', 'Process')).Trim()
@@ -547,6 +666,21 @@ function Invoke-Main {
     }
     $v = $null
     Write-Log ("Windows User environment loaded (names only): {0}" -f ($loaded -join ', '))
+    # Never copied, but this process inherits the account's User environment: name (never show) any backup
+    # credential found there. Start-Pumped removes them from every child, so this is a warning, not a refusal.
+    $inheritedBackup = @(Get-ChildItem Env: | ForEach-Object { $_.Name } | Where-Object { Test-BackupName $_ } | Sort-Object)
+    # Review round 7: only these backup names are not secret (home-backup-restore.md "If a backup secret leaked"
+    # step 5). Any other XTNL_BACKUP_* / RCLONE_* / B2_* name counts as a secret, an unknown one included.
+    $secretBackup = @($inheritedBackup | Where-Object { $NonSecretBackupNames -notcontains $_ })
+    if ($secretBackup.Count -gt 0) {
+        # Review round 5: anything running as this account can read them from its User environment, so a secret
+        # found here has leaked. Deleting it is not enough: rotate it at once, and distrust check C runs recorded
+        # from the earliest time it may have leaked until the rotation; runs from before that time stay trusted
+        # (home-backup-restore.md "Rotation", "If a backup secret leaked"; review round 7).
+        Write-Log ("warning: this account's environment holds {0}; backup credentials belong to the separate backup Windows account: delete them here and rotate every secret among them now (a new check C ping URL for XTNL_BACKUP_HC_URL, a new B2 upload key for XTNL_BACKUP_B2_ACCOUNT / XTNL_BACKUP_B2_KEY; home-backup-restore.md 'If a backup secret leaked'); write the earliest time they may have leaked in the rotation note: check C runs recorded from that time until the rotation are not trusted for a restore, runs from before it stay trusted. They are removed from the engine, API and live view" -f ($inheritedBackup -join ', '))
+    } elseif ($inheritedBackup.Count -gt 0) {
+        Write-Log ("warning: non-secret backup names found in this account's environment: {0}; they belong to the separate backup Windows account: delete them here. None of them is secret, so nothing needs rotating and no check C run is distrusted (home-backup-restore.md 'If a backup secret leaked', step 5). They are removed from the engine, API and live view" -f ($inheritedBackup -join ', '))
+    }
     if ($missing.Count -gt 0) {
         Write-Log ("refused: not set in the Windows User environment: {0}" -f ($missing -join ', '))
         $script:ExitCode = 78; return
@@ -561,6 +695,16 @@ function Invoke-Main {
         Write-Log 'order-server API enabled (XTNL_API_SECRET and XTNL_API_DSN are set); it runs alongside the engine without the broker credentials'
     } else {
         Write-Log 'order-server API disabled: XTNL_API_SECRET is not set in the Windows User environment (deploy\local\new-api-credentials.ps1)'
+    }
+    if ($NoLiveView) {
+        Write-Log 'live view disabled (-NoLiveView)'
+    } elseif ($loaded -contains 'XTNL_LIVEVIEW_DSN') {
+        $script:LiveView.Enabled = $true
+        $lvAddr = ([string][Environment]::GetEnvironmentVariable('XTNL_LIVEVIEW_ADDR', 'Process')).Trim()
+        if ($lvAddr -eq '') { $lvAddr = '127.0.0.1:8090' }
+        Write-Log ("live view enabled (XTNL_LIVEVIEW_DSN is set): http://{0}/ after the engine starts; read-only, never sends orders" -f $lvAddr)
+    } else {
+        Write-Log 'live view disabled: XTNL_LIVEVIEW_DSN is not set in the Windows User environment (deploy\local\new-liveview-credentials.ps1)'
     }
     $env:PYTHONUNBUFFERED = '1'
     $env:PYTHONIOENCODING = 'utf-8'
@@ -648,15 +792,19 @@ function Invoke-Attempt {
         Write-Log ("ALERT: clock not within the limit after {0} min; starting the engine anyway: it records nothing until its own clock check passes (an elevated resync fixes it now)" -f $ClockWaitMinutes)
     }
 
-    # 8. engine (run-local.ps1 restarts it after hard exits) and, when enabled, the order-server API beside it
+    # 8. engine (run-local.ps1 restarts it after hard exits) and, when enabled, the order-server API and then the
+    # live view beside it
     Write-Log "running deploy\local\run-local.ps1 -EnvFile $EnvFile"
     $script:Engine = Start-Pumped $PsExe @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $RunLocal, '-EnvFile', $EnvFile) '' -DropEnv $EngineDropEnv
     $script:Api.NextStart = Get-Date
     $script:Api.Delay = $ApiRetryFirstS
+    $script:LiveView.NextStart = Get-Date
+    $script:LiveView.Delay = $LiveViewRetryFirstS
     while (-not (Step-Pumped $script:Engine)) {
         Step-Api
+        Step-LiveView
         $pending = New-Object System.Collections.Generic.List[System.Threading.Tasks.Task]
-        foreach ($st in @($script:Engine, $script:Api.St)) {
+        foreach ($st in @($script:Engine, $script:Api.St, $script:LiveView.St)) {
             if ($null -eq $st) { continue }
             if ($null -ne $st.TOut) { $pending.Add($st.TOut) }
             if ($null -ne $st.TErr) { $pending.Add($st.TErr) }
@@ -665,6 +813,7 @@ function Invoke-Attempt {
     }
     [void]$script:Engine.Proc.WaitForExit(10000)
     Stop-Api
+    Stop-LiveView
     $code = Get-PumpedExit $script:Engine
     if ($null -eq $code) { $code = 1 }
     Write-Log "run-local.ps1 ended (exit $code)"
@@ -673,6 +822,7 @@ function Invoke-Attempt {
 
 function Invoke-Cleanup {
     try { Stop-Api } catch { }
+    try { Stop-LiveView } catch { }
     if ($null -ne $script:Engine) {
         if (-not (Wait-Pumped $script:Engine 60)) { Write-Log 'engine output still open after 60 s' }
     }

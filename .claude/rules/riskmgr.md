@@ -89,7 +89,10 @@ Design: `docs/design/automated-risk-manager.md` Part B; plan `docs/design/arm-im
    other set; a Supabase document can never name a sink.
 5. **No market data in PostgreSQL** (design §B3, §B8): ids, bucket times, check names, counts, order-state levels and
    keyed HMAC hashes with their key id only; R values dimensionless (0.01 R); never a price increment, quantum,
-   spread, pip size or account value in a notice, page or log record.
+   spread, pip size or account value in a notice, page or log record. Exception (owner decision 2026-11-21): the
+   ARM email's HTML part may show each stop's **distance from the entry in pips**; the relay reads the instrument's
+   `point_size` at send time (`src.db.instrument_reads.PgPointSizes`) and never stores it in a notice, prints it or
+   logs it. The pip size itself is still never shown.
 6. **Adding a strategy:** a new `(KIND, IMPL_VERSION)` in `src/riskmgr/registry.py` (never edit a pinned version);
    `RESOURCE = STOP_LEVEL` only; every REASON mapped to an engine category; `DECISION_METRICS` typed (`RMultiple` /
    `Ratio`); `parse_params` rejects unknown keys and out-of-bound values; `migrate_state` round-trips from every older

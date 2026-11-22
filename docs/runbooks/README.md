@@ -23,6 +23,9 @@ in the broker's own platform.
 | [downtime-catchup.md](downtime-catchup.md) | Single-PC mode: page "downtime catch-up" / "downtime catch-up incomplete", reading `uptime show` / `catchup show` |
 | [single-pc-autostart.md](single-pc-autostart.md) | Single-PC mode: start the engine at log-on (scheduled task `XTNL engine`), start / stop / status, reboot / sleep / update behaviour, removal |
 | [order-server-api.md](order-server-api.md) | Single-PC mode: the read-only HTTPS API for the thesis website (Pine Script order history): credentials, firewall / router / DNS steps you run yourself, Vercel settings, rotation, closing it again |
+| [live-view.md](live-view.md) | Single-PC mode: the local read-only live view (`http://127.0.0.1:8090/`): migration 0021, its login (`new-liveview-credentials.ps1`), rotation, exit 78 / `db: down`, turning it off |
+| [home-backup-restore.md](home-backup-restore.md) | Single-PC home server: the nightly encrypted PostgreSQL + partition-archive backup to B2 (task `XTNL backup`, account `xtnl-backup`), Healthchecks.io check C red, backup exit codes, the restore and the quarterly drill |
+| [deadman-receiver-home.md](deadman-receiver-home.md) | Single-PC home server: the dead-man receiver on a small VPS over Tailscale (unit, env file, `/healthz` timer = Healthchecks.io check B), and the engine's own page "dead-man receiver not acknowledging" |
 | [pinescript-export.md](pinescript-export.md) | Draw the past week's order life cycles on a TradingView chart (`python -m src.ops pinescript`) |
 | [marketdata.md](marketdata.md) | Optional market-data store `redis-md` and its tasks: enable / disable on AWS, the md pages (memory, broker bars, indicators), AOF aside, HMAC key rotation, redis-md password rotation |
 | [arm.md](arm.md) | Optional Automated Risk Manager (advice only): every ARM page with its fix, FAILED pings (probe kinds, the command to run first, clear), configuration, pause / disarm, enable / disable |

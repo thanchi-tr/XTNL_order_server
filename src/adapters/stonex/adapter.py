@@ -95,6 +95,7 @@ from src.dto import (
     CashFlowDTO,
     InstrumentSpec,
     OrderDTO,
+    OrderStatus,
     PositionDTO,
     PriceBarsResponse,
     bar_request_problem,
@@ -548,8 +549,9 @@ class StoneXAdapter(BrokerAdapter):
 
     def _map_open_orders(self, positions: Sequence[tuple[str, JsonObj]],
                          actives: Sequence[tuple[str, JsonObj]]) -> list[OrderDTO]:
-        nested = [(client, child) for client, row in [*positions, *actives] for child in attached_orders(row)]
-        for _client, child in nested:
+        nested = [(client, child, False) for client, row in positions for child in attached_orders(row)]
+        nested += [(client, child, True) for client, row in actives for child in attached_orders(row)]
+        for _client, child, _entry in nested:
             self._mapper.learn_parent(str(to_id(get_ci(child.raw, "OrderId"))), child.parent_id)
 
         out: list[OrderDTO] = []
@@ -570,15 +572,21 @@ class StoneXAdapter(BrokerAdapter):
             self._mapper.learn_order(dto, to_id(get_ci(row, "MarketId")))
             seen.add(order_id)
             out.append(dto)
-        for client, child in nested:
+        for client, child, of_entry in nested:
             order_id = to_id(get_ci(child.raw, "OrderId"))
             if order_id is None or order_id in seen:
                 continue
+            # An if-done child of a working (not yet filled) entry is Pending on the stream and its nested row has
+            # no status or time of its own: it takes Pending and the entry row's broker time, so a snapshot agrees
+            # with the stream (and heals a child the stream committed unlinked) instead of an untimed WORKING.
+            bracket = of_entry and child.if_done
             try:
                 dto = map_stop_limit_order(child.raw, account_id=client, lookup=self._lookup,
                                            parent_id=child.parent_id, default_side=child_side(child.parent_side),
                                            default_qty=child.parent_qty, default_market_id=child.parent_market_id,
-                                           order_kind=order_kind_of(child.order_type))
+                                           order_kind=order_kind_of(child.order_type),
+                                           default_status=OrderStatus.PENDING if bracket else None,
+                                           default_ts=child.parent_ts if bracket else 0)
             except UnmappableError as exc:
                 self._unmapped("orders", f"attached order skipped: {exc}")
                 continue
@@ -953,11 +961,20 @@ class StoneXAdapter(BrokerAdapter):
                     continue
                 done = msg.get(_LOOKUP_DONE)
                 if done is not None:
-                    for out in self._map_items(held.pop(done, [])):
+                    # A finished read is acted on only behind the broker frames already queued when it finished
+                    # (the channel hands local frames over first): an entry's frame still in the queue must be
+                    # registered as a bracket-parent candidate before its child's read releases the child.
+                    holding.behind.append([done, ch.qsize()])
+                else:
+                    for out in await self._map_order_frame(msg, holding):
                         yield out
-                    continue
-                for out in await self._map_order_frame(msg, holding):
-                    yield out
+                    for entry in holding.behind:
+                        entry[1] = int(entry[1]) - 1
+                while holding.behind and int(holding.behind[0][1]) <= 0:
+                    finished = str(holding.behind.pop(0)[0])
+                    holding.reading.discard(finished)
+                    for out in self._finish_held(finished, holding):
+                        yield out
         finally:
             for task in lookups:
                 task.cancel()
@@ -971,6 +988,7 @@ class StoneXAdapter(BrokerAdapter):
         if item is None:
             self._unmapped("orders", "ORDERS frame without OrderId")
             return [StreamEvent(StreamEventKind.GAP, "orders", "ORDERS frame without OrderId", self._wall_ms())]
+        self._mapper.note_frame(item)        # a held entry is a bracket-parent candidate from its first frame
         out: list[OrderStreamItem] = []
         try:
             await self._ensure_markets([item.market_id])
@@ -991,13 +1009,48 @@ class StoneXAdapter(BrokerAdapter):
                 if entry:
                     self._mapper.mark_entry_looked_up(item.order_id)
                 holding.held[item.order_id] = [item]
+                holding.reading.add(item.order_id)
                 task = asyncio.get_running_loop().create_task(
                     self._lookup_parent(item.order_id, holding.ch, relation=relation, entry=entry))
                 holding.lookups.add(task)
                 task.add_done_callback(holding.lookups.discard)
                 return out
+            wait_for = self._held_parent(item, holding)
+            if wait_for is not None:
+                holding.held[item.order_id] = [item]
+                holding.block(item.order_id, wait_for)
+                return out
         out.extend(self._map_items([item]))
         return out
+
+    def _held_parent(self, item: OrderItem, holding: _Holding) -> str | None:
+        """The held order this order's frames must wait for: its known parent while that parent's frames are held,
+        else (a Pending stop / limit with no known parent) any bracket-parent candidate of its key whose own read is
+        still running. A child is then mapped once, after its parent, and linked, never before it and unlinked
+        (live finding 2026-11-20)."""
+        parent = self._mapper.parent_of(item.order_id)
+        if parent is not None:
+            return parent if parent in holding.held and parent not in holding.blocked else None
+        for candidate in self._mapper.bracket_candidates(item):
+            if candidate in holding.reading:
+                return candidate
+        return None
+
+    def _finish_held(self, order_id: str, holding: _Holding) -> list[OrderStreamItem]:
+        """Map an order's held frames once nothing it waits for is held any more, then the orders that waited for
+        it, in order."""
+        frames = holding.held.get(order_id)
+        if frames:
+            wait_for = self._held_parent(frames[0], holding)
+            if wait_for is not None and wait_for != order_id:
+                holding.block(order_id, wait_for)
+                return []
+        outs = self._map_items(holding.held.pop(order_id, []))
+        holding.blocked.pop(order_id, None)
+        for waiter in holding.after.pop(order_id, []):
+            holding.blocked.pop(waiter, None)
+            outs.extend(self._finish_held(waiter, holding))
+        return outs
 
     def _map_items(self, items: Iterable[OrderItem]) -> list[OrderStreamItem]:
         out: list[OrderStreamItem] = []
@@ -1041,6 +1094,12 @@ class StoneXAdapter(BrokerAdapter):
                     if active is not None:
                         self._mapper.learn_parent(order_id, parent_of(active))
                         self._mapper.learn_side(order_id, parse_side(get_ci(active, "Direction")))
+                        # A stop / limit entry's row nests its if-done children (IfDone): learn their parent from
+                        # it, as a snapshot does; a pending entry's child has no active row of its own.
+                        for child in attached_orders(active):
+                            child_id = to_id(get_ci(child.raw, "OrderId"))
+                            if child_id is not None:
+                                self._mapper.learn_parent(child_id, child.parent_id)
                     if not self._mapper.side_known(order_id):
                         body = await read("order")
                         for key in ("TradeOrder", "StopLimitOrder"):
@@ -1242,14 +1301,28 @@ class StoneXAdapter(BrokerAdapter):
 
 
 class _Holding:
-    """The ORDERS consumer's held frames (per order id) and its background parent reads."""
+    """The ORDERS consumer's held frames (per order id), its background parent reads (``reading``: the ids whose
+    read has not finished), and the held orders waiting for another held order (``blocked`` child -> the order it
+    waits for, ``after`` that order -> its waiters, in order). A waiter is released when the order it waits for is
+    mapped, which happens when that order's read finishes or times out, so no wait outlives the read timeout."""
 
-    __slots__ = ("ch", "held", "lookups")
+    __slots__ = ("ch", "held", "lookups", "reading", "blocked", "after", "behind")
 
     def __init__(self, ch: FrameChannel, held: dict[str, list[OrderItem]], lookups: set[asyncio.Task[None]]) -> None:
         self.ch = ch
         self.held = held
         self.lookups = lookups
+        self.reading: set[str] = set()
+        self.blocked: dict[str, str] = {}
+        self.after: dict[str, list[str]] = {}
+        # finished reads not acted on yet: [order id, broker frames still queued ahead of it], in finishing order
+        self.behind: list[list[str | int]] = []
+
+    def block(self, order_id: str, wait_for: str) -> None:
+        self.blocked[order_id] = wait_for
+        waiters = self.after.setdefault(wait_for, [])
+        if order_id not in waiters:
+            waiters.append(order_id)
 
 
 def _entry_price(row: JsonObj, *names: str) -> Decimal | None:

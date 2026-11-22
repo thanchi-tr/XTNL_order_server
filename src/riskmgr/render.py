@@ -4,7 +4,8 @@ R11-M14).
 **The body** (`NoticeBody`) is what an ARM outbox row holds from its INSERT on: the notice id and key, decision ids,
 outcome codes and order-state fields only (`encode_body` / `decode_body`, a canonical JSON text whose keys are held
 to `BODY_KEYS` / `ITEM_KEYS` / ... both ways). Order state means the proposed stop, the pinned entry `E` and `S0`
-(needed to turn a bar close into favour R at send time) and the R values computed from order state
+(needed to turn a bar close into favour R at send time), the stop level the handles to move held when read
+(`stop_now`, for the HTML email's stop block) and the R values computed from order state
 (`current_risk_r = σ·(E − S)/R`); market data appears only as the trigger input's id with its keyed hash
 (`series_id|bar_end_ms|key_id‖hash`), which cannot be turned back into a price. There is never an OHLC, quote,
 spread, indicator value, favour R or favour / risk in a body.
@@ -111,8 +112,10 @@ ITEM_KEYS: Final = frozenset({
     "revision", "outcome", "category", "reason", "reason_kind", "trigger_met", "borderline", "advice",
     "proposed_stop", "current_risk_r", "first_bar_ratio", "caveats", "quality_flags", "stop_basis", "trigger_source",
     "handles", "trigger_input", "entry", "s0", "supersedes", "decided_at_ms", "strategy_kind",
-    "strategy_impl_version", "valid_until_ms", "stop_read_at_ms", "late", "loosen_policy",
+    "strategy_impl_version", "valid_until_ms", "stop_read_at_ms", "late", "loosen_policy", "stop_now",
 })
+"""`stop_now` is additive (written only when known), so a body without it still decodes (as None); `BODY_VERSION`
+stays 1."""
 PENDING_KEYS: Final = frozenset({"adapter_id", "position_id", "symbol", "side"})
 EXTRA_KEYS: Final = frozenset({"kind", "adapter_id", "position_id", "symbol", "side", "reason", "at_ms"})
 FAILED_KEYS: Final = frozenset({"scope_kind", "scope_id", "reason"})
@@ -154,6 +157,10 @@ class ItemBody:
     handles: tuple[str, ...] = ()
     stop_read_at_ms: int | None = None
     """When the stop the handles hold was read (order-state time, the latest of the handles' reads; never a price)."""
+    stop_now: Decimal | None = field(default=None, repr=False)
+    """The order-state stop level the handles to move held when read (at `stop_read_at_ms`; the most distant one when
+    they differ); None when not recorded (an older body, a timer-pass item). Shown only in the HTML email's stop
+    block, never in the text."""
     late: bool = False
     """A bar-end decision committed after its event's part 5 (a replayed bar): it goes out only as a LATE item."""
     trigger_input: str | None = None
@@ -236,6 +243,13 @@ def _dec_text(value: Decimal | None) -> str | None:
 
 
 def _item_json(i: ItemBody) -> dict[str, object]:
+    out = _item_core(i)
+    if i.stop_now is not None:      # additive key: absent when unknown, so earlier bodies keep their exact text
+        out["stop_now"] = _dec_text(i.stop_now)
+    return out
+
+
+def _item_core(i: ItemBody) -> dict[str, object]:
     return {
         "decision_id": i.decision_id, "decision_bar_end_ms": i.decision_bar_end_ms, "adapter_id": i.adapter_id,
         "position_id": i.position_id, "symbol": i.symbol, "side": i.side, "event": i.event,
@@ -370,7 +384,7 @@ def _item(raw: object) -> ItemBody:
         supersedes=_int(g("supersedes"), none=True), decided_at_ms=_req_int(g("decided_at_ms", 0)),
         strategy_kind=_req_str(g("strategy_kind", "")), strategy_impl_version=_req_int(g("strategy_impl_version", 0)),
         valid_until_ms=_int(g("valid_until_ms"), none=True), stop_read_at_ms=_int(g("stop_read_at_ms"), none=True),
-        late=bool(_bool(g("late", False))), loosen_policy=_policy(g("loosen_policy")))
+        late=bool(_bool(g("late", False))), loosen_policy=_policy(g("loosen_policy")), stop_now=_dec(g("stop_now")))
 
 
 def decode_body(text: str) -> NoticeBody:
@@ -641,7 +655,8 @@ def item_lines(item: ItemBody, route: str, *, favour: Favour | None, settings: R
         figures.append(f"first-bar ratio {format(item.first_bar_ratio, 'f')}")
     if item.borderline:
         figures.append("borderline")
-    if settings.show_levels and item.entry is not None:
+    if settings.show_levels and item.entry is not None and item.event != "PRE":
+        # a PRE ADJUST item carries its pinned entry for the HTML stop block only; the text stays as before
         figures.append(f"entry {format(item.entry, 'f')}")
     if figures:
         lines.append("  " + "; ".join(figures))

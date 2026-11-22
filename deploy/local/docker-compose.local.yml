@@ -39,6 +39,10 @@
 # nothing of the engine's Redis (entity keys, halt:state). The API never gets REDIS_URL (src/api/settings.py
 # refuses to start with it; deploy/local/start-xtnl.ps1 removes it from the API's environment).
 #
+# backup (compose profile `backup`, home-server plan W3) is a run-once job, never a running service: pg_dump, age
+# encryption and an rclone upload to Backblaze B2, run nightly by deploy/local/backup-pg.ps1 under a separate
+# Windows account (docs/runbooks/home-backup-restore.md). A plain `up` never starts it.
+#
 # 'xtnl_local_only' is a LOCAL-ONLY password for this loopback-bound container. It is not a credential for
 # anything else and must never be reused elsewhere. Broker credentials never appear in this file.
 
@@ -141,7 +145,14 @@ services:
       - --listen-peer-urls=http://localhost:2380
       - --initial-advertise-peer-urls=http://localhost:2380
       - --initial-cluster=etcd-local=http://localhost:2380
-      - --initial-cluster-token=xtnl-local
+      # A new cluster's member and cluster ids are computed from the peer URL and this token alone, so a fresh
+      # xtnl_local_etcd volume made with the same token gets the SAME cluster_id with its revision back near 1:
+      # the engine's epoch bump (src/db/epoch.py, `revision < $2`) then changes 0 rows (FENCED) and
+      # `epoch adopt` refuses with already_adopted. A rebuild therefore sets a new token (xtnl-local-r1, -r2, ...)
+      # in the shell that creates the volume (home-server plan W18; runbook single-pc-autostart.md "Rebuild etcd").
+      # The --initial-* flags are read only when the data directory is empty: on an existing volume a different
+      # token changes nothing (compose recreates the container once, the cluster_id stays).
+      - --initial-cluster-token=${XTNL_ETCD_CLUSTER_TOKEN:-xtnl-local}
       - --initial-cluster-state=new
       - --heartbeat-interval=250
       - --election-timeout=2500
@@ -151,6 +162,7 @@ services:
       - "127.0.0.1:52380:2379"
     volumes:
       # The cluster_id lives here: it must survive restarts or the engine epoch changes and the engine fences.
+      # Carry it over only together with PostgreSQL data from the same moment (or rebuild with a new token).
       - xtnl_local_etcd:/etcd-data
     stop_grace_period: 30s
     healthcheck:
@@ -202,6 +214,51 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
+    logging: *default-logging
+
+  # Nightly encrypted off-site backup of PostgreSQL (home-server plan 3.2 option A, W3; runbook
+  # docs/runbooks/home-backup-restore.md). Compose profile `backup`: a plain `up -d --wait` never builds, starts
+  # or waits for it. deploy/local/backup-pg.ps1 runs it once and removes it, under the separate backup account:
+  #     docker compose -f deploy/local/docker-compose.local.yml --profile backup run --rm -T backup
+  # It joins this project's default network and reads postgres:5432 with the stack's local-only login (header).
+  # Settings come from the backup account's Windows User environment, never from this file. Only the NON-secret
+  # ones go by name (-e NAME): the bucket, the age PUBLIC key, XTNL_BACKUP_EXCLUDE_MARKS and XTNL_BACKUP_SECRETS=stdin.
+  # The secrets (the B2 key id, the B2 key) go on the job's stdin only: never pass them as -e or `environment:`
+  # and never write them here, or `docker inspect` shows them to every docker-users member (runbook "Accepted
+  # deviation"). The Healthchecks.io check C URL never reaches this service, not even on stdin: backup-pg.ps1
+  # sends every check C ping itself, outside Docker (home-server review round 2). It backs up
+  # PostgreSQL and the partition archive folder only: no market-data or cache volume is mounted here.
+  # Plain dump files exist only in /dev/shm (tmpfs, capped by shm_size) and are deleted on exit.
+  backup:
+    profiles: ["backup"]
+    build:
+      context: ./backup
+    image: xtnl-local-backup:1
+    restart: "no"
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: xtnl
+      PGPASSWORD: xtnl_local_only   # the postgres service's local-only password (see header)
+      PGDATABASE: xtnl
+      PGCONNECT_TIMEOUT: "10"
+      PGAPPNAME: xtnl-backup
+    volumes:
+      # The engine's XTNL_ARCHIVE_DIR (W10), read-only. backup-pg.ps1 sets XTNL_BACKUP_ARCHIVE_HOST and refuses to
+      # run when the folder is missing; never created here. The default only keeps a plain `up` parse quiet.
+      - type: bind
+        source: ${XTNL_BACKUP_ARCHIVE_HOST:-C:/xtnl/archive}
+        target: /archive
+        read_only: true
+        bind:
+          create_host_path: false
+      # The postgres base image declares a VOLUME here; an in-memory mount keeps each run from leaving an
+      # anonymous Docker volume behind. Nothing is written to it.
+      - type: tmpfs
+        target: /var/lib/postgresql/data
+    shm_size: "2gb"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     logging: *default-logging
 
 volumes:

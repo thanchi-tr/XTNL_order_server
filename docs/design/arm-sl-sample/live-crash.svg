@@ -1,0 +1,79 @@
+<svg width="100%" viewBox="0 0 680 603" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>Design 3: crash with and without recovery</title>
+<desc>Crash points K1 to K8 along the stop-move lifecycle, with what happens if the order-server stays down and if it recovers.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#73726C" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<style>
+text{font-family:'Segoe UI',system-ui,sans-serif}
+.th{font-size:14px;font-weight:600;fill:#2C2C2A}.ts{font-size:12px;fill:#5F5E5A}
+.arr{stroke:#73726C;stroke-width:1.5;fill:none}
+.box{fill:#F8F7F3;stroke:#B4B2A9}
+.c-gray>rect{fill:#F1EFE8;stroke:#5F5E5A}.c-gray>.th{fill:#444441}.c-gray>.ts{fill:#5F5E5A}
+.c-amber>rect{fill:#FAEEDA;stroke:#854F0B}.c-amber>.th{fill:#633806}.c-amber>.ts{fill:#854F0B}
+.c-coral>rect{fill:#FAECE7;stroke:#993C1D}.c-coral>.th{fill:#712B13}.c-coral>.ts{fill:#993C1D}
+.c-teal>rect{fill:#E1F5EE;stroke:#0F6E56}.c-teal>.th{fill:#085041}.c-teal>.ts{fill:#0F6E56}
+.c-red>rect{fill:#FCEBEB;stroke:#A32D2D}.c-red>.th{fill:#791F1F}.c-red>.ts{fill:#A32D2D}
+</style>
+<rect width="680" height="603" fill="#ffffff"/>
+<g class="c-gray"><rect x="40" y="56" width="76" height="46" rx="8" stroke-width="0.8"/><text class="th" x="78.0" y="75" text-anchor="middle" dominant-baseline="central">PRE</text><text class="ts" x="78.0" y="93" text-anchor="middle" dominant-baseline="central">heads-up</text></g>
+<g class="c-gray"><rect x="126" y="56" width="76" height="46" rx="8" stroke-width="0.8"/><text class="th" x="164.0" y="75" text-anchor="middle" dominant-baseline="central">POST</text><text class="ts" x="164.0" y="93" text-anchor="middle" dominant-baseline="central">bar end</text></g>
+<path d="M116 79 H124" class="arr" fill="none" marker-end="url(#arrow)"/>
+<g class="c-gray"><rect x="212" y="56" width="76" height="46" rx="8" stroke-width="0.8"/><text class="th" x="250.0" y="75" text-anchor="middle" dominant-baseline="central">Intent</text><text class="ts" x="250.0" y="93" text-anchor="middle" dominant-baseline="central">proposed</text></g>
+<path d="M202 79 H210" class="arr" fill="none" marker-end="url(#arrow)"/>
+<g class="c-coral"><rect x="298" y="56" width="76" height="46" rx="8" stroke-width="0.8"/><text class="th" x="336.0" y="75" text-anchor="middle" dominant-baseline="central">Approve</text><text class="ts" x="336.0" y="93" text-anchor="middle" dominant-baseline="central">P3 only</text></g>
+<path d="M288 79 H296" class="arr" fill="none" marker-end="url(#arrow)"/>
+<g class="c-amber"><rect x="384" y="56" width="76" height="46" rx="8" stroke-width="0.8"/><text class="th" x="422.0" y="75" text-anchor="middle" dominant-baseline="central">Send</text><text class="ts" x="422.0" y="93" text-anchor="middle" dominant-baseline="central">row + write</text></g>
+<path d="M374 79 H382" class="arr" fill="none" marker-end="url(#arrow)"/>
+<g class="c-amber"><rect x="470" y="56" width="76" height="46" rx="8" stroke-width="0.8"/><text class="th" x="508.0" y="75" text-anchor="middle" dominant-baseline="central">Ack</text><text class="ts" x="508.0" y="93" text-anchor="middle" dominant-baseline="central">confirm read</text></g>
+<path d="M460 79 H468" class="arr" fill="none" marker-end="url(#arrow)"/>
+<g class="c-teal"><rect x="556" y="56" width="76" height="46" rx="8" stroke-width="0.8"/><text class="th" x="594.0" y="75" text-anchor="middle" dominant-baseline="central">Moved</text><text class="ts" x="594.0" y="93" text-anchor="middle" dominant-baseline="central">stop at BE</text></g>
+<path d="M546 79 H554" class="arr" fill="none" marker-end="url(#arrow)"/>
+<g class="c-red"><rect x="106.0" y="20" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="121.0" y="30" text-anchor="middle" dominant-baseline="central">K1</text></g>
+<line x1="121.0" y1="40" x2="121.0" y2="54" stroke="#A32D2D" stroke-width="1" stroke-dasharray="2 2"/>
+<g class="c-red"><rect x="235.0" y="20" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="250.0" y="30" text-anchor="middle" dominant-baseline="central">K2</text></g>
+<line x1="250.0" y1="40" x2="250.0" y2="54" stroke="#A32D2D" stroke-width="1" stroke-dasharray="2 2"/>
+<g class="c-red"><rect x="321.0" y="20" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="336.0" y="30" text-anchor="middle" dominant-baseline="central">K4</text></g>
+<line x1="336.0" y1="40" x2="336.0" y2="54" stroke="#A32D2D" stroke-width="1" stroke-dasharray="2 2"/>
+<g class="c-red"><rect x="407.0" y="20" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="422.0" y="30" text-anchor="middle" dominant-baseline="central">K3</text></g>
+<line x1="422.0" y1="40" x2="422.0" y2="54" stroke="#A32D2D" stroke-width="1" stroke-dasharray="2 2"/>
+<g class="c-red"><rect x="493.0" y="20" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="508.0" y="30" text-anchor="middle" dominant-baseline="central">K5</text></g>
+<line x1="508.0" y1="40" x2="508.0" y2="54" stroke="#A32D2D" stroke-width="1" stroke-dasharray="2 2"/>
+<g class="c-red"><rect x="579.0" y="20" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="594.0" y="30" text-anchor="middle" dominant-baseline="central">K6</text></g>
+<line x1="594.0" y1="40" x2="594.0" y2="54" stroke="#A32D2D" stroke-width="1" stroke-dasharray="2 2"/>
+<text class="ts" x="40" y="14">K1–K6 along one stop move; K7, K8 can happen any time.</text>
+<text class="th" x="40" y="126">Crash point</text><text class="th" x="196" y="126">Stays down</text><text class="th" x="420" y="126">Recovers (restart / failover)</text>
+<g class="c-red"><rect x="40" y="138" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="55" y="148" text-anchor="middle" dominant-baseline="central">K1</text></g>
+<text class="ts" x="76" y="152">PRE → POST</text>
+<g class="c-gray"><rect x="190" y="138" width="220" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="198" y="153">No decision, no move. Broker keeps</text><text class="ts" x="198" y="168">the old stop.</text></g>
+<g class="c-teal"><rect x="416" y="138" width="236" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="424" y="153">Before cap: POST (delayed) or LATE,</text><text class="ts" x="424" y="168">can still move. After cap: next bar.</text></g>
+<g class="c-red"><rect x="40" y="188" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="55" y="198" text-anchor="middle" dominant-baseline="central">K2</text></g>
+<text class="ts" x="76" y="202">Intent unsent</text>
+<g class="c-gray"><rect x="190" y="188" width="220" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="198" y="203">Nothing sent; old stop stays. P3:</text><text class="ts" x="198" y="218">your approval cannot be processed.</text></g>
+<g class="c-teal"><rect x="416" y="188" width="236" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="424" y="203">Resumes in its saved state and mode;</text><text class="ts" x="424" y="218">P3 never skips approval; may expire.</text></g>
+<g class="c-red"><rect x="40" y="238" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="55" y="248" text-anchor="middle" dominant-baseline="central">K3</text></g>
+<text class="ts" x="76" y="252">Sending</text>
+<g class="c-gray"><rect x="190" y="238" width="220" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="198" y="253">Old or new stop at the broker:</text><text class="ts" x="198" y="268">both protect (single in-place amend).</text></g>
+<g class="c-teal"><rect x="416" y="238" width="236" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="424" y="253">Unknown → read: at target = moved;</text><text class="ts" x="424" y="268">else operator page. Never re-sent.</text></g>
+<g class="c-red"><rect x="40" y="288" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="55" y="298" text-anchor="middle" dominant-baseline="central">K4</text></g>
+<text class="ts" x="76" y="302">Approval wait</text>
+<g class="c-gray"><rect x="190" y="288" width="220" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="198" y="303">Request delivered; approving</text><text class="ts" x="198" y="318">does nothing yet.</text></g>
+<g class="c-teal"><rect x="416" y="288" width="236" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="424" y="303">Approval kept: applied before expiry,</text><text class="ts" x="424" y="318">refused after.</text></g>
+<g class="c-red"><rect x="40" y="338" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="55" y="348" text-anchor="middle" dominant-baseline="central">K5</text></g>
+<text class="ts" x="76" y="352">Acked</text>
+<g class="c-gray"><rect x="190" y="338" width="220" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="198" y="353">New or old stop: both protect.</text></g>
+<g class="c-teal"><rect x="416" y="338" width="236" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="424" y="353">Confirm window re-checked: at target</text><text class="ts" x="424" y="368">= moved, else operator page.</text></g>
+<g class="c-red"><rect x="40" y="388" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="55" y="398" text-anchor="middle" dominant-baseline="central">K6</text></g>
+<text class="ts" x="76" y="402">Moved</text>
+<g class="c-gray"><rect x="190" y="388" width="220" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="198" y="403">Stop already at break-even.</text></g>
+<g class="c-teal"><rect x="416" y="388" width="236" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="424" y="403">Next bar end sees the target and</text><text class="ts" x="424" y="418">releases the position.</text></g>
+<g class="c-red"><rect x="40" y="438" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="55" y="448" text-anchor="middle" dominant-baseline="central">K7</text></g>
+<text class="ts" x="76" y="452">PC off / asleep</text>
+<g class="c-gray"><rect x="190" y="438" width="220" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="198" y="453">Nothing runs until you log on.</text><text class="ts" x="198" y="468">The broker stop protects.</text></g>
+<g class="c-teal"><rect x="416" y="438" width="236" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="424" y="453">Fence → restart; missed bars spanned</text><text class="ts" x="424" y="468">'downtime'; old intents expire.</text></g>
+<g class="c-red"><rect x="40" y="488" width="30" height="20" rx="4" stroke-width="0.8"/><text class="ts" x="55" y="498" text-anchor="middle" dominant-baseline="central">K8</text></g>
+<text class="ts" x="76" y="502">Crash loop</text>
+<g class="c-gray"><rect x="190" y="488" width="220" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="198" y="503">—</text></g>
+<g class="c-teal"><rect x="416" y="488" width="236" height="44" rx="6" stroke-width="0.6"/><text class="ts" x="424" y="503">SAFE_HOLD: nothing sent, paged. Live</text><text class="ts" x="424" y="518">moves stay off until you re-enable.</text></g>
+<text class="ts" x="40" y="548">Baseline: the stop rests at the broker, so a crash can lose or delay a move, never remove a stop</text>
+<text class="ts" x="40" y="563">(only with a single in-place amend, prerequisite P2). Who tells you if it stays down: the engine's</text>
+<text class="ts" x="40" y="578">own page while the PC is up; if the PC is off or the supervisor died, only the off-PC dead-man (P4).</text>
+</svg>
