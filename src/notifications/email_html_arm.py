@@ -178,11 +178,10 @@ def _card_block(inner: str) -> str:
 def adjust_headline(item: ItemBody) -> str:
     sym, side = _id(item.symbol) or "position", _side(item.side)
     proposed = _dec(item.proposed_stop)
-    # "break-even" only when the body proves it: the proposed stop equals the pinned entry (Decimal compare, so
-    # 1.1 == 1.10000). With be_offset_r > 0, or a target rounded toward profit off an off-grid entry, the level is
-    # beyond entry and the generic wording is the truthful one.
-    be = (item.strategy_kind == BREAK_EVEN_KIND and item.entry is not None and item.proposed_stop is not None
-          and item.proposed_stop == item.entry)
+    # §20 Q6 / Q1 (a): every break_even_on_risk_close target is "break-even", at the entry and at the entry plus a
+    # buffer (or rounded toward profit), as the single §B8 COMPLETE text (render.COMPLETE_TEXT); the preheader adds
+    # the exact level. §B8 fixes no other ADJUST headline.
+    be = item.strategy_kind == BREAK_EVEN_KIND
     if item.event == "PRE":
         target = "break-even" if be else (proposed or "a new level")
         return f"Heads-up: {sym} {side} stop would move to {target}"
@@ -430,15 +429,51 @@ def _xtnl_levels(item: ItemBody, settings: RenderSettings, unit: object, accent:
         note = f"Moves the stop {move} {pip.word}{how}."
     if not settings.show_levels:
         note = (note + " The entry is not shown (show_levels off).").strip()
+    if item.event == "PRE" and FIRST_BAR_CONDITIONAL in item.caveats:
+        # §B6.5 / §B8: a bar-0 PRE that proposes a move is shown only with its conditional label, first
+        note = f"{pre_label(bool(item.trigger_met))}. {note}".strip()
     sym = f"{_id(item.symbol) or 'position'} {_side(item.side)}"
     return th.levels_rows(f"Levels · {sym}", levels, accent, note)
+
+
+def _delayed_text(item: ItemBody) -> str | None:
+    """§B5.2: a POST decided after `T + post_grace` is labelled DELAYED with its delay (as the text part)."""
+    if DELAYED in item.caveats and item.decided_at_ms > item.bar_end_ms:
+        return f"decided {(item.decided_at_ms - item.bar_end_ms) // 60_000} min after bar end"
+    return None
+
+
+def _caveat_texts(item: ItemBody) -> list[str]:
+    """The item's caveats in words (§B6.3 `be_offset_first_seen`, §B7 S0, Q14 roll, ...), as the text part."""
+    return [CAVEAT_TEXT.get(c, _id(c)) for c in item.caveats if c not in (FIRST_BAR_CONDITIONAL, DELAYED)]
+
+
+def _xtnl_item_facts(item: ItemBody) -> list[tuple[str, str]]:
+    """The facts under an ADJUST item's levels block: the §B8 allow-list fields the classic card and the text part
+    carry (valid until, DELAYED, current risk R, first-bar ratio, borderline, caveats). Never favour R or favour /
+    risk, a pip size or an increment."""
+    facts: list[tuple[str, str]] = []
+    if item.event == "PRE" and item.valid_until_ms is not None:
+        facts.append(("Valid until", _arm_clock(item.valid_until_ms)))
+    delayed = _delayed_text(item)
+    if delayed is not None:
+        facts.append(("Delayed", delayed))
+    if item.current_risk_r is not None:
+        facts.append(("Current risk", f"{format(item.current_risk_r, 'f')} R"))
+    if item.first_bar_ratio is not None:
+        facts.append(("First-bar ratio", format(item.first_bar_ratio, "f")))
+    if item.borderline:
+        facts.append(("Borderline", "yes"))
+    facts += [("Caveat", c) for c in _caveat_texts(item)]
+    return facts
 
 
 def _render_arm_xtnl(body: NoticeBody, s: RenderSettings, footer: FooterSource | None, outbox_id: int | None,
                      title: str | None, pip_units: Mapping[tuple[str, str], object] | None) -> str:
     """The XTNL-theme page of one ARM notice (`email_theme`): status word, plain headline, steps, the levels block of
-    every ADJUST item, the other items, pending positions, extras and FAILED scopes, the facts and the operator
-    block. Favour R and favour / risk are never shown."""
+    every ADJUST item (with the bar-0 PRE label, §B6.5) and its facts (valid until, DELAYED, R, ratio, borderline,
+    caveats), the other items with their DELAYED line and caveats, pending positions, extras and FAILED scopes, the
+    facts and the operator block. Favour R and favour / risk are never shown."""
     from src.notifications import email_theme as th
     adjust = [i for i in body.items if i.outcome == "ADJUST"]
     final = [i for i in adjust if i.event != "PRE"]
@@ -497,6 +532,7 @@ def _render_arm_xtnl(body: NoticeBody, s: RenderSettings, footer: FooterSource |
         rows.append(th.nothing_row(nothing, accent))
     for i in adjust:
         rows.append(_xtnl_levels(i, s, units.get((i.adapter_id, i.symbol)), accent))
+        rows.append(th.facts_rows(_xtnl_item_facts(i)))
     when = th.melbourne_clock(body.created_ms)
     if body.event == "PRE":
         rows.append(th.story_rows([th.Event("bar close", "Final advice", "after the bar closes", "next"),
@@ -504,8 +540,16 @@ def _render_arm_xtnl(body: NoticeBody, s: RenderSettings, footer: FooterSource |
     elif final:
         rows.append(th.story_rows([th.Event("next bar", "Next check", "when the next bar closes", "next"),
                                    th.Event(when, stage, "This email.", "now")], accent))
-    others = [(f"{_id(i.symbol) or _id(i.position_id)} {_side(i.side)}", outcome_text(i, s))
-              for i in body.items if i.outcome != "ADJUST"]
+    others: list[tuple[str, str]] = []
+    for i in body.items:
+        if i.outcome == "ADJUST":
+            continue
+        name = f"{_id(i.symbol) or _id(i.position_id)} {_side(i.side)}"
+        others.append((name, outcome_text(i, s)))
+        delayed = _delayed_text(i)
+        if delayed is not None:
+            others.append((f"{name} · delayed", delayed))
+        others += [(f"{name} · caveat", c) for c in _caveat_texts(i)]
     others += [(f"{_id(p.symbol) or _id(p.position_id)} {_side(p.side)}", AWAITING_TEXT) for p in body.pending]
     others += [(_id(e.kind).replace("_", " ").title(), EXTRA_TEXT.get(e.kind, _id(e.kind))
                 + (f" ({_id(e.position_id)})" if e.position_id else "")) for e in body.extras]

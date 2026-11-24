@@ -33,7 +33,9 @@ when the strategy declares `RELEASE_POLICY = ON_CONFIRMED_TARGET` (kind (a)); a 
 (`AT_TARGET_UNCONFIRMED`, round 12 / S38c);
 at target without the trigger → `AT_TARGET_UNCONFIRMED` (shown only on the first bar of an at-target run); if this
 bar's PRE proposed a move and the bar end ends in a guard HOLD, a strategy reason with `trigger_met` false or
-`AT_TARGET_UNCONFIRMED`, the outcome is `PRE_NOT_CONFIRMED(reason)` (INFO, shown) and `pre_basis` is stored.
+`AT_TARGET_UNCONFIRMED`, the outcome is `PRE_NOT_CONFIRMED(reason)` (INFO, shown) and `pre_basis` is stored, except
+this bar's PRE levels when `S_at_T` is already beyond them away from entry (C1: the stop was loosened back past them
+before the bar end; a guard HOLD applies the same rule).
 
 **Post-guards** (8)-(13) (`apply_envelope`, also at PRE on the frozen quote): (8) a target that would loosen a current
 handle → `BROKER_AHEAD` for that handle; (9) round toward profit to the increment; (10) market not open now (SM10
@@ -77,6 +79,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Context, Decima
 from enum import Enum
 from typing import Final
 
+from src.dto import Side
 from src.marketdata.ports import CalendarPort, HandleRef, calendar_open
 from src.marketdata.timing import COLD_SKEW, SkewEstimate, decision_cap_ms, pre_fire_ms, pre_valid_until_ms, timing_for
 from src.marketdata.types import BarSpec, Quote
@@ -460,6 +463,20 @@ def _strategy_code(strategy: SlStrategy, evaluation: Evaluation, *, pre_not_conf
         raise PipelineFault(strategy_scope_id(strategy.KIND, strategy.IMPL_VERSION)) from None
 
 
+def _unconfirmed_basis(side: Side, entry: Decimal, s_at_t: StopAtT, stored: PreBasis | None,
+                       this_bar_pre: PreBasis | None) -> PreBasis | None:
+    """The basis a `PRE_NOT_CONFIRMED` stores (§B6.3 C1): the farther of the stored basis and this bar's PRE levels,
+    where the stored one is kept only while its `S_pre` is farther from entry than the bar-end `S_at_T` (the rule
+    `trigger_basis` applies at every bar end), and this bar's PRE levels ("the handle levels the PRE used, before the
+    move it prompted") are left out when `S_at_T` is already beyond them away from entry: the stop was loosened back
+    past them before the bar end, so the current, larger risk already applies. A stop still at the PRE's level (no
+    move yet) keeps them, so a move made later on the heads-up is still discounted."""
+    old = trigger_basis(side, entry, s_at_t.level, s_at_t.basis, stored).stored
+    if this_bar_pre is not None and farther_from_entry(side, entry, s_at_t.level, this_bar_pre.s_pre):
+        this_bar_pre = None
+    return farther_basis(side, entry, old, this_bar_pre)
+
+
 def _latch(strategy: SlStrategy, inp: PipelineInput) -> bool:
     try:
         return bool(strategy.latch(inp.params))
@@ -655,7 +672,9 @@ def _bar_end(inp: PipelineInput, strategy: SlStrategy, registry: ArmRegistry) ->
                              sm11_events=(Sm11Event.REARM_ON_LOOSEN,) if rearmed else ())
         stored = inp.pre_basis
         code = _guard_code(guard, verdict, pre_not_confirmed=pre_proposed)
-        if pre_proposed:
+        if isinstance(inp.stop_at_t, StopAtT):          # C1 against the bar-end stop
+            stored = _unconfirmed_basis(side, entry, inp.stop_at_t, stored, inp.this_bar_pre)
+        elif pre_proposed:                              # no current S known: C1 cannot be checked, kept
             stored = farther_basis(side, entry, stored, inp.this_bar_pre)
         return replace(base, code=code, final=True, guard_verdicts=tuple(acc.verdicts), metrics=verdict.metrics,
                        caveats=_dedupe([*ctx.caveats, *acc.caveats, *verdict.caveats]), pre_basis=stored,
@@ -686,14 +705,14 @@ def _bar_end(inp: PipelineInput, strategy: SlStrategy, registry: ArmRegistry) ->
     elif at_target:
         if pre_proposed:
             code = OutcomeCode.pre_not_confirmed("", Outcome.AT_TARGET_UNCONFIRMED.value)
-            after_basis = farther_basis(side, entry, after_basis, inp.this_bar_pre)
+            after_basis = _unconfirmed_basis(side, entry, s_at_t, after_basis, inp.this_bar_pre)
         else:
             code = OutcomeCode.engine(Outcome.AT_TARGET_UNCONFIRMED)
             shown = not inp.prev_final_at_target
     elif evaluation.proposal is None:
         code = _strategy_code(strategy, evaluation, pre_not_confirmed=pre_proposed)
         if pre_proposed:
-            after_basis = farther_basis(side, entry, after_basis, inp.this_bar_pre)
+            after_basis = _unconfirmed_basis(side, entry, s_at_t, after_basis, inp.this_bar_pre)
     else:                                                       # (8)-(13)
         env = apply_envelope(trigger_ctx, evaluation, quote=inp.live_quote, quote_live=ctx.exit_quote_live,
                              market_open=calendar_open(inp.calendar, ctx.adapter_id, ctx.symbol),

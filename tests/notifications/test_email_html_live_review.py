@@ -1,7 +1,8 @@
 """Live review F2 / F3 on the HTML email part.
 
-F2: "break-even" is said only when the proposed stop equals the pinned entry (Decimal compare), not whenever the
-strategy kind is break_even_on_risk_close: with be_offset_r > 0 the target is beyond entry.
+F2 (reverted in round 4): every break_even_on_risk_close target is "break-even" in the headline and preheader, at
+the entry, at the entry plus a buffer or rounded off an off-grid entry, and with the entry unknown (§20 Q6, Q1 (a);
+§B8 fixes no ADJUST headline). The preheader states the level; other strategy kinds keep the generic wording.
 F3: a missing_stop_loss state with reason stop_kind_inconsistent gets its own action (a STOP child at or beyond the
 market), not the generic "an input is unknown" text; it is still capped at SOFT.
 """
@@ -10,6 +11,8 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 from typing import Any
+
+import pytest
 
 from src.notifications.email_html import (
     STOP_KIND_INCONSISTENT_ACTION,
@@ -44,6 +47,15 @@ def _notice(item: ItemBody) -> NoticeBody:
 
 
 # ------------------------------------------------------------------------------------------------ F2 break-even
+# Round 4 reverts round 1's "break-even only at entry": §B8 fixes no ADJUST headline, and §20 Q6 / Q1 (a) call every
+# break_even_on_risk_close target "break-even", at the entry and at the entry plus a buffer (as the single §B8
+# COMPLETE text). The preheader still states the exact level.
+def _hidden_preheader(page: str) -> str:
+    hidden = re.search(r'display:none[^>]*>([^<]*)</div>', page)
+    assert hidden is not None
+    return hidden.group(1)
+
+
 def test_proposed_equal_to_entry_keeps_break_even_wording() -> None:
     final, pre = _item(), _item(event="PRE")
     assert adjust_headline(final) == "Move stop to break-even: SYN.A long"
@@ -52,26 +64,41 @@ def test_proposed_equal_to_entry_keeps_break_even_wording() -> None:
     assert "break-even" in render_arm_html(_notice(final), theme="xtnl")
 
 
-def test_an_offset_target_beyond_entry_gets_the_generic_wording() -> None:
-    final = _item(proposed_stop=D("1.10001"))  # be_offset_r > 0 (or a target rounded toward profit)
-    pre = _item(event="PRE", proposed_stop=D("1.10001"))
+@pytest.mark.parametrize(("side", "entry", "proposed", "word"), [
+    ("BUY", D("1.1"), D("1.10000"), "long"),             # exactly the entry (Decimal compare)
+    ("BUY", D("1.1"), D("1.10001"), "long"),             # entry plus a buffer (be_offset_r > 0)
+    ("SELL", D("1.1"), D("1.09999"), "short"),           # a short's buffer is below entry
+    ("BUY", D("1.100005"), D("1.10001"), "long"),        # rounded toward profit off an off-grid entry
+    ("SELL", D("1.100005"), D("1.10000"), "short"),
+    ("BUY", None, D("1.10001"), "long"),                 # entry unknown
+    ("SELL", None, D("1.09999"), "short"),
+])
+def test_every_break_even_target_gets_the_break_even_wording(side: str, entry: Decimal | None, proposed: Decimal,
+                                                             word: str) -> None:
+    final = _item(side=side, entry=entry, proposed_stop=proposed)
+    pre = _item(event="PRE", side=side, entry=entry, proposed_stop=proposed)
+    assert adjust_headline(final) == f"Move stop to break-even: SYN.A {word}"
+    assert adjust_headline(pre) == f"Heads-up: SYN.A {word} stop would move to break-even"
+    level = format(proposed, "f")
+    for item, lead in ((final, "Move stop to break-even"), (pre, "Heads-up")):
+        pre_line = arm_preheader(_notice(item))
+        assert pre_line.startswith(lead) and "break-even" in pre_line and pre_line.endswith(f"→ {level}")
+        for theme in ("classic", "xtnl"):
+            hidden = _hidden_preheader(render_arm_html(_notice(item), theme=theme))
+            assert "break-even" in hidden and level in hidden, theme
+
+
+def test_another_strategy_kind_gets_the_generic_wording() -> None:
+    final = _item(strategy_kind="trail_atr")
+    pre = _item(event="PRE", strategy_kind="trail_atr")
     assert adjust_headline(final) == "Move stop: SYN.A long"
-    assert adjust_headline(pre) == "Heads-up: SYN.A long stop would move to 1.10001"
-    for body in (_notice(final), _notice(pre)):
-        pre_line = arm_preheader(body)
-        assert "break-even" not in pre_line and "1.10001" in pre_line
-    short = _item(side="SELL", proposed_stop=D("1.09999"))
-    assert adjust_headline(short) == "Move stop: SYN.A short"
-    page = render_arm_html(_notice(final), theme="xtnl")
-    hidden = re.search(r'display:none[^>]*>([^<]*)</div>', page)
-    assert hidden is not None and "break-even" not in hidden.group(1)
-
-
-def test_an_unknown_entry_gets_the_generic_wording() -> None:
-    assert adjust_headline(_item(entry=None)) == "Move stop: SYN.A long"
-    assert adjust_headline(_item(event="PRE", entry=None)) == "Heads-up: SYN.A long stop would move to 1.10000"
-    assert adjust_headline(_item(proposed_stop=None, event="PRE")) == (
+    assert adjust_headline(pre) == "Heads-up: SYN.A long stop would move to 1.10000"
+    assert adjust_headline(_item(event="PRE", strategy_kind="trail_atr", proposed_stop=None)) == (
         "Heads-up: SYN.A long stop would move to a new level")
+    assert adjust_headline(_item(side="SELL", strategy_kind="")) == "Move stop: SYN.A short"
+    for item in (final, pre):
+        pre_line = arm_preheader(_notice(item))
+        assert "break-even" not in pre_line and pre_line.endswith("→ 1.10000")
 
 
 # ------------------------------------------------------------------------------------- F3 stop_kind_inconsistent
