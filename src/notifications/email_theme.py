@@ -258,7 +258,8 @@ def levels_rows(heading: str, levels: Sequence[Level], accent: str, note: str = 
             price = (f'<div style="font:{"800" if x.key else "700"} 17px/1.35 {MONO};color:{INK0};">'
                      f'{t(x.price, ID_LIMIT)}</div>')
             if x.distance is None:
-                dist = f'<div style="font:12px/1.4 {SANS};color:{INK1};">{"reference" if n == 0 else ""}</div>'
+                ref = "reference" if n == 0 and x.label == "Entry" else ""    # the entry, not a lone stop
+                dist = f'<div style="font:12px/1.4 {SANS};color:{INK1};">{ref}</div>'
             else:
                 pips, where, word = x.distance
                 dist = (f'<div style="font:700 14px/1.3 {MONO};color:{INK0};white-space:nowrap;">{pips} '

@@ -3,12 +3,16 @@ by the ARM relay at send time from the structured `NoticeBody` on the shared tem
 `src.notifications.email_html`.
 
 **The SL advice block** (an `ADJUST` item): status (PROVISIONAL heads-up at PRE, FINAL "move stop" after the bar
-closes, LATE / CORRECTED tags), symbol and side, position, the pinned entry (with Q13 `show_levels`, as the text),
-the current stop the handles held when read (`ItemBody.stop_now`, "not recorded" when absent), the proposed new
-stop, the bar it was decided on, the "move only if your stop is still worse" rule line and what to do.
+closes, LATE / CORRECTED tags), symbol and side, position, the pinned entry and the current stop the handles held
+when read (`ItemBody.stop_now`, "not recorded" when absent), both levels only with Q13 `show_levels` (§B8 "entry and
+current stop only if Q13"; the built default is "proposed stop and R only"; the read time and the handle ids are
+always shown), the proposed new stop, the bar it was decided on, the "move only if your stop is still worse" rule line
+and what to do.
 
-**Content:** order-state levels (entry, current stop, proposed stop), ids, codes, R values and times only. Favour R
-and favour / risk are never computed or shown here, whatever the text part carries (F2).
+**Content:** order-state levels (entry and current stop with `show_levels`, proposed stop), ids, codes, R values and
+times only. Favour R and favour / risk are never computed or shown here, whatever the text part carries (F2). Never a
+price increment or pip size, and no move size between two stops (`riskmgr.md` §5); the xtnl page may show each stop's
+distance from the entry in pips (owner decision 2026-11-21).
 """
 from __future__ import annotations
 
@@ -188,12 +192,15 @@ def adjust_headline(item: ItemBody) -> str:
     return f"Move stop to break-even: {sym} {side}" if be else f"Move stop: {sym} {side}"
 
 
-def _current_stop(item: ItemBody) -> str:
+def _current_stop(item: ItemBody, show_levels: bool) -> str:
+    """The "Current stop" field: its level only with Q13 `show_levels` (§B8 "entry and current stop only if Q13");
+    the stop's read time and the handle ids always (§B8 allow-list)."""
     level = _dec(item.stop_now)
-    parts = [level if level is not None else "not recorded"]
-    if item.stop_read_at_ms is not None:
-        parts.append(f"as read {_arm_clock(item.stop_read_at_ms)}")
-    text = " ".join(parts)
+    read = f"as read {_arm_clock(item.stop_read_at_ms)}" if item.stop_read_at_ms is not None else ""
+    if show_levels:
+        text = " ".join(p for p in ("not recorded" if level is None else level, read) if p)
+    else:
+        text = " · ".join(p for p in ("not shown (show_levels off)", read) if p)
     if item.handles:
         text += " · handles " + ", ".join(_id(h) for h in item.handles)
     return text
@@ -218,9 +225,9 @@ def _adjust_strip(item: ItemBody, token: str, visuals: bool) -> tuple[str, str |
 
 def _adjust_card(item: ItemBody, bar_spec: str, route: str, settings: RenderSettings, *,
                  head: bool = True, visuals: bool = True) -> tuple[str, str]:
-    """The SL advice block (§5): status, identity, entry, current stop, proposed stop, the still-worse rule and what
-    to do; with `visuals`, the advice stepper, the time strip and the ordinal stop ladder (V5, V7, V4). Returns (card
-    html, its token)."""
+    """The SL advice block (§5): status, identity, entry and current stop (their levels only with Q13 `show_levels`),
+    proposed stop, the still-worse rule and what to do; with `visuals`, the advice stepper, the time strip and the
+    ordinal stop ladder (V5, V7, V4; the ladder only with `show_levels`). Returns (card html, its token)."""
     pre = item.event == "PRE"
     token = "PROVISIONAL" if pre else "FINAL"
     badges = [("HEADS-UP" if pre else "MOVE STOP", token), *_event_tags(item)]
@@ -232,7 +239,7 @@ def _adjust_card(item: ItemBody, bar_spec: str, route: str, settings: RenderSett
         fields.append(Field("Entry", _dec(item.entry) or "not recorded", mono=True))
     else:
         fields.append(Field("Entry", "not shown (show_levels off)"))
-    fields.append(Field("Current stop", _current_stop(item)))
+    fields.append(Field("Current stop", _current_stop(item, settings.show_levels)))
     fields.append(Field("Proposed new stop", proposed, big=True))
     fields.append(_bar_field(item, bar_spec))
     fields.append(Field("Provisional / final",
@@ -402,9 +409,11 @@ def _tighter(item: ItemBody) -> bool | None:
 
 
 def _xtnl_levels(item: ItemBody, settings: RenderSettings, unit: object, accent: str) -> str:
-    """The themed levels block of an ADJUST item: entry (Q13 `show_levels` only), current stop, proposed stop, each
-    stop's distance from the entry in pips when the entry is shown and the instrument's pip unit is known (owner
-    decision 2026-11-21); with the entry hidden, only the size of the move. The pip unit itself is never shown."""
+    """The themed levels block of an ADJUST item: the entry and the current stop (Q13 `show_levels` only: §B8 "entry
+    and current stop only if Q13"), the proposed stop, and each stop's distance from the entry in pips when the entry
+    is shown and the instrument's pip unit is known (owner decision 2026-11-21). The note gives only the move's
+    direction (tighter / looser), never its size: `riskmgr.md` §5 allows a stop's distance from the entry only, and a
+    one-increment move would print the increment. The pip unit itself is never shown."""
     from src.notifications import email_theme as th
     pip = unit if isinstance(unit, th.PipUnit) else None
     entry = item.entry if settings.show_levels else None
@@ -418,17 +427,16 @@ def _xtnl_levels(item: ItemBody, settings: RenderSettings, unit: object, accent:
     levels: list[th.Level] = []
     if entry is not None:
         levels.append(th.Level("Entry", _dec(entry)))
-    levels.append(th.Level("Stop now", _dec(item.stop_now) or "not recorded", dist(item.stop_now)))
-    if item.proposed_stop is not None:
-        levels.append(th.Level("Proposed stop", _dec(item.proposed_stop), dist(item.proposed_stop), key=True))
-    note = ""
+    if settings.show_levels:
+        levels.append(th.Level("Stop now", _dec(item.stop_now) or "not recorded", dist(item.stop_now)))
+    proposed = _dec(item.proposed_stop)
+    if proposed is not None or not levels:
+        # with show_levels off and no proposed level, the block still carries the note (§B6.5 bar-0 label)
+        levels.append(th.Level("Proposed stop", proposed or "not recorded", dist(item.proposed_stop), key=True))
     tighter = _tighter(item)
-    if pip is not None and item.proposed_stop is not None and item.stop_now is not None:
-        move = abs((item.proposed_stop - item.stop_now) / pip.size).quantize(Decimal("0.1"))
-        how = "" if tighter is None else (" tighter" if tighter else " looser")
-        note = f"Moves the stop {move} {pip.word}{how}."
+    note = "" if tighter is None else f"Moves the stop {'tighter' if tighter else 'looser'}."
     if not settings.show_levels:
-        note = (note + " The entry is not shown (show_levels off).").strip()
+        note = (note + " The entry and the current stop are not shown (show_levels off).").strip()
     if item.event == "PRE" and FIRST_BAR_CONDITIONAL in item.caveats:
         # §B6.5 / §B8: a bar-0 PRE that proposes a move is shown only with its conditional label, first
         note = f"{pre_label(bool(item.trigger_met))}. {note}".strip()

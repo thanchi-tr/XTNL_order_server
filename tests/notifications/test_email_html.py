@@ -520,7 +520,9 @@ def test_an_older_body_without_stop_now_decodes_and_reads_not_recorded() -> None
     assert '"stop_now"' not in raw          # additive: absent when unknown, so older bodies keep their exact text
     back = decode_body(raw)
     assert back.items[0].stop_now is None
-    assert "Current stop not recorded as read" in visible(render_arm_html(back))
+    assert "Current stop not recorded as read" in visible(render_arm_html(back, settings=RenderSettings(show_levels=True)))
+    # Q13 / §B8: without show_levels no current stop level is shown, recorded or not (the read time stays)
+    assert "Current stop not shown (show_levels off) · as read" in visible(render_arm_html(back))
     with_level = encode_body(notice(adjust()))
     assert json.loads(with_level)["items"][0]["stop_now"] == "1.21456"
     assert decode_body(with_level).items[0].stop_now == D("1.21456") and "stop_now" in ITEM_KEYS
@@ -685,7 +687,7 @@ ARM_EXPECTED: dict[str, set[str]] = {
     "arm.pre_adjust (bar-0 heads-up)": {"advice-steps", "side", "time-strip", "stop-ladder"},
     "arm.pre_adjust (valid until before bar end)": {"advice-steps", "side", "time-strip", "stop-ladder"},
     "arm.post_adjust (final advice)": {"advice-steps", "stop-ladder", "side"},
-    "arm.post_adjust (show_levels off)": {"advice-steps", "stop-ladder", "side"},
+    "arm.post_adjust (show_levels off)": {"advice-steps", "side"},     # Q13 / §B8: no current stop level, no ladder
     "arm.post_adjust (older body, no stop_now)": {"advice-steps", "side"},
     "arm.post_adjust (short side)": {"advice-steps", "stop-ladder", "side"},
     "arm.post_adjust (entry outside the path)": {"advice-steps", "stop-ladder", "side"},
@@ -754,7 +756,8 @@ def test_t2_the_stop_ladder_is_left_out_when_a_level_is_missing_or_not_finite() 
     assert "xv-stop-ladder" not in _arm_page(adjust(stop_now=None))
     assert "xv-stop-ladder" not in _arm_page(adjust(stop_now=D("NaN")))
     assert "xv-stop-ladder" not in _arm_page(adjust(entry=D("Infinity")))
-    assert "xv-stop-ladder" in _arm_page(adjust(entry=D("Infinity")), show=False)   # entry not shown, not read
+    # Q13 / §B8: without show_levels the card shows no current stop level, so the ladder is left out
+    assert "xv-stop-ladder" not in _arm_page(adjust(), show=False)
 
 
 def test_t2_rule_and_halt_ladders_degrade() -> None:
@@ -858,8 +861,8 @@ def geometry(page: str) -> list[str]:
 
 
 def test_t4_the_stop_ladder_is_ordinal_the_gap_never_shapes_it() -> None:
-    near = _arm_page(adjust(stop_now=D("1.08010"), proposed_stop=D("1.08420"), strategy_kind="k"), show=False)
-    far = _arm_page(adjust(stop_now=D("1.00010"), proposed_stop=D("1.98420"), strategy_kind="k"), show=False)
+    near = _arm_page(adjust(stop_now=D("1.08010"), proposed_stop=D("1.08420"), strategy_kind="k", entry=None))
+    far = _arm_page(adjust(stop_now=D("1.00010"), proposed_stop=D("1.98420"), strategy_kind="k", entry=None))
     assert "xv-stop-ladder" in near and "xv-stop-ladder" in far
     assert near.replace("1.08010", "LVL").replace("1.08420", "LVL") == far.replace("1.00010", "LVL").replace(
         "1.98420", "LVL")
@@ -867,10 +870,10 @@ def test_t4_the_stop_ladder_is_ordinal_the_gap_never_shapes_it() -> None:
 
 
 def test_t4_rungs_follow_price_order_not_the_side() -> None:
-    rungs = _texts(_part(_arm_page(adjust(strategy_kind="k"), show=False), "stop-ladder"))
+    rungs = _texts(_part(_arm_page(adjust(strategy_kind="k", entry=None)), "stop-ladder"))
     assert rungs.index("PROPOSED STOP") < rungs.index("CURRENT STOP") and "▲ above current stop" in rungs
-    short = _arm_page(adjust(side="SELL", stop_now=D("1.27410"), proposed_stop=D("1.27000"), strategy_kind="k"),
-                      show=False)
+    short = _arm_page(adjust(side="SELL", stop_now=D("1.27410"), proposed_stop=D("1.27000"), strategy_kind="k",
+                             entry=None))
     rungs = _texts(_part(short, "stop-ladder"))
     assert rungs.index("CURRENT STOP") < rungs.index("PROPOSED STOP") and "▼ below current stop" in rungs
     assert any("short" in r and "not to scale" in r for r in rungs)
@@ -878,7 +881,7 @@ def test_t4_rungs_follow_price_order_not_the_side() -> None:
 
 def test_t4_entry_only_with_show_levels_and_every_ladder_level_is_in_the_fields() -> None:
     off = _arm_page(adjust(entry=D("1.11111"), proposed_stop=D("1.22222")), show=False)
-    assert "1.11111" not in off and "ENTRY" not in _part(off, "stop-ladder")
+    assert "1.11111" not in off and "1.21456" not in off and "xv-stop-ladder" not in off
     on = _arm_page(adjust(entry=D("1.11111"), proposed_stop=D("1.22222")), show=True)
     rungs = _texts(_part(on, "stop-ladder"))
     assert "ENTRY" in rungs and "1.11111" in rungs
@@ -893,7 +896,7 @@ def test_t4_entry_only_with_show_levels_and_every_ladder_level_is_in_the_fields(
 def test_t4_break_even_and_equal_levels_share_a_rung() -> None:
     rungs = _texts(_part(_arm_page(adjust(), show=True), "stop-ladder"))
     assert "PROPOSED STOP = ENTRY (break-even)" in rungs and "▲ above current stop" in rungs
-    same = _texts(_part(_arm_page(adjust(stop_now=D("1.23456")), show=False), "stop-ladder"))
+    same = _texts(_part(_arm_page(adjust(stop_now=D("1.23456"), entry=None)), "stop-ladder"))
     assert "PROPOSED STOP = CURRENT STOP" in same and "same level" in same
 
 

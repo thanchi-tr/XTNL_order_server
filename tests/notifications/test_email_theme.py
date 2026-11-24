@@ -164,7 +164,8 @@ def test_arm_levels_show_pips_from_the_entry() -> None:
     assert _word(page) == "ACT"
     assert "1.27140" in page and "1.26800" in page and "1.27020" in page
     assert "34.0 pips" in page and "12.0 pips" in page and "below entry" in page
-    assert "Moves the stop 22.0 pips tighter." in page
+    # riskmgr.md §5: only each stop's distance from the entry; the move is named by its direction, never its size
+    assert "Moves the stop tighter." in page and "22.0" not in page
     assert "0.0001" not in page
 
 
@@ -176,7 +177,8 @@ def test_arm_levels_without_a_unit_or_entry() -> None:
                              pip_units={("demo-broker", "SYN.EURX"): FX})
     assert "1.27140" not in hidden                      # Q13: the entry stays hidden
     assert "below entry" not in hidden                  # no distance from a hidden entry
-    assert "Moves the stop 22.0 pips tighter." in hidden
+    assert "1.26800" not in hidden                      # Q13 / §B8: nor the current stop
+    assert "Moves the stop tighter." in hidden and "22.0" not in hidden
     assert "show_levels off" in hidden
 
 

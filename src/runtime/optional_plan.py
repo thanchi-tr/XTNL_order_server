@@ -35,7 +35,9 @@ the term into supervised tasks and non-blocking request handlers:
   `PgTrackerSnapshot`, the SM10 `CalendarGrid`, the installer as `AcceptedConfigPort`) with the handlers
   `arm_disarm` / `arm_repin` / `arm_rearm` (enqueued, answered by the tracker); the BarClock inside the `arm` loop
   (every 250 ms, once the open FAILED episodes are read and while no ARM-global FAILED holds) over the S21 join
-  (`src/riskmgr/evaluation.py`, `PipelineEvaluator`), with the installer's `pause_reason` as its config pause; the
+  (`src/riskmgr/evaluation.py`, `PipelineEvaluator`, behind the §B6.3 REOPEN clean-spread retry of
+  `src/runtime/reopen_spread.py` over the session's installed clean-spread hook), with the installer's
+  `pause_reason` as its config pause; the
   notices (`ArmNotices`): the notice sink in the sink chain (`LateNoticeSink`, bound when the graph is built), the
   timer pass every 5 s in the `arm` loop (suppressed while paused), `FAILED_CLEARED`, the tracker's extras and the
   TEST notice of `arm notify-test`. The job runner's STRATEGY_VERSION signals and the stuck-frontier views feed the
@@ -136,6 +138,7 @@ from src.runtime.md_ports import StampPortImpl
 from src.runtime.optional import OptionalPlan, OptionalServices
 from src.runtime.optional_settings import resolved_environ
 from src.runtime.ports import OperatorRequest
+from src.runtime.reopen_spread import ReopenSpreadGate
 from src.runtime.request_handlers import Accepted, Applied, HandlerResult, Moot, Refused, RequestHandler, RequestResult
 from src.runtime.session import EngineSession
 from src.runtime.sleeplog import SleepAwareRestarts
@@ -497,6 +500,8 @@ class ArmGraph:
     tracker: ArmTracker | None = None
     clock: BarClock | None = None
     evaluator: PipelineEvaluator | None = None
+    reopen_spread: ReopenSpreadGate | None = None
+    """The BarClock's evaluation port: `evaluator` with the §B6.3 REOPEN clean-spread retry."""
     grid: CalendarGrid | None = None
     started: bool = False
     tick_errors: int = 0
@@ -826,10 +831,15 @@ class OptionalRuntime:
                                       held=lambda row: failed.scopes.covers_row(row, tracker.series_of(row)),
                                       no_trade=lambda series, bucket: _no_trade(md.bars, series, bucket),
                                       verified=md.bars.verified)
+        # §B6.3 REOPEN (live review round 5): an exit spread not clean by the existing rule (the session's installed
+        # `marks.clean_spread_pips`, the committer's and orchestrator's hook; the point size read at call time) is
+        # retryable; the threshold and the point size stay in src/runtime (never logged or shown)
+        reopen_gate = ReopenSpreadGate(evaluator, md=md.port, clean_spread=s.clean_spread,
+                                       point_sizes=PgPointSizes(engine_db), fatal=is_lost_fence)
         stop_reads = StopReads(arm.stop_reads, TrackerBook(tracker), enabled=settings.stop_reads,
                                pre_offset_s=settings.pre_offset_s)
         barclock = BarClock(store=store, controls=PgArmConfigStore(arm.db), md=md.port, grid=grid,
-                            evaluator=evaluator, jobs=jobs, pager=svc.pager, clock=clock, settings=settings,
+                            evaluator=reopen_gate, jobs=jobs, pager=svc.pager, clock=clock, settings=settings,
                             lease_valid=s.ctx.lease.lease_valid, stop_reads=stop_reads, sinks=arm.sinks,
                             closes=grid, notices=notices, fatal=is_lost_fence,
                             config_pause=None if config is None else config.pause_reason,
@@ -852,7 +862,8 @@ class OptionalRuntime:
         md.global_failed.bind(lambda: failed.summary().global_failed)
         self.graph = ArmGraph(arm=arm, engine_db=engine_db, budget=budget, failed=failed, relay=relay,
                               controls_store=PgArmConfigStore(arm.db), config=config, jobs=jobs, notices=notices,
-                              tracker=tracker, clock=barclock, evaluator=evaluator, grid=grid,
+                              tracker=tracker, clock=barclock, evaluator=evaluator, reopen_spread=reopen_gate,
+                              grid=grid,
                               flush_errors_seen=md.writer.counters.flush_errors)
         return self.graph
 

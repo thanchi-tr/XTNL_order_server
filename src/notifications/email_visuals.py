@@ -5,9 +5,9 @@ Pure HTML helpers used by `src.notifications.email_html` (layouts L1 to L4) and 
 * V1 `hero_row`: a glyph tile beside the badges and the headline.
 * V2 / V3 `rule_ladder` / `halt_ladder` (both on `level_ladder`): the rule level PASS · FLAG · SOFT · HARD and the
   halt level NONE · SOFT · HARD, the current level marked.
-* V4 `stop_ladder`: the order-state stop levels a card already shows (proposed stop, current stop, entry with
-  `show_levels`) as rungs in price order, **ordinal**: fixed spacing, labelled "not to scale". Only `<`, `>` and
-  `==` are used on the levels; no distance is computed or drawn.
+* V4 `stop_ladder`: the order-state stop levels a card already shows (proposed stop, current stop, entry; only with
+  `show_levels`, since the card shows no current stop level without it) as rungs in price order, **ordinal**: fixed
+  spacing, labelled "not to scale". Only `<`, `>` and `==` are used on the levels; no distance is computed or drawn.
 * V5 `advice_steps`: Heads-up -> Final advice (-> Released) with the current step.
 * V6 `count_tiles`, V7 `time_strip` (two ordered times, fixed height), V8 `side_chip` (neutral LONG / SHORT),
   V9 `step_list` + `command_chip`, V10 `summary_chips`.
@@ -274,14 +274,15 @@ def _clock_or_none(ms: int) -> str | None:
 
 
 def stop_ladder(item: LadderItem, settings: LevelSettings, token: str, pre: bool) -> str:
-    """V4: proposed stop, current stop and (with `show_levels`) entry as rungs in price order, higher at top, with
-    fixed 12 px spacing (ordinal, not to scale). Equal levels share a rung. Left out when a level is missing or not
-    finite."""
+    """V4: proposed stop, current stop and entry as rungs in price order, higher at top, with fixed 12 px spacing
+    (ordinal, not to scale). Equal levels share a rung. Only with `show_levels` (Q13; §B8 "entry and current stop
+    only if Q13"): without it the card shows no current stop level, so the ladder is left out. Also left out when a
+    level is missing or not finite."""
     proposed, current = item.proposed_stop, item.stop_now
-    if proposed is None or current is None:
+    if not settings.show_levels or proposed is None or current is None:
         return ""
     roles: list[tuple[str, Decimal]] = [("P", proposed), ("C", current)]
-    if settings.show_levels and item.entry is not None:
+    if item.entry is not None:
         roles.append(("E", item.entry))
     if not all(isinstance(v, Decimal) and v.is_finite() for _, v in roles):
         return ""
