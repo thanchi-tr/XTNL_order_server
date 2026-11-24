@@ -88,6 +88,9 @@ class ToyStrategy:
     def loosen_policy(self, params: StrategyParams) -> LoosenPolicy:
         return LoosenPolicy.TELL_ONLY
 
+    def target_is_entry(self, params: StrategyParams) -> bool:
+        return True
+
     def latch(self, params: StrategyParams) -> bool:
         return False
 

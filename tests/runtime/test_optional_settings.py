@@ -71,8 +71,17 @@ def test_problems_never_carry_a_secret() -> None:
 def test_arm_channels_both_required() -> None:
     both = {"XTNL_ARM_SMTP_HOST": "smtp.example.test", "XTNL_ARM_SMTP_FROM": "arm@example.test",
             "XTNL_ARM_ALERT_EMAIL_TO": "ops@example.test", "XTNL_ARM_PUSH_PROVIDER": "ntfy",
-            "XTNL_ARM_PUSH_URL": "https://ntfy.example.test/arm"}
+            "XTNL_ARM_PUSH_URL": "https://ntfy.example.test/arm", "XTNL_ARM_PUSH_TOKEN": "tok-secret-1"}
     assert arm_channel_problems(both) == []
+    # design PR4: ntfy with a token, or Pushover; a token-less ntfy topic is one push problem, named, no value
+    no_token = {k: v for k, v in both.items() if k != "XTNL_ARM_PUSH_TOKEN"}
+    got = arm_channel_problems(no_token)
+    assert len(got) == 1 and "push" in got[0] and "XTNL_ARM_PUSH_TOKEN" in got[0]
+    assert "ntfy.example.test" not in got[0] and "/arm" not in got[0]
+    pushover = {**no_token, "XTNL_ARM_PUSH_PROVIDER": "pushover", "XTNL_ARM_PUSH_URL": "",
+                "XTNL_ARM_PUSH_TOKEN": "tok-secret-1", "XTNL_ARM_PUSH_USER": "user-1"}
+    assert arm_channel_problems(pushover) == []
+    assert not any("tok-secret-1" in p for p in arm_channel_problems({**both, "XTNL_ARM_SMTP_HOST": ""}))
     no_push = {k: v for k, v in both.items() if "PUSH" not in k}
     assert [("push" in p) for p in arm_channel_problems(no_push)] == [True]
     assert len(arm_channel_problems({})) == 2

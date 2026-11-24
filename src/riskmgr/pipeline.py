@@ -90,6 +90,7 @@ from src.riskmgr.outcomes import (
     Category,
     Outcome,
     OutcomeCode,
+    guard_pending_reason,
 )
 from src.riskmgr.registry import REGISTRY, ArmRegistry
 from src.riskmgr.sm11 import ArmState, Sm11Event
@@ -152,7 +153,7 @@ PRE_BASIS_HELD: Final = "pre_basis_held"
 
 def pending_reason(guard_kind: str) -> str:
     """`DATA_UNAVAILABLE(<kind>_pending)` while a guard is PENDING (FirstBarGuard: `first_bar_pending`, §B6.5)."""
-    return f"{guard_kind}_pending"
+    return guard_pending_reason(guard_kind)
 
 
 class ResultKind(str, Enum):
@@ -272,10 +273,12 @@ class EnvelopeOutcome:
 
 
 def round_toward_profit(level: Decimal, increment: Decimal, sig: int) -> Decimal:
-    """Step (9): onto the increment grid, toward profit (up for a long, down for a short)."""
+    """Step (9): onto the increment grid, toward profit (up for a long, down for a short). The result is stated at
+    the increment's exponent (`1.2000` for 0.0001, never `1.2`), so every ADJUST level (POST, PRE, LATE, REOPEN,
+    CORRECTED) is written in one form whatever form its input had (a REOPEN reuses a stored, normalised target)."""
     c = ENVELOPE_CONTEXT
     steps = c.divide(level, increment).to_integral_value(rounding=ROUND_CEILING if sig > 0 else ROUND_FLOOR)
-    return c.multiply(steps, increment)
+    return c.multiply(steps, increment).quantize(increment, context=c)
 
 
 def apply_envelope(ctx: BarContext, evaluation: Evaluation, *, quote: Quote | None, quote_live: bool,
@@ -489,17 +492,14 @@ def answers_final_advice(inp: PipelineInput) -> bool:
     """Round 14 (plan S38g): the stop at bar end answers an outstanding final `ADJUST`, so this bar's PRE levels do
     not apply. True when the position is ADVICE_OUTSTANDING with a final advice target, this bar's PRE proposed a
     move, `S_at_T` is nearer entry than that PRE's `S_pre` (the stop moved after the PRE) and not past the target
-    (`S_at_T` at or short of it: a move beyond the advised target is not covered by the advice). A target on the loss
-    side of the current E never counts (live review): kind (a) advises break-even or beyond, so such a target was
-    advised under an E since re-pinned (partial fill, entry correction) and a move to it answers nothing current; the
-    bar then keeps its PRE levels (the conservative basis)."""
+    (`S_at_T` at or short of it: a move beyond the advised target is not covered by the advice). §B6.4 round 14 has
+    no exception for the target's position relative to the current E: SM11 has no re-pin edge, so advice outstanding
+    through an E / S0 re-pin still counts (live review round 2)."""
     pre, target, s_at_t = inp.this_bar_pre, inp.final_advice_target, inp.stop_at_t
     if (pre is None or target is None or inp.arm_state is not ArmState.ADVICE_OUTSTANDING
             or not isinstance(s_at_t, StopAtT)):
         return False
     side, entry = inp.ctx.side, inp.ctx.entry
-    if farther_from_entry(side, entry, target, entry):
-        return False
     return (farther_from_entry(side, entry, pre.s_pre, s_at_t.level)
             and not farther_from_entry(side, entry, target, s_at_t.level))
 

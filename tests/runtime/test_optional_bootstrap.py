@@ -76,7 +76,8 @@ GOLIVE_ACCEPT_ALL = {golive.ACCEPT_VAR: ",".join(g.gate_id for g in golive.GATES
 `test_open_go_live_gates_leave_the_arm_idle_with_one_page`)."""
 ARM_CHANNELS = {"XTNL_ARM_SMTP_HOST": "smtp.example.test", "XTNL_ARM_SMTP_FROM": "arm@example.test",
                 "XTNL_ARM_ALERT_EMAIL_TO": "ops@example.test", "XTNL_ARM_PUSH_PROVIDER": "ntfy",
-                "XTNL_ARM_PUSH_URL": "https://ntfy.example.test/arm-test", **GOLIVE_ACCEPT_ALL}
+                "XTNL_ARM_PUSH_URL": "https://ntfy.example.test/arm-test", "XTNL_ARM_PUSH_TOKEN": "t-arm",
+                **GOLIVE_ACCEPT_ALL}   # design PR4: ntfy with a token
 
 
 async def run_id(_: Any) -> str:

@@ -95,11 +95,13 @@ from src.runtime.optional_settings import (
     arm_channel_problems,
     check_tick_symbols,
     parse_optional_settings,
+    resolved_environ,
 )
 from src.runtime.pg_ports import GuardedEngineDb, LazyPgSource
 from src.runtime.request_handlers import RequestHandler
 from src.runtime.session import OPTIONAL_BOOTSTRAP_TASK, EngineSession
 from src.runtime.supervisor import TaskContext, TaskSpec
+from src.secrets.source import SecretsSource
 
 if TYPE_CHECKING:
     from src.adapters.base import BrokerAdapter
@@ -258,6 +260,13 @@ class OptionalDeps:
     retry_base_s: float = ARM_RETRY_BASE_S
     retry_max_s: float = ARM_RETRY_MAX_S
     park_stamp_s: float = PARK_STAMP_S
+    #: The engine's secrets source (operations.md §13): on AWS the `XTNL_MD_*` / `XTNL_ARM_*` secrets are read from it,
+    #: laid over `environ` (`resolved_environ`). None or the env source: `environ` as is.
+    secrets: SecretsSource | None = field(default=None, repr=False)
+
+    def resolved_environ(self) -> Mapping[str, str]:
+        """`environ` with the secrets source's cached secret laid over it (never blocks)."""
+        return resolved_environ(self.secrets, self.environ)
 
 
 class Parked(Exception):
@@ -332,7 +341,7 @@ class OptionalBootstrapRunner:
         if s.stopping:
             return
         if self.settings is None:
-            parsed = parse_optional_settings(self.deps.environ, s.ctx.optional_flags, s.adapter_ids)
+            parsed = parse_optional_settings(self.deps.resolved_environ(), s.ctx.optional_flags, s.adapter_ids)
             if isinstance(parsed, list):
                 self._park("settings", "optional services settings", "; ".join(parsed)[:1500])
                 return
@@ -366,7 +375,8 @@ class OptionalBootstrapRunner:
             gates = golive_verdict(self.deps.environ, stop_rule_in_force=stop_at_entry())
             if gates.problems:
                 self._page_once("golive_setting", "high", "ARM go-live setting", "; ".join(gates.problems)[:1500])
-            problems = arm_channel_problems(self.deps.environ)
+            # the ARM channel credentials come from the secrets source on AWS (operations.md §13)
+            problems = arm_channel_problems(self.deps.resolved_environ())
             if not gates.allowed:
                 # S38e: go-live gates open and not accepted: the ARM stays idle for the term (md keeps running)
                 self.arm_idle_reason = "golive_gates"

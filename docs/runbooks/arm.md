@@ -74,7 +74,9 @@ Go to "FAILED: find the cause, run the first command, clear" below.
   /etc/xtnl/engine.env` exits 0 (PC: `$OPS arm gates` in a new shell, which reads the Windows User environment).
 * Secrets (design §C2, never printed): `XTNL_ARM_CONFIG_DSN` (Supabase reader), the ARM channel credentials
   `XTNL_ARM_SMTP_USERNAME`, `XTNL_ARM_SMTP_PASSWORD` or `XTNL_ARM_SES_*`, `XTNL_ARM_PUSH_TOKEN`, `XTNL_ARM_PUSH_USER`
-  (a separate account from Oversee's channels). AWS: the Secrets Manager secret. PC: the Windows User environment.
+  (a separate account from Oversee's channels; design PR4: ntfy with a token, or Pushover, so an ntfy push without
+  `XTNL_ARM_PUSH_TOKEN` leaves the ARM idle with "ARM not started"). AWS: the Secrets Manager secret. PC: the Windows
+  User environment.
 * The Supabase project provisioned (`deploy/supabase/arm_schema.sql`, self-check) and a document accepted locally.
 
 ```

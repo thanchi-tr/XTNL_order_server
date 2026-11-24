@@ -115,6 +115,7 @@ from src.riskmgr.render import (
 )
 from src.riskmgr.sinks import NOTICE_SINK, Written
 from src.riskmgr.sm11 import MANAGED, ArmState
+from src.riskmgr.strategy import SlStrategy, StrategyParams
 from src.riskmgr.tracker import AcceptedConfigPort, BarGridPort, NoticeKind, TrackerNotice
 from src.riskmgr.types import ArmEvent
 
@@ -313,12 +314,12 @@ class _Info:
     s0: Decimal | None = field(default=None, repr=False)
     loosen_policy: str | None = None
     """The pinned Q10 policy (`REARM` | `TELL_ONLY`) the position's strategy returns for its pinned params."""
+    target_is_entry: bool | None = None
+    """The pinned strategy targets the entry itself (`SlStrategy.target_is_entry`, Q6); None when unknown."""
 
 
-def pinned_loosen_policy(registry: ArmRegistry, row: ArmPositionRow) -> str | None:
-    """The position's **pinned** Q10 policy (`SlStrategy.loosen_policy` of its stored pin, round 13): a strategy
-    parameter pinned per position, never a node-global setting. None when the pin cannot be loaded here (the
-    release text then says "told only", the safe statement)."""
+def _pinned(registry: ArmRegistry, row: ArmPositionRow) -> tuple[SlStrategy, StrategyParams] | None:
+    """The position's pinned strategy and params, or None when the pin cannot be loaded here."""
     strategy = registry.strategy(row.strategy_kind, row.strategy_impl_version)
     if strategy is None:
         return None
@@ -329,12 +330,41 @@ def pinned_loosen_policy(registry: ArmRegistry, row: ArmPositionRow) -> str | No
             return None
         params = registry.parse_params(row.strategy_kind, row.strategy_impl_version, {**raw, "guards": guards},
                                        new_pin=False)
-        return strategy.loosen_policy(params).value
     except (ValueError, TypeError, ParamError):
         return None
+    except Exception:  # a strategy's own parser: never let it break a notice
+        log.warning("arm notices: the pin of %s did not load", position_ref(row.key.adapter_id, row.key.position_id))
+        return None
+    return strategy, params
+
+
+def pinned_loosen_policy(registry: ArmRegistry, row: ArmPositionRow) -> str | None:
+    """The position's **pinned** Q10 policy (`SlStrategy.loosen_policy` of its stored pin, round 13): a strategy
+    parameter pinned per position, never a node-global setting. None when the pin cannot be loaded here (the
+    release text then says "told only", the safe statement)."""
+    pin = _pinned(registry, row)
+    if pin is None:
+        return None
+    try:
+        return pin[0].loosen_policy(pin[1]).value
     except Exception:  # a strategy's own code: never let it break a notice
         log.warning("arm notices: loosen_policy raised for %s", position_ref(row.key.adapter_id,
                                                                             row.key.position_id))
+        return None
+
+
+def pinned_target_is_entry(registry: ArmRegistry, row: ArmPositionRow) -> bool | None:
+    """Whether the position's **pinned** strategy targets the entry itself (`SlStrategy.target_is_entry`, §20 Q6),
+    for the `COMPLETE` text (§B8: "break-even" only then). None when the pin cannot be loaded here (the release text
+    then names "the target", which is never false)."""
+    pin = _pinned(registry, row)
+    if pin is None:
+        return None
+    try:
+        return bool(pin[0].target_is_entry(pin[1]))
+    except Exception:  # a strategy's own code: never let it break a notice
+        log.warning("arm notices: target_is_entry raised for %s", position_ref(row.key.adapter_id,
+                                                                              row.key.position_id))
         return None
 
 
@@ -504,7 +534,8 @@ class ArmNotices:
     def learn(self, row: ArmPositionRow) -> None:
         """Remember a position's route, symbol, side and pinned levels (the decision rows carry none of them)."""
         self._info[row.key] = _Info(row.account_id, row.symbol, row.side, row.entry_level, row.s0_level,
-                                    pinned_loosen_policy(self._registry, row))
+                                    pinned_loosen_policy(self._registry, row),
+                                    pinned_target_is_entry(self._registry, row))
         route = self._routes.route_of(row.key.adapter_id, row.account_id)
         self._members.setdefault(route, set()).add((row.key.adapter_id, row.account_id))
 
@@ -911,7 +942,9 @@ class ArmNotices:
             s0=info.s0 if info is not None and trig is not None else None, supersedes=d.supersedes_decision_id,
             decided_at_ms=d.decided_at_ms, strategy_kind=d.strategy_kind,
             strategy_impl_version=d.strategy_impl_version, valid_until_ms=valid_until,
-            loosen_policy=info.loosen_policy if info is not None and d.outcome == Outcome.COMPLETE.value else None)
+            loosen_policy=info.loosen_policy if info is not None and d.outcome == Outcome.COMPLETE.value else None,
+            release_at_entry=info.target_is_entry if info is not None and d.outcome == Outcome.COMPLETE.value
+            else None)
 
     def _failed_lines(self) -> tuple[FailedLine, ...]:
         if self._failed is None:
@@ -1107,6 +1140,6 @@ __all__ = [
     "ALIVE", "AcceptedPolicies", "ArmNotices", "BAR_EVENTS", "END_PART", "FAILED_CLEARED", "FOLDS",
     "FailedLinesPort", "GLOBAL_ROUTE", "IMMEDIATE_OUTCOMES", "ITEM_EVENTS", "LAST_PART", "MD_RESET",
     "NoticeCounters", "NoticeMeta", "NoticeOutboxPort", "NoticeSettings", "NoticeSink", "OutboxNotice", "RouteBook",
-    "RoutePolicyPort", "TASK", "TEST", "expires_at_ms", "held_stop_level", "item_key_of", "pinned_loosen_policy",
+    "RoutePolicyPort", "TASK", "TEST", "expires_at_ms", "held_stop_level", "item_key_of", "pinned_loosen_policy", "pinned_target_is_entry",
     "shown_by_mode", "supersedes",
 ]

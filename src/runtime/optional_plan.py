@@ -93,7 +93,8 @@ from src.marketdata.ticks import HookCounters
 from src.marketdata.types import SeriesId, Sm12State
 from src.marketdata.writer import WriterCounters
 from src.notifications.arm_relay import ArmRelay, SendTimeRenderer
-from src.notifications.factory import ChannelSet, build_arm_channels
+from src.notifications.factory import ARM_CHANNEL_NAMES, ChannelSet, build_arm_channels
+from src.notifications.rotation import RotatingChannels, settings_from_secrets
 from src.notifications.settings import ARM_PREFIX, NotificationSettings
 from src.observability.metrics import Sample, gauge
 from src.marketdata.clockstep import SUSPEND_AFTER_MS
@@ -133,11 +134,13 @@ from src.runtime.arm_ports import (
 from src.runtime.deadman import ArmFailedBeat
 from src.runtime.md_ports import StampPortImpl
 from src.runtime.optional import OptionalPlan, OptionalServices
+from src.runtime.optional_settings import resolved_environ
 from src.runtime.ports import OperatorRequest
 from src.runtime.request_handlers import Accepted, Applied, HandlerResult, Moot, Refused, RequestHandler, RequestResult
 from src.runtime.session import EngineSession
 from src.runtime.sleeplog import SleepAwareRestarts
 from src.runtime.supervisor import TaskContext, TaskSpec
+from src.secrets.source import SecretsSource
 
 if TYPE_CHECKING:
     import httpx
@@ -785,11 +788,16 @@ class OptionalRuntime:
             budget_store=PgArmBudgetStore(arm.db),
             # S38g: a PC sleep's own restart (a sleep fence recorded by the lease keeper) is not an unclean restart
             restarts=SleepAwareRestarts(PgRestartHistory(engine_db.source), self._sleep_fences))
-        channels = self.plan.arm_channels(s)
+        # The ARM channels follow the secrets source (plan S29, operations.md §13, oversee-rules.md §10): with a
+        # `RotatingChannels` the relay re-reads them every credentials poll and at once after an auth error.
+        built = self.plan.arm_channels(s)
+        rotating = built if isinstance(built, RotatingChannels) else None
+        channels = built.current if isinstance(built, RotatingChannels) else built
         renderer = SendTimeRenderer(md.port, keyring=lambda: md.settings.keyring)
         relay = ArmRelay(PgArmOutboxStore(engine_db), channels.channels, renderer=renderer,
                          disabled=channels.disabled, issues=channels.issues, lease_valid=s.ctx.lease.lease_valid,
                          clock_ms=s.ctx.clock_ms, page=svc.pager.page, drain_notices=self.controls.drain,
+                         channel_source=rotating,
                          footer=lambda: s.email_footer(),   # read at send time
                          # XTNL_EMAIL_THEME of the ARM channels; the xtnl theme shows pips from the entry (point sizes
                          # read at send time, never stored or shown)
@@ -1404,32 +1412,49 @@ def _counter_samples(name: str, component: str, counters: object, *, skip: Itera
 
 
 # ---------------------------------------------------------------------------------------------------- the plan
-def default_arm_channels(environ: Mapping[str, str]) -> Callable[[EngineSession], ChannelSet]:
-    """The `XTNL_ARM_` channels (`arm_email`, `arm_push`) over the term's HTTP client (or a client of their own,
-    closed with the term)."""
+ArmChannels = ChannelSet | RotatingChannels
+"""What an ARM channel factory gives: a fixed `ChannelSet`, or a `RotatingChannels` the relay uses as its
+`channel_source` (its `current` is the set to start with)."""
 
-    def build(session: EngineSession) -> ChannelSet:
-        settings = NotificationSettings.from_env(environ, prefix=ARM_PREFIX)
+
+def default_arm_channels(environ: Mapping[str, str],
+                         secrets: SecretsSource | None = None) -> Callable[[EngineSession], ArmChannels]:
+    """The `XTNL_ARM_` channels (`arm_email`, `arm_push`) over the term's HTTP client (or a client of their own,
+    closed with the term). With a secrets source other than the environment (AWS Secrets Manager), the channel
+    credentials follow it (operations.md §13, oversee-rules.md §10, plan S29): a `RotatingChannels` over
+    `settings_from_secrets(source, environ, prefix=ARM_PREFIX)` with the source's `invalidate`, exactly as the session
+    builds the Oversee channels. With the env source the settings are read once, as before."""
+
+    def build(session: EngineSession) -> ArmChannels:
         client: httpx.AsyncClient | None = session.http_client
         if client is None:
             own = session.ctx.http_client()
             session.register_closer("arm-http", own.aclose)
             client = own
-        return build_arm_channels(settings, client, smtp_factory=session.ctx.smtp_factory,
-                                  footer=lambda: session.email_footer())   # read at send time
+
+        def footer() -> tuple[str, str | None]:
+            return session.email_footer()      # read at send time
+        if secrets is None or secrets.kind == "env":
+            settings = NotificationSettings.from_env(environ, prefix=ARM_PREFIX)
+            return build_arm_channels(settings, client, smtp_factory=session.ctx.smtp_factory, footer=footer)
+        return RotatingChannels(settings_from_secrets(secrets, environ, prefix=ARM_PREFIX), client,
+                                smtp_factory=session.ctx.smtp_factory, invalidate=secrets.invalidate,
+                                names=ARM_CHANNEL_NAMES, footer=footer)
 
     return build
 
 
-def default_config_source(environ: Mapping[str, str]) -> Callable[[EngineSession], ConfigSource | None | list[str]]:
+def default_config_source(environ: Mapping[str, str], secrets: SecretsSource | None = None,
+                          ) -> Callable[[EngineSession], ConfigSource | None | list[str]]:
     """The Supabase reader of `XTNL_ARM_CONFIG_DSN` / `XTNL_ARM_CONFIG_CA_FILE` over asyncpg's `connect` (imported
     lazily: the untyped driver, as `src/db/pg.py` does). The factory returns None without a DSN (idle) and the
-    settings problems (variable names only) for a bad setting."""
+    settings problems (variable names only) for a bad setting. `XTNL_ARM_CONFIG_DSN` is read through the secrets source
+    (laid over `environ`, operations.md §13) at each term's build."""
 
     def build(_session: EngineSession) -> ConfigSource | None | list[str]:
         from src.armconfig.client import SupabaseConfigSource, parse_source_settings
 
-        settings = parse_source_settings(environ)
+        settings = parse_source_settings(resolved_environ(secrets, environ))
         if settings is None or isinstance(settings, list):
             return settings
         asyncpg = importlib.import_module("asyncpg")
@@ -1447,7 +1472,7 @@ class ProductionPlan:
     """What the production plan needs from the process (the environment's ARM channel and configuration source
     settings)."""
 
-    arm_channels: Callable[[EngineSession], ChannelSet]
+    arm_channels: Callable[[EngineSession], ArmChannels]
     config_source: Callable[[EngineSession], ConfigSource | None | list[str]] = _no_config_source
 
     def runtime(self, svc: OptionalServices) -> OptionalRuntime:
@@ -1468,12 +1493,14 @@ class ProductionPlan:
 
 
 def production_plan(environ: Mapping[str, str], *,
-                    arm_channels: Callable[[EngineSession], ChannelSet] | None = None,
+                    arm_channels: Callable[[EngineSession], ArmChannels] | None = None,
                     config_source: Callable[[EngineSession], ConfigSource | None | list[str]] | None = None,
+                    secrets: SecretsSource | None = None,
                     ) -> OptionalPlan:
-    """The `OptionalPlan` of the production engine (S32; the `arm-config` source, S33)."""
-    return ProductionPlan(arm_channels or default_arm_channels(environ),
-                          config_source or default_config_source(environ)).plan()
+    """The `OptionalPlan` of the production engine (S32; the `arm-config` source, S33). `secrets`: the engine's
+    secrets source, which the ARM channels and the configuration DSN follow (operations.md §13)."""
+    return ProductionPlan(arm_channels or default_arm_channels(environ, secrets),
+                          config_source or default_config_source(environ, secrets)).plan()
 
 
 def registry_tokens() -> tuple[str, ...]:

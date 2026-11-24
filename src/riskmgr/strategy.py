@@ -389,6 +389,12 @@ class SlStrategy(Protocol):
 
     def loosen_policy(self, params: StrategyParams) -> LoosenPolicy: ...
 
+    def target_is_entry(self, params: StrategyParams) -> bool:
+        """True when every target this strategy proposes under `params` is the entry itself (§20 Q6 "exactly
+        entry"): only then does a release (`COMPLETE`) say "break-even" (§B8). Read by the notices as they read
+        `loosen_policy`: the engine never reads a strategy-specific key. Wording only; never a decision input."""
+        ...
+
     def latch(self, params: StrategyParams) -> bool:
         """True when a trigger recorded on a final bar keeps re-proposing (the advice stands through a HOLD). The
         pipeline (S21) reads it for SM11 §B12 "POST without ADJUST and latch off: withdrawn", as it reads

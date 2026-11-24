@@ -28,7 +28,10 @@ A scheduler over the `(adapter, bar_spec)` set pinned by live `arm_positions` ro
    `T + post_grace` carries the caveat `delayed` (§B5.2); a series still waiting at `T + post_grace` pages once per
    episode. A non-final result (a POST-time `DATA_UNAVAILABLE`, a job fault) writes **no row** and does not advance
    the cursor: the position is marked `pending_event` once, the reason is kept as the bar's expiry reason, and the bar
-   is decided later or spanned at its cap (§B5.3).
+   is decided later or spanned at its cap (§B5.3). A bar pending only on a guard (`<kind>_pending`: its broker bar
+   is final) is not spanned at its cap: it is decided once there, so the guard's timeout and `unknown_policy` apply
+   (§B6.1, §B6.5: bar 0 ends `FIRST_BAR_UNKNOWN(timeout)`, Q3), and it never raises the post_grace page, which is
+   for a bar still awaiting the broker (§B5.2). Only if that decision is not final is the bar spanned next pass.
 4. **PRE** of the forming bar `T` at local `T + p50 − pre_offset`, valid until `fire + 10 s`
    (S38c: a 10 s window at every allowed offset); never on a bar of a closed period; with PR9 on it waits for its stop read (`src.riskmgr.stopreads`) and a
    position armed after that read was queued gets no PRE that bar. PRE rows never move the cursor or the SM11 state.
@@ -135,7 +138,7 @@ from src.riskmgr.envelope import stamp
 from src.riskmgr.frontier import FrontierView
 from src.riskmgr.jobs import JOB_SUSPENDED, JobRunner, JobSpec
 from src.riskmgr.ordering import advice, next_decision_seq
-from src.riskmgr.outcomes import DOWNTIME, FAILED, PAUSED, RELEASE_UNVERIFIED, STOP_STALE
+from src.riskmgr.outcomes import DOWNTIME, FAILED, PAUSED, RELEASE_UNVERIFIED, STOP_STALE, is_guard_pending
 from src.riskmgr.ports import Clock, Pager
 from src.riskmgr.probes import PASSED, ProbeResult, refused_probe
 from src.riskmgr.replay import (
@@ -445,6 +448,9 @@ class BarClock:
         self._rows_at: int | None = None
         self._reason: dict[tuple[str, int], str] = {}
         """The reason each bar was last pending with while the ARM ran (its expiry reason)."""
+        self._cap_tried: set[tuple[str, int]] = set()
+        """Bars tried at or after their `decision_cap` that stayed undecided: a guard wait is then spanned, never
+        retried (the frontier never sticks; live review round 2)."""
         self._pre_done: set[tuple[str, int]] = set()
         self._pre_wait: dict[tuple[str, int], str] = {}
         self._reopen_last: dict[str, int] = {}
@@ -733,8 +739,7 @@ class BarClock:
             for e in ends:
                 self._reason.setdefault((p.ref, e), hold)
             return next_step(frontier, (), now, spec=p.spec, skew=p.skew, hold=hold)
-        slots = [BarSlot(e, ready=False, reason=self._reason.get((p.ref, e), DOWNTIME),
-                         post_sent=self._post_sent(p, e), next_open_ms=self._next_open(p, e)) for e in ends]
+        slots = [self._slot(p, e) for e in ends]
         rechecks: list[tuple[ReopenCheck, bool]] = []
         if p.row.reopen_bar_end_ms is not None:
             nxt = self._next_open(p, p.row.reopen_bar_end_ms)
@@ -744,6 +749,14 @@ class BarClock:
                 rechecks.append((reopen_check(p.row.reopen_bar_end_ms, nxt, p.spec, p.skew), due))
         return next_step(frontier, slots, now, spec=p.spec, skew=p.skew, bar0_end_ms=self._bar0_end(p),
                          rechecks=rechecks)
+
+    def _slot(self, p: _Pos, e: int) -> BarSlot:
+        """Bar `e` as the planner sees it. A guard's `<kind>_pending` is a final broker bar waiting only on the guard:
+        at its cap it is decided by the guard's timeout (§B6.1, §B6.5), unless that was already tried."""
+        reason = self._reason.get((p.ref, e), DOWNTIME)
+        return BarSlot(e, ready=False, reason=reason, post_sent=self._post_sent(p, e),
+                       next_open_ms=self._next_open(p, e),
+                       guard_timeout=is_guard_pending(reason) and (p.ref, e) not in self._cap_tried)
 
     def _post_sent(self, p: _Pos, bar_end_ms: int) -> bool:
         return self._notices is not None and self._notices.post_sent(p.row, p.spec.name, bar_end_ms)
@@ -782,6 +795,9 @@ class BarClock:
                     go_on.add(ref)
                 elif isinstance(step, Decide) and not unreadable:
                     asks.append(_Ask(p, step.event, step.bar_end_ms))
+                elif isinstance(step, Decide) and step.event is not ArmEvent.REOPEN:
+                    # a guard wait at its cap with the controls unreadable: not decided, so spanned next pass
+                    self._cap_tried.add((ref, step.bar_end_ms))
                 elif isinstance(step, Wait) and step.reason != REOPEN_PENDING:
                     if unreadable:                       # an earlier reason (broker_bar_not_final) is kept
                         self._reason.setdefault((ref, step.bar_end_ms), CONTROLS_UNREADABLE)
@@ -836,7 +852,10 @@ class BarClock:
             return _Result(ask, retry=True)
         self.counters.pending += 1
         self._reason[(p.ref, ask.bar_end_ms)] = reason
-        if reason != RELEASE_UNVERIFIED:      # the broker bar is final: a held release is not an awaited bar
+        if now >= decision_cap_ms(ask.bar_end_ms, p.spec, p.skew):
+            self._cap_tried.add((p.ref, ask.bar_end_ms))   # tried at its cap: spanned next pass, never retried
+        if reason != RELEASE_UNVERIFIED and not is_guard_pending(reason):
+            # the broker bar is final for a held release or a guard's wait: neither is an awaited broker bar (§B5.2)
             self._grace_page(ask, now)
         if p.row.pending_event == ask.event.value and p.row.pending_bar_end_ms == ask.bar_end_ms:
             return _Result(ask)
@@ -1237,6 +1256,7 @@ class BarClock:
         if cursor is not None:
             for k in [k for k in self._reason if k[0] == d.ref and k[1] <= cursor]:
                 del self._reason[k]
+            self._cap_tried = {k for k in self._cap_tried if k[0] != d.ref or k[1] > cursor}
         return True
 
     # ------------------------------------------------------------------------------------------------ corrections
@@ -1540,6 +1560,7 @@ class BarClock:
         live = {r.ref for r in self._rows}
         series = {(r.key.adapter_id, r.symbol, r.bar_spec) for r in self._rows}
         self._reason = {k: v for k, v in self._reason.items() if k[0] in live}
+        self._cap_tried = {k for k in self._cap_tried if k[0] in live and k[1] >= floor}
         self._reopen_last = {k: v for k, v in self._reopen_last.items() if k in live}
         self._span_paged &= live
         self._grace_paged &= series

@@ -66,16 +66,6 @@ def fit_lines(body: str, limit: int, *, in_bytes: bool = False) -> str:
         over = _size(head, in_bytes) - room
         head = head[:-max(1, over // 4 if in_bytes else over)]
     return head + marker
-    # no newline fits: hard-cut the first line, the cut line itself counts as partly shown
-    marker = TRUNCATION_MARKER.format(n=sum(1 for ln in lines[1:] if ln.strip()))
-    room = limit - _size(marker, in_bytes)
-    if room <= 0:
-        return body.encode("utf-8")[:limit].decode("utf-8", "ignore") if in_bytes else body[:limit]
-    head = lines[0]
-    while head and _size(head, in_bytes) > room:
-        over = _size(head, in_bytes) - room
-        head = head[:-max(1, over // 4 if in_bytes else over)]
-    return head + marker
 
 
 def _header_text(s: str) -> str:

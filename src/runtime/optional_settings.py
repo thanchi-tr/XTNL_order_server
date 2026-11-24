@@ -20,7 +20,8 @@ ingestion or Oversee. It combines
   loaded yet keeps its symbols.
 
 The ARM channels (`XTNL_ARM_` email and push, design §B14: both required before the ARM starts) are checked by
-`arm_channel_problems`; a missing channel leaves the ARM idle with one page, the market-data layer still runs.
+`arm_channel_problems`; a missing channel, or an ntfy push without `XTNL_ARM_PUSH_TOKEN` (design PR4: "ntfy with a
+token, or Pushover"), leaves the ARM idle with one page, the market-data layer still runs.
 Problems name the variable only, never its value.
 """
 from __future__ import annotations
@@ -33,6 +34,7 @@ from typing import TYPE_CHECKING, Final
 if TYPE_CHECKING:   # imported lazily below: with both flags off the engine never loads these packages
     from src.marketdata.config import MdSettings
     from src.riskmgr.config import ArmSettings
+    from src.secrets.source import SecretsSource
 
 MD_ENABLED_VAR: Final = "XTNL_MD_ENABLED"
 ARM_ENABLED_VAR: Final = "XTNL_ARM_ENABLED"
@@ -143,6 +145,15 @@ def check_tick_symbols(symbols: Mapping[str, Sequence[str]],
     return kept, unknown
 
 
+def resolved_environ(secrets: SecretsSource | None, environ: Mapping[str, str]) -> Mapping[str, str]:
+    """The environment with the secrets source's cached secret laid over it (operations.md §13: the `XTNL_MD_*` and
+    `XTNL_ARM_*` secrets come from the secrets source on AWS). Never blocks (`resolve_cached`, filled by
+    `load_settings`); with the env source (or none) it is `environ` itself, as before."""
+    if secrets is None or secrets.kind == "env":
+        return environ
+    return secrets.resolve_cached(environ)
+
+
 def arm_channel_problems(environ: Mapping[str, str]) -> list[str]:
     """Both ARM channels must be configured (design §B14, PR4) before the ARM starts: the missing ones by name."""
     from src.notifications.settings import ARM_PREFIX, NotificationSettings
@@ -153,6 +164,9 @@ def arm_channel_problems(environ: Mapping[str, str]) -> list[str]:
         problems.append("ARM email channel (XTNL_ARM_ email settings) is not configured")
     if not ch.push_enabled:
         problems.append("ARM push channel (XTNL_ARM_ push settings) is not configured")
+    elif ch.push is not None and ch.push.provider == "ntfy" and not ch.push.token:
+        # design PR4: the ARM's push is "ntfy with a token, or Pushover" (a token-less topic is anyone's to read)
+        problems.append("ARM push channel: ntfy needs XTNL_ARM_PUSH_TOKEN (design PR4)")
     return problems
 
 

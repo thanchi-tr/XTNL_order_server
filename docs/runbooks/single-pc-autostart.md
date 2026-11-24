@@ -87,6 +87,10 @@ Docker restart).
      nothing**.
    * Settings > Windows Update > Advanced options > **Active hours**: cover the hours you trade, so Windows
      does not restart for updates then.
+   * **Fast Startup off** (admin PowerShell, once; home-server plan §4.3): `powercfg /hibernate off` turns off
+     hibernate and Fast Startup. Check: `powercfg /a` lists neither Hibernate nor Fast Startup. While Fast
+     Startup is on, Shut down is a log-off plus a kernel hibernate (see "What happens on reboot, sleep, Windows
+     update").
 6. **Clock:** w32time syncs every 15 min. The engine's hard check needs |offset| <= 50 ms; `start-xtnl.ps1`
    waits up to 15 min for it and never resyncs (that needs admin). When the wait gives up it logs an `ALERT:` line
    and starts the engine anyway: the engine applies the same check itself, so it records nothing until the clock
@@ -242,7 +246,8 @@ ingestion and Oversee behave exactly as without it. Turning it on never affects 
   rebuilds Redis from PostgreSQL (SM8) and runs a `startup` catch-up from the last recorded coverage
   ([downtime-catchup.md](downtime-catchup.md)). Nothing runs before you log on (the task is "only when logged
   on"); turn on automatic sign-in yourself if you need that.
-* **Sleep / hibernate:** every process is suspended. On wake the engine detects the wall-clock jump and runs a
+* **Sleep / hibernate:** (you stay logged on; a Shut down with Fast Startup on is not this case, see below) every
+  process is suspended. On wake the engine detects the wall-clock jump and runs a
   `resume_after_sleep` catch-up; if the sleep outlived the 15 s lease, it hard-exits and `run-local.ps1`
   restarts it (back-off 5 s doubling to 120 s), which runs a `startup` catch-up. A short clock offset right after
   wake is corrected by w32time; the health check fails closed meanwhile.
@@ -250,6 +255,16 @@ ingestion and Oversee behave exactly as without it. Turning it on never affects 
   while. Short outages are handled in place (Redis loss: SM8); a lease loss hard-exits the engine and
   `run-local.ps1` restarts it.
 * **Log-off:** the task stops with your session (hard stop; next log-on starts it again with a catch-up).
+* **Shut down while Windows Fast Startup is on (the Windows default):** Shut down is a log-off plus a kernel
+  hibernate, not a sleep. Event Viewer > System shows Winlogon 7002 (log-off), then Kernel-Power 187 and 42
+  "entering sleep" (reason Application API), and at the next start Kernel-Power 107 and Kernel-Boot 27 "boot type
+  0x1" (a hybrid boot). The task still stopped at the log-off, as in "Log-off": a hard stop that leaves the
+  `engine_runs` row open (its `last_seen_ms` is the last proof of life) with `suspended_gaps` 0; no sleep fence and
+  no `resume_after_sleep` ran, and `run-local.ps1` stopped with the task. The next log-on starts the task and the
+  engine runs a `startup` catch-up. The real sleep and wake times are in Power-Troubleshooter event 1. On a Modern
+  Standby PC (`powercfg /a`: Standby (S0 Low Power Idle), no S3), Kernel-Power 506/507 at that wake belong to the
+  resume, not to a separate sleep. `powercfg /hibernate off` (Prerequisites step 5; home-server plan §4.3) turns
+  Fast Startup off; Shut down is then a full shutdown, as in "Reboot".
 * **Power cut behind a UPS:** the UPS carries the box; before the battery runs out PowerPanel (or the watcher)
   drains the engine and shuts Windows down, and when mains returns the PC powers on and the task starts again.
   See the next section.

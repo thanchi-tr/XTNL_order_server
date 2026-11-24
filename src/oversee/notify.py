@@ -22,6 +22,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final, Literal, Protocol
 
+from src.oversee.risk import STOP_KIND_INCONSISTENT
 from src.oversee.snapshot import BreachAck
 from src.oversee.types import BreachState, Level, Transition
 
@@ -153,6 +154,15 @@ def episode_key(rule_id: str, subject_type: str, subject_id: str, activation_id:
     return (rule_id, subject_type, subject_id, activation_id or 0, int(level))
 
 
+def _reason_text(t: Transition) -> str:
+    """The alert's reason: the reason code, plus, for `stop_kind_inconsistent`, the result's detail naming only the
+    inconsistent child ids (oversee-rules.md §6; ids only, no prices). Other UNKNOWN details stay out of the alert
+    text, as before. The detail is never part of `t.reason`, so the code stays the first token of the body."""
+    if t.detail and t.reason == STOP_KIND_INCONSISTENT:
+        return f"{t.reason}: {t.detail}"
+    return t.reason
+
+
 def alerts_for_transitions(transitions: Iterable[Transition]) -> list[OutboxRow]:
     """Activated / raised -> one episode alert; lowered / resolved / capped / uncapped -> info."""
     rows: list[OutboxRow] = []
@@ -160,12 +170,12 @@ def alerts_for_transitions(transitions: Iterable[Transition]) -> list[OutboxRow]
         subject = f"{t.rule_id} {t.subject_type}:{t.subject_id}"
         if t.transition in ("activated", "raised"):
             rows.append(OutboxRow("episode", _severity(t.level), f"{t.level.name} {subject}",
-                                  f"{t.reason} (cap {t.cap.value}, sweep {t.sweep_id})", t.at_ms,
+                                  f"{_reason_text(t)} (cap {t.cap.value}, sweep {t.sweep_id})", t.at_ms,
                                   episode_key(t.rule_id, t.subject_type, t.subject_id, t.activation_id, t.level),
                                   t.account_id))
         else:
             rows.append(OutboxRow("info", "info", f"{t.transition} {subject}",
-                                  f"{t.reason} (level {t.level.name}, cap {t.cap.value})", t.at_ms,
+                                  f"{_reason_text(t)} (level {t.level.name}, cap {t.cap.value})", t.at_ms,
                                   None, t.account_id))
     return rows
 

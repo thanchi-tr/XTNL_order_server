@@ -1,6 +1,8 @@
-"""Live review 2026-11-25, finding 5: removing the only stop while a missing-stop state is active never sends a
-'resolved / No action' alert; MissingStopLossRule's grace holds the state and the same episode goes on
-(oversee-rules.md §2 Rule states, §6 MissingStopLossRule). Synthetic prices only."""
+"""Live review 2026-11-25, finding 5, as reverted in round 2: MissingStopLossRule's grace does not hold an active
+state. oversee-rules.md §2 (unchanged) says a capped UNKNOWN state, `stop_kind_inconsistent` included, resolves once
+a known result is below SOFT, and Release resolves an uncapped state after `release_ms` below its level. Whether the
+grace should hold the state instead is an open owner decision (docs/design/live-review-2026-11-25.md).
+Synthetic prices only."""
 from __future__ import annotations
 
 import pytest
@@ -46,28 +48,26 @@ async def inconsistent_state_active() -> Env:
     return env
 
 
-async def test_cancelling_the_inconsistent_child_continues_the_episode_without_resolving() -> None:
+async def test_cancelling_the_inconsistent_child_resolves_then_a_fresh_missing_stop_episode_activates() -> None:
+    """§2 UNKNOWN: the capped state resolves on the first known PASS below SOFT (the grace's `stop_grace`); once the
+    2 s grace ends, the still missing stop is a new `missing_stop_loss` episode."""
     env = await inconsistent_state_active()
     first = env.state(STOP_KEY).activation_id
     cancelled = (child("T", "1.1200", "STOP", status=OrderStatus.CANCELLED),)
     t = T0 + GRACE + 1000
     env.kw.update(orders=cancelled)                         # the only stop is gone: the grace starts
-    await env.every(t, t + STOP_GRACE - 1000)               # held, capped, no transition
+    await env.at(t)
     s = env.state(STOP_KEY)
-    assert s.active and s.level is Level.SOFT_HALT and s.cap is Cap.SOFT and s.uncapped_ms == 0
-    assert env.events("missing_stop_loss") == ["activated"] and await env.level() is HaltLevel.SOFT
-    await env.every(t + STOP_GRACE, t + STOP_GRACE + 3000)
+    assert not s.active and s.resolved_by == "sweep" and not s.unknown_origin
+    assert env.events("missing_stop_loss") == ["activated", "resolved"]
+    await env.every(t + 1000, t + STOP_GRACE)
     s = env.state(STOP_KEY)
-    assert env.events("missing_stop_loss") == ["activated", "uncapped"]
-    assert activations(env) == {first} and s.activation_id == first
-    assert s.level is Level.SOFT_HALT and s.cap is Cap.NONE and s.reason == "missing_stop_loss"
-    assert not s.unknown_origin and s.uncapped_ms > 0           # the escalation clock now runs
-    uncapped = [e for e in env.db.t.events.values() if e.transition == "uncapped"]
-    assert [e.reason for e in uncapped] == ["missing_stop_loss"]
-    assert resolved_rows(env) == []
+    assert env.events("missing_stop_loss") == ["activated", "resolved", "activated"]
+    assert s.active and s.level is Level.SOFT_HALT and s.cap is Cap.NONE and s.reason == "missing_stop_loss"
+    assert s.activation_id != first and len(activations(env)) == 2
 
 
-async def test_a_stop_placed_during_the_held_grace_resolves_the_state() -> None:
+async def test_a_stop_placed_during_the_grace_leaves_the_state_resolved() -> None:
     env = await inconsistent_state_active()
     t = T0 + GRACE + 1000
     await env.at(t, orders=(child("T", "1.1200", "STOP", status=OrderStatus.CANCELLED),))
@@ -86,9 +86,9 @@ async def test_a_fresh_missing_stop_still_activates_after_the_grace() -> None:
     assert env.events("missing_stop_loss") == ["activated"]
 
 
-async def test_a_stop_that_flickers_on_an_uncapped_state_sends_no_transition() -> None:
-    """A stop present for 3 s and then gone again: the release wait from the stop (5 s) would end inside the
-    new grace; the grace holds the state instead, so no 'resolved' and no new activation."""
+async def test_a_stop_that_flickers_on_an_uncapped_state_resolves_after_release_then_reactivates() -> None:
+    """A stop present for 3 s and then gone again: the release wait that started with the stop (5 s, §2 Release)
+    ends inside the new 2 s grace, so the state resolves, and the grace's end activates a new episode."""
     env = Env(positions=(position("P"),))
     await env.every(T0, T0 + STOP_GRACE)
     assert env.events("missing_stop_loss") == ["activated"]
@@ -98,5 +98,5 @@ async def test_a_stop_that_flickers_on_an_uncapped_state_sends_no_transition() -
     env.kw.update(orders=())
     await env.every(t + 4000, t + 4000 + RELEASE + STOP_GRACE)
     s = env.state(STOP_KEY)
-    assert env.events("missing_stop_loss") == ["activated"]
-    assert s.active and s.cap is Cap.NONE and s.reason == "missing_stop_loss" and resolved_rows(env) == []
+    assert env.events("missing_stop_loss") == ["activated", "resolved", "activated"]
+    assert s.active and s.cap is Cap.NONE and s.reason == "missing_stop_loss"
