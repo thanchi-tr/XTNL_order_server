@@ -31,7 +31,7 @@ The final independent differential check of the SL edge recommendation ran more 
 | `S_at_T` ignores an untimed stop version that is known to come after T | §B6.3 (`S_at_T` = the stop at the bar end); C1 |
 | The Q10 release sentence follows the side ("below" for a long, "above" for a short) | §20 Q10 (a stop moved back toward loss); §B6.3 step (4), made side-neutral |
 | `favour / risk` is shown only when its denominator is the stop the trigger tested | §B8 (notices state the decision's own inputs); C5 (no favour figures on PRE) |
-| The headline says "break-even" only when the proposed stop equals entry | §20 Q6 (break-even at entry, or plus a buffer) |
+| ~~The headline says "break-even" only when the proposed stop equals entry~~ **Reverted in round 4.** §B8 fixes no ADJUST headline text, and §20 Q6 / Q1 (a) call every `break_even_on_risk_close` target "break-even", at the entry and at the entry plus a buffer (as the single §B8 COMPLETE text, round 3). The headline and preheader say "break-even" for that strategy kind again; the preheader still states the level. A different wording for a buffered target would be an owner decision on §B8 / Q6 | §B8, §20 Q6, Q1 (a) |
 | A push body over the channel limit is cut on a line boundary with a "see email" marker | §B8 (email and push carry the same notice); D-decisions on channels |
 | `stop_kind_inconsistent` alerts name the condition and its action | `oversee-rules.md` §5 / §6 (UNKNOWN `stop_kind_inconsistent`) |
 | `at_target` is judged against the unrounded target (doc wording aligned) | §B6.3 (7a) already counts a handle exactly at an off-grid E with offset 0, which only the unrounded target does; broker handle levels are on-grid, where the two are equal |
@@ -87,12 +87,28 @@ A third independent check rendered about 31,000 decisions from the real `run_pip
 | COMPLETE always uses the single §B8 release text. Round 2's second text was reverted | §B8 release texts |
 | `stop_kind_inconsistent` re-pages also name the inconsistent child ids | `oversee-rules.md` §6 |
 
-## Round 4 (to do)
+## Round 4
 
-- **Increment leak.** The xtnl levels note "Moves the stop N points" can print the price increment itself (one increment with pip unit 1). `riskmgr.md` §5 says a notice never shows a price increment, and the owner asked never to see the pip size.
-- **Headline wording.** Round 1's headline change ("break-even" only when the proposed stop equals entry) needs the same §B8 / Q6 check that reverted the COMPLETE text.
-- **`pre_basis` on PRE_NOT_CONFIRMED.** PRE_NOT_CONFIRMED stores this bar's PRE basis even when `S_at_T` is already at or beyond it, while the spec says such a basis is cleared (C1).
-- **Regression review of round 3.**
+Round 4 had 3 open items and 10 new items from a regression review of round 3 (which found 0 defects) and from a completeness critic over the SL path (clause map plus a stdlib line-coverage trace of tests/riskmgr and tests/notifications). Each item went through 3 skeptics, and 10 were confirmed and fixed.
+
+| Fix | Requirement it follows |
+|---|---|
+| ADJUST headline: "break-even" for every `break_even_on_risk_close` target again (round-1 change reverted) | §B8 notice texts (single wording); §20 Q6 |
+| PRE_NOT_CONFIRMED no longer stores a PRE basis that the bar-end `S_at_T` has already loosened past | §B6.3 C1 (cleared once the current S, = bar-end `S_at_T`, is farther from entry) |
+| A REOPEN that does not end the re-check (PRICE_THROUGH_LEVEL) is retried; the last result is written when the re-check ends | §B6.3 REOPEN (retryable outcomes) |
+| The xtnl ARM email shows the bar-0 conditional PRE label, "valid until", the DELAYED delay and every decision caveat | §B6.5 bar-0 PRE label; §B5.2 DELAYED; §B6.3 / §B7 caveats; §B8 |
+| Tests for duplicate bar-end events, an older-bar CORRECTED item, PRE pre-guards (1)-(3b), the 15m grid / roll caveat / 17:00 New York fills across both 2026 DST changes, and REOPEN across a weekend restart | §B6.6, §A13, §B6.3, Q7, Q14, SM10, C3 |
+
+**Decided from the requirement text: the C1 tie.** When `S_at_T` equals `S_pre` exactly, the PRE basis is kept, which is the as-built behaviour. The literal clear sentence ("at or farther") and C1's purpose sentence ("a move made on an unconfirmed heads-up never makes a later bar's test easier") conflict at the tie. Clearing at the tie would let a heads-up move made after T make the next test easier, which the purpose sentence forbids. The pipeline docstring follows the purpose sentence.
+
+## Round 5 (to do)
+
+- **Increment leak.** The xtnl note "Moves the stop N pips/points" prints the price increment when the move is one increment. `riskmgr.md` §5 forbids any increment or pip size in a notice; the owner's exception covers only each stop's distance from entry in pips. Drop the numeric move size.
+- **Current stop with `show_levels` off.** Both HTML themes show the current stop when `show_levels` is off. Q13's built default is "proposed stop and R only", and §B8 says "entry and current stop only if Q13".
+- **NO_BROKER_BAR basis.** NO_BROKER_BAR folds this bar's PRE levels into `pre_basis` without the C1 clear that round 4 added to every other non-confirming bar end (`arm-implementation-plan.md` S38c fix (a): "as every other non-confirming bar end").
+- **Latch on, CORRECTED re-run.** With `latch = on` (not the Q11 default), a CORRECTED re-run of the bar that recorded the trigger reads its own committed state, so a withdrawn trigger keeps re-proposing. Check whether §B6.6 ("re-run on the recorded order state, `commit_state` re-applied") decides the state to re-run on.
+- **REOPEN clean-spread retry.** Needs the Oversee clean-spread threshold injected in `src/runtime/optional_plan.py` (§B6.3 REOPEN).
+- **Regression review of round 4.**
 
 ## Operator items (not code)
 

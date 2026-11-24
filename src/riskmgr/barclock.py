@@ -24,7 +24,9 @@ A scheduler over the `(adapter, bar_spec)` set pinned by live `arm_positions` ro
    reason, which advances the cursor **before the next bar's POST is evaluated**, in the same pass (rounds of at most
    `max_rounds`); then the first undecided bar is decided when its inputs exist: `POST` when the broker's final bar
    `T` is stored and its indicators are updated for `T` (the evaluation port says `NotReady` until then), `LATE` once
-   its POST notice has gone, `REOPEN` for a pre-close re-check from the open + settle (every 5 s). A POST decided after
+   its POST notice has gone, `REOPEN` for a pre-close re-check from the open + settle (every 5 s; §B6.3: only an
+   `ADJUST` or `COMPLETE` ends it early, any other result is retried with no row, and the last one is written with its
+   reason, changing no state, when the first post-open POST is decided or its cap passes). A POST decided after
    `T + post_grace` carries the caveat `delayed` (§B5.2); a series still waiting at `T + post_grace` pages once per
    episode. A non-final result (a POST-time `DATA_UNAVAILABLE`, a job fault) writes **no row** and does not advance
    the cursor: the position is marked `pending_event` once, the reason is kept as the bar's expiry reason, and the bar
@@ -138,7 +140,15 @@ from src.riskmgr.envelope import stamp
 from src.riskmgr.frontier import FrontierView
 from src.riskmgr.jobs import JOB_SUSPENDED, JobRunner, JobSpec
 from src.riskmgr.ordering import advice, next_decision_seq
-from src.riskmgr.outcomes import DOWNTIME, FAILED, PAUSED, RELEASE_UNVERIFIED, STOP_STALE, is_guard_pending
+from src.riskmgr.outcomes import (
+    DOWNTIME,
+    FAILED,
+    PAUSED,
+    RELEASE_UNVERIFIED,
+    STOP_STALE,
+    Outcome,
+    is_guard_pending,
+)
 from src.riskmgr.ports import Clock, Pager
 from src.riskmgr.probes import PASSED, ProbeResult, refused_probe
 from src.riskmgr.replay import (
@@ -196,6 +206,18 @@ NOT_DECIDING: Final = "not_deciding"
 """Correction compare reasons (codes only): an input's current hash could not be read; the re-run was not final; a
 confirmed correction could not be applied because the position is not in a deciding state (FAILED, SUSPENDED, ...;
 kept open and retried, an `UNVERIFIABLE(not_deciding)` audit row when its window ends)."""
+REOPEN_RETRY: Final = "reopen_retry"
+"""A REOPEN attempt whose result does not end the re-check (§B6.3 REOPEN): retried, no row (a code only)."""
+REOPEN_ENDING: Final = frozenset({Outcome.ADJUST.value, Outcome.COMPLETE.value})
+"""The REOPEN outcomes that end the re-check (§B6.3 REOPEN; a closed position and the first post-open POST end it
+through the planner)."""
+
+
+def ends_recheck(outcome: str) -> bool:
+    """A final REOPEN result with this outcome ends the re-check (§B6.3 REOPEN): `ADJUST` or `COMPLETE` only."""
+    return outcome in REOPEN_ENDING
+
+
 CORRECTABLE: Final = frozenset({ArmEvent.POST, ArmEvent.LATE, ArmEvent.CORRECTED})
 RERUN_EVENTS: Final = frozenset({Sm11Event.FINAL_ADJUST, Sm11Event.ADVICE_WITHDRAWN, Sm11Event.HANDLES_REACHED})
 """Of a correction's re-run, the SM11 events re-applied with its `commit_state` (the latest bar only)."""
@@ -261,7 +283,9 @@ class Verdict(str, Enum):
 class Evaluated:
     """What one evaluation job returns. `decision`: the row's outcome fields (the BarClock sets the key, bar, event,
     `decision_seq`, `decided_at_ms`, `advice` and the pinned version fields); `final`: it decides the bar (POST /
-    LATE move the cursor with `trigger_hash`; a REOPEN ends its re-check); `sm11_events` in order (none at PRE);
+    LATE move the cursor with `trigger_hash`; a REOPEN `ADJUST` or `COMPLETE` ends its re-check, any other final
+    REOPEN result is retried and only the last one is written when the re-check ends, §B6.3); `sm11_events` in order
+    (none at PRE);
     `strategy_state_json` None = unchanged; `pre_basis_change` writes `pre_basis_json` / `pre_basis_bar` as given
     (None clears); `reopen_candidate`: a final POST that came out `MARKET_CLOSED` with `trigger_met`."""
 
@@ -454,6 +478,10 @@ class BarClock:
         self._pre_done: set[tuple[str, int]] = set()
         self._pre_wait: dict[tuple[str, int], str] = {}
         self._reopen_last: dict[str, int] = {}
+        self._reopen_hold: dict[str, tuple[int, Evaluated]] = {}
+        """Per position, the last retryable REOPEN result (a final HOLD or any other result that does not end the
+        re-check) with its bar end: written and sent when the re-check ends without an ADJUST or COMPLETE (§B6.3
+        REOPEN, "on expiry the last HOLD is sent with its reason"). Memory only: after a restart nothing is held."""
         self._grace_paged: set[tuple[str, str, str]] = set()
         self._span_paged: set[str] = set()
         self._pause_paged: int | None = None
@@ -787,10 +815,8 @@ class BarClock:
                     writes.setdefault((ArmEvent.POST, step.bar_end_ms), []).append(self._span_write(p, step, now))
                     go_on.add(ref)
                 elif isinstance(step, DropRecheck):
-                    cas = PositionCas(row=replace(p.row, reopen_bar_end_ms=None, updated_at_ms=now),
-                                      expected_row_version=p.row.row_version)
                     writes.setdefault((ArmEvent.REOPEN, step.bar_end_ms), []).append(
-                        Decided(ref=ref, decision=None, position=cas))
+                        self._drop_recheck(p, step.bar_end_ms, now))
                     self._reopen_last.pop(ref, None)
                     go_on.add(ref)
                 elif isinstance(step, Decide) and not unreadable:
@@ -825,6 +851,12 @@ class BarClock:
             reason = res.reason or (res.decision.reason if res.decision is not None and res.decision.reason
                                     else NOT_FINAL)
             return self._not_ready(ask, reason, now)
+        if ask.event is ArmEvent.REOPEN and not ends_recheck(res.decision.outcome):
+            # §B6.3 REOPEN: only ADJUST, COMPLETE, a closed position or the first post-open bar's POST ends the
+            # re-check; any other result (PRICE_THROUGH_LEVEL at the open, a market not open yet, ...) is retried
+            # on the 5 s cadence, and the last one is written when the re-check ends (`_drop_recheck`)
+            self._reopen_hold[ask.pos.ref] = (ask.bar_end_ms, res)
+            return self._not_ready(ask, REOPEN_RETRY, now)
         transition = self._transition(ask.pos.row, res)
         if isinstance(transition, Refused):
             # the state cannot take this result: write nothing (a decision whose state did not move would disagree
@@ -835,6 +867,22 @@ class BarClock:
                         ask.pos.ref, transition.reason)
             return self._not_ready(ask, SM11_REFUSED, now)
         return _Result(ask, write=self._final_write(ask, res, now, transition), go_on=True)
+
+    def _drop_recheck(self, p: _Pos, bar_end_ms: int, now: int) -> Decided:
+        """The re-check ends undecided (the planner's `DropRecheck`: the first post-open bar's POST was decided, or
+        its `decision_cap` passed). The last retryable result of this re-check, when one is held, is written now as
+        the REOPEN row and sent with its reason (§B6.3 REOPEN), in the same CAS that clears `reopen_bar_end_ms`. It
+        changes no position state (no SM11 event, strategy state or basis: like every retried attempt it did not
+        decide the re-check, and a later POST may already have decided the position). With nothing held (a restart
+        since), only the re-check is cleared."""
+        held = self._reopen_hold.get(p.ref)
+        if held is None or held[0] != bar_end_ms or held[1].decision is None:
+            cas = PositionCas(row=replace(p.row, reopen_bar_end_ms=None, updated_at_ms=now),
+                              expected_row_version=p.row.row_version)
+            return Decided(ref=p.ref, decision=None, position=cas)
+        record = replace(held[1], sm11_events=(), strategy_state_json=None, pre_basis_change=False,
+                         pre_basis_json=None, pre_basis_bar=None, reopen_candidate=False)
+        return self._final_write(_Ask(p, ArmEvent.REOPEN, bar_end_ms), record, now, None)
 
     def _transition(self, row: ArmPositionRow, ev: Evaluated) -> Transition | Refused | None:
         """The SM11 result of a final evaluation; None when the stored state is unreadable (kept as it is)."""
@@ -1250,6 +1298,7 @@ class BarClock:
                 self._grace_paged.discard((new.key.adapter_id, new.symbol, new.bar_spec))
         if event is ArmEvent.REOPEN:
             self._reopen_last.pop(d.ref, None)
+            self._reopen_hold.pop(d.ref, None)
         if event in CORRECTABLE and dec.outcome != UNRESOLVED_RANGE and w.ref is not None:
             self._record(d.ref, dec, w.ref, new)
         cursor = new.last_decided_bar
@@ -1562,6 +1611,7 @@ class BarClock:
         self._reason = {k: v for k, v in self._reason.items() if k[0] in live}
         self._cap_tried = {k for k in self._cap_tried if k[0] in live and k[1] >= floor}
         self._reopen_last = {k: v for k, v in self._reopen_last.items() if k in live}
+        self._reopen_hold = {k: v for k, v in self._reopen_hold.items() if k in live}
         self._span_paged &= live
         self._grace_paged &= series
         self._reads.forget(live)
@@ -1602,6 +1652,7 @@ __all__ = [
     "ARMED_AFTER_PRE_READ", "BarClock", "BarClockCounters", "BarClockSettings", "CONTROLS_UNREADABLE", "ControlsPort",
     "DECIDING_STATES", "DELAYED", "EvalRequest", "EvaluationPort", "Evaluated", "MD_UNAVAILABLE", "NotReady",
     "PREPARE_TIMEOUT", "PRE_EXPIRED", "PRE_MARKET_CLOSED", "PRE_READ_MISSING", "PostNoticeView", "Prepared",
+    "REOPEN_ENDING", "REOPEN_RETRY", "ends_recheck",
     "SM11_REFUSED", "SPAN_ALREADY_DECIDED", "SPAN_ROWS_UNREADABLE", "SPAN_ROW_CHANGED", "SPAN_WRITE_FAILED",
     "SessionCloseView", "TASK", "Verdict",
 ]
