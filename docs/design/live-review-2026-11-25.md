@@ -18,8 +18,8 @@ The final independent differential check of the SL edge recommendation ran more 
 
 | Fix | Requirement it follows |
 |---|---|
-| StoneX children of a working entry map `PENDING` at the entry's broker time in every REST shape (IfDone, direct, own row), never untimed `WORKING` | `dto-contracts.md` versions (a stale REST read never overwrites a newer stream update); `adapter-isolation.md` accepted deviation of 2026-11-21, widened to the shapes seen live |
-| `fetch_history` leaves untimed working rows to the snapshot | `operations.md` §17 (an untimed history row is never labelled with the watermark); the snapshot already reconciles working orders |
+| ~~StoneX children of a working entry map `PENDING` in every REST shape~~ **Reverted in round 3** to the owner-accepted IfDone shape only | `adapter-isolation.md` accepted deviation 2026-11-21 (IfDone only); `IMPLEMENTATION_PLAN` 8.1 (the adapter never invents a status) |
+| ~~`fetch_history` leaves untimed working rows to the snapshot~~ **Reverted in round 3**: they are offered, skipped as unversioned, and leave the catch-up incomplete, with the ids and window named in the page | `adapter-isolation.md` §4; `operations.md` §17 step 3; `oversee-rules.md` §8 |
 | The incomplete catch-up page names the skipped ids and window | `operations.md` §17 (skipped rows are reported); `oversee-rules.md` §8 (`catchup_unverified`) |
 | A timed-out feed `XREADGROUP BLOCK` reads as empty instead of killing the feed observer. This consumer's own pending entries are drained at once (XREADGROUP id 0) | `oversee-rules.md` §1 (the observer never waits on a condition), §3 (consumer-group recovery); `operations.md` §3 (a task stays alive across transient waits) |
 | RiskSweep passes are scheduled and timed on the monotonic clock | `oversee-rules.md` §2 ("monotonic `sweep_id`"); `operations.md` §17 (a wall-clock step is detected, never trusted) |
@@ -41,8 +41,8 @@ The final independent differential check of the SL edge recommendation ran more 
 
 - **Feed client socket timeout.** Wire a dedicated feed Redis client with socket-timeout headroom over the `BLOCK` (`src/cache/client.py` `feed_redis_from` is ready) into `src/runtime/session.py`. Requirement: `oversee-rules.md` §1, `operations.md` §3.
 - **Post-T stop versions in SQL.** Add the post-T counting-version predicate to the stop-version SQL reader (`src/db`), so the `S_at_T` rule above also holds for reads from PostgreSQL. Requirement: §B6.3.
-- **Notice ordering and wording.** Order ARM notice items as ADJUST first. Make the COMPLETE text say "break-even" only at entry. Requirement: §B8, Q6.
-- **Child ids in alerts.** Carry the inconsistent child ids into the `stop_kind_inconsistent` alert. Requirement: `oversee-rules.md` §6 ("naming only the inconsistent child ids"). *Round 2: done for transition alerts.* The ids travel in `Transition.detail` and never in the reason, so the alert body reads `stop_kind_inconsistent: stop child <ids>`. A re-page still names only the reason, because the stored `halt_breaches` row has no detail column.
+- **Notice ordering and wording.** Order ARM notice items as ADJUST first. ~~Make the COMPLETE text say "break-even" only at entry.~~ *Reverted in round 3:* §B8 has a single `COMPLETE` text, and §20 Q6 calls the target "break-even" both at the entry and at the entry plus a buffer. Requirement: §B8, Q6.
+- **Child ids in alerts.** Carry the inconsistent child ids into the `stop_kind_inconsistent` alert. Requirement: `oversee-rules.md` §6 ("naming only the inconsistent child ids"). *Round 2: done for transition alerts.* The ids travel in `Transition.detail` and never in the reason, so the alert body reads `stop_kind_inconsistent: stop child <ids>`. *Round 3: done for re-pages too* (`oversee-rules.md` §6 "re-pages", §10). The RiskSweep hands this pass's UNKNOWN detail to the dispatcher (`NotificationDispatcher.stage_repage_details`), so the re-page body reads `stop_kind_inconsistent: stop child <ids> (cap SOFT)`. Nothing is stored: the ids are the current pass's only, never in the reason, the ack match or the episode / dedupe key; a state whose current result is not that UNKNOWN re-pages with the reason alone.
 - **Silent engine after wake.** Explain why the engine wrote nothing after the 02:08 wake on 2026-11-24. Requirement: `operations.md` §17 sleep detection, resume catch-up, and hard exit plus restart by `run-local.ps1`.
 
 ## Round 2
@@ -60,7 +60,7 @@ An independent check then ran 360,000 cases through the real `run_pipeline` (POS
 | A guard-pending bar 0 is decided at its decision cap as `FIRST_BAR_UNKNOWN(timeout)`, not spanned as a FAULT | §B6.5; Q2, Q3, Q7 |
 | `answers_final_advice` no longer carries a "loss-side target never counts" clause that §B6.4 round 14 does not contain | §B6.4 round 14 |
 | Every ADJUST level is stated at the price increment's precision (REOPEN shows `1.2000`) | §B6.3 step (9) |
-| The COMPLETE text says "break-even" only when the target is the entry | §20 Q6 |
+| ~~The COMPLETE text says "break-even" only when the target is the entry~~ **Reverted in round 3.** No requirement asks for a second release text: §B8 "Release texts" has one `COMPLETE` text, and §20 Q6 uses "break-even" for the entry and for the entry plus a buffer. Every release renders the §B8 text again. `COMPLETE_TARGET_TEXT`, the `release_at_entry` body key (a stored body that carries it still decodes; the key is ignored) and `SlStrategy.target_is_entry` (not in §B6.1) are removed. The pinned `BreakEvenOnRiskClose` v1 is restored as it was before round 2. A different wording for a buffered target would be an owner decision on §B8 / Q6 | §B8 "Release texts", §20 Q6, §B6.1; `riskmgr.md` §6 (requirement wins) |
 | `stop_kind_inconsistent` alerts name only the inconsistent child ids | `oversee-rules.md` §6 |
 | Never-activated unlisted rows resolve silently | `oversee-rules.md` §2 Confirm |
 | **Reverted:** round 1's "the missing-stop grace holds an active state". The unchanged §2 says a capped UNKNOWN state resolves once a known result is below SOFT | `oversee-rules.md` §2 UNKNOWN (requirement wins) |
@@ -72,15 +72,27 @@ The engine's two silences were not sleeps:
 
 Nothing off the PC pages a dead engine until the dead-man receiver (W6) runs.
 
-## Round 3 (to do)
+## Round 3
 
-- **StoneX child shapes.** Revert round 1's widening of the 2026-11-21 accepted deviation (own-row and directly nested children mapped `PENDING`). The owner accepted the IfDone shape only, and `IMPLEMENTATION_PLAN` 8.1 says the adapter never invents a status.
-- **History filter.** Revert round 1's filter that left untimed working rows out of `fetch_history`. `adapter-isolation.md` §4 lists every order whose state changed in the window. `operations.md` §17 and `oversee-rules.md` §8 say an untimed row is skipped, reported, and leaves the catch-up incomplete. The page now names the ids and the window, as round 1 made it.
-- **Own-pending drain timeout.** Make the own-pending drain read timeout-tolerant (`src/cache/feed_stream.py`).
-- **Market-sessions lost update.** Make `market-sessions accept` safe against the engine's concurrent schedule save (`src/db/market_sessions.py`).
-- **Hard-exit backstop.** Arm the `hard_exit` backstop timer before logging (`src/runtime/exits.py`).
-- **ARM notice order.** Order ARM notice items ADJUST first, only if a requirement asks for it (the plain-text baselines are pinned).
-- **Regression review of round 2.**
+Round 3 produced 3 new findings. Two were confirmed, and the 5 carried items were also fixed.
+
+A third independent check rendered about 31,000 decisions from the real `run_pipeline`, each in 10 renderings (text, both push limits, both email themes), plus 3,000 multi-item notices. In every one, the stated level equals the oracle's at the increment's precision, the side words match, pips from entry are right, there is no favour figure on PRE, push equals email, and no account values appear. The exception is the increment leak listed under round 4. A fresh exact-arithmetic run of `run_pipeline` also agreed, apart from one low reading of `pre_basis`, also listed under round 4.
+
+| Fix | Requirement it follows |
+|---|---|
+| The StoneX child mapping is restored to the IfDone shape only, and `fetch_history` offers untimed working rows again (both round-1 reverts) | `adapter-isolation.md` 2026-11-21 deviation and §4; `IMPLEMENTATION_PLAN` 8.1; `operations.md` §17; `oversee-rules.md` §8 |
+| The own-pending drain read is timeout-tolerant | `oversee-rules.md` §1, §3; `operations.md` §3 |
+| `market-sessions accept` can no longer be lost to the engine's concurrent schedule save (re-merged under `MARKET_SESSIONS_LOCK`) | `operations.md` §10 Review / Accept |
+| `hard_exit` arms an `os._exit` backstop before any logging | `operations.md` §1 / §3 |
+| COMPLETE always uses the single §B8 release text. Round 2's second text was reverted | §B8 release texts |
+| `stop_kind_inconsistent` re-pages also name the inconsistent child ids | `oversee-rules.md` §6 |
+
+## Round 4 (to do)
+
+- **Increment leak.** The xtnl levels note "Moves the stop N points" can print the price increment itself (one increment with pip unit 1). `riskmgr.md` §5 says a notice never shows a price increment, and the owner asked never to see the pip size.
+- **Headline wording.** Round 1's headline change ("break-even" only when the proposed stop equals entry) needs the same §B8 / Q6 check that reverted the COMPLETE text.
+- **`pre_basis` on PRE_NOT_CONFIRMED.** PRE_NOT_CONFIRMED stores this bar's PRE basis even when `S_at_T` is already at or beyond it, while the spec says such a basis is cleared (C1).
+- **Regression review of round 3.**
 
 ## Operator items (not code)
 

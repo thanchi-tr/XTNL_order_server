@@ -63,10 +63,7 @@ MARKET_CLOSES: Final = "market_closes"
 
 PRE_HEADER: Final = "PROVISIONAL, final advice after the bar closes"
 COMPLETE_TEXT: Final = "released: the bar end confirmed break-even; the ARM no longer manages this position"
-COMPLETE_TARGET_TEXT: Final = "released: the bar end confirmed the target; the ARM no longer manages this position"
-"""`COMPLETE_TEXT` (§B8) says "break-even"; a release whose pinned target is not the entry itself (`release_at_entry`
-False: a buffer, `be_offset_r > 0`) names "the target" instead (§20 Q6; live review round 2). An unknown pin (None:
-an older body, a pin not readable here) keeps the §B8 text, the Q6 default "exactly entry"."""
+"""The single §B8 release text, for every pinned target (§20 Q6: break-even is the entry, or entry plus a buffer)."""
 Q10_TELL: Final = "if the stop is moved back below the target later, you are told only"
 Q10_REARM: Final = "if the stop is moved back below the target later, the ARM manages the position again"
 """`Q10_TELL` / `Q10_REARM` are the long (BUY) forms of `q10_text`, kept for existing readers."""
@@ -128,10 +125,13 @@ ITEM_KEYS: Final = frozenset({
     "proposed_stop", "current_risk_r", "first_bar_ratio", "caveats", "quality_flags", "stop_basis", "trigger_source",
     "handles", "trigger_input", "entry", "s0", "supersedes", "decided_at_ms", "strategy_kind",
     "strategy_impl_version", "valid_until_ms", "stop_read_at_ms", "late", "loosen_policy", "stop_now",
-    "release_at_entry",
 })
-"""`stop_now` and `release_at_entry` are additive (written only when known), so a body without them still decodes
-(as None); `BODY_VERSION` stays 1."""
+"""`stop_now` is additive (written only when known), so a body without it still decodes (as None); `BODY_VERSION`
+stays 1."""
+LEGACY_ITEM_KEYS: Final = frozenset({"release_at_entry"})
+"""Item keys an earlier engine wrote and this one never writes or reads: decode accepts and ignores them, so a stored
+body carrying one still decodes. `release_at_entry` chose round 2's second release text, reverted in live review
+round 3 (§B8 has one `COMPLETE` text)."""
 PENDING_KEYS: Final = frozenset({"adapter_id", "position_id", "symbol", "side"})
 EXTRA_KEYS: Final = frozenset({"kind", "adapter_id", "position_id", "symbol", "side", "reason", "at_ms"})
 FAILED_KEYS: Final = frozenset({"scope_kind", "scope_id", "reason"})
@@ -191,10 +191,6 @@ class ItemBody:
     """The position's **pinned** Q10 policy (`REARM` | `TELL_ONLY`, an order-state code from
     `SlStrategy.loosen_policy(pinned params)`), carried on a `COMPLETE` item so its release text says what happens if
     the stop is moved back; None (an older body, or no pin readable) renders the tell-only text (round 13)."""
-    release_at_entry: bool | None = None
-    """On a `COMPLETE` item: whether the position's **pinned** strategy targets the entry itself
-    (`SlStrategy.target_is_entry`, Q6). False (a buffer) makes the release text say "the target"; True says
-    "break-even" (§B8), and so does None (an older body, no pin readable: the Q6 default) (live review round 2)."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -266,8 +262,6 @@ def _item_json(i: ItemBody) -> dict[str, object]:
     out = _item_core(i)
     if i.stop_now is not None:      # additive key: absent when unknown, so earlier bodies keep their exact text
         out["stop_now"] = _dec_text(i.stop_now)
-    if i.release_at_entry is not None:
-        out["release_at_entry"] = i.release_at_entry
     return out
 
 
@@ -388,7 +382,7 @@ def _policy(v: object) -> str | None:
 
 
 def _item(raw: object) -> ItemBody:
-    m = _obj(raw, ITEM_KEYS, "item")
+    m = _obj(raw, ITEM_KEYS | LEGACY_ITEM_KEYS, "item")
     g = m.get
     return ItemBody(
         decision_id=_req_int(g("decision_id")), decision_bar_end_ms=_req_int(g("decision_bar_end_ms")),
@@ -406,8 +400,7 @@ def _item(raw: object) -> ItemBody:
         supersedes=_int(g("supersedes"), none=True), decided_at_ms=_req_int(g("decided_at_ms", 0)),
         strategy_kind=_req_str(g("strategy_kind", "")), strategy_impl_version=_req_int(g("strategy_impl_version", 0)),
         valid_until_ms=_int(g("valid_until_ms"), none=True), stop_read_at_ms=_int(g("stop_read_at_ms"), none=True),
-        late=bool(_bool(g("late", False))), loosen_policy=_policy(g("loosen_policy")), stop_now=_dec(g("stop_now")),
-        release_at_entry=_bool(g("release_at_entry"), none=True))
+        late=bool(_bool(g("late", False))), loosen_policy=_policy(g("loosen_policy")), stop_now=_dec(g("stop_now")))
 
 
 def decode_body(text: str) -> NoticeBody:
@@ -629,8 +622,7 @@ def outcome_text(item: ItemBody, settings: RenderSettings) -> str:
             return f"provisional: the rule would move the stop{stop}{detail} {STILL_WORSE}"
         return f"ADJUST: move the stop{stop}{detail} {STILL_WORSE}"
     if o == Outcome.COMPLETE.value:
-        text = COMPLETE_TARGET_TEXT if item.release_at_entry is False else COMPLETE_TEXT
-        return f"{text} ({q10_text(item.side, item.loosen_policy == 'REARM')})"
+        return f"{COMPLETE_TEXT} ({q10_text(item.side, item.loosen_policy == 'REARM')})"
     if o == Outcome.PRE_NOT_CONFIRMED.value:
         why = "at target, not yet confirmed" if item.reason == Outcome.AT_TARGET_UNCONFIRMED.value \
             else _reason_text(item)
@@ -749,9 +741,9 @@ def render(body: NoticeBody, *, bars: Mapping[tuple[str, int], Bar] | None = Non
 
 __all__ = [
     "ALIVE_KEYS", "AT_TARGET_TEXT", "AWAITING_TEXT", "AliveCounts", "BODY_KEYS", "BODY_VERSION", "BodyError",
-    "CAVEAT_TEXT", "COMPLETE_TARGET_TEXT", "COMPLETE_TEXT", "DELAYED", "EXTRA_KEYS", "EXTRA_TEXT", "ExtraBody",
-    "FAILED_KEYS",
-    "FIRST_BAR_CONDITIONAL", "FailedLine", "Favour", "ITEM_KEYS", "InputRef", "ItemBody", "LOOSEN_POLICIES",
+    "CAVEAT_TEXT", "COMPLETE_TEXT", "DELAYED", "EXTRA_KEYS", "EXTRA_TEXT", "ExtraBody", "FAILED_KEYS",
+    "FIRST_BAR_CONDITIONAL", "FailedLine", "Favour", "ITEM_KEYS", "InputRef", "ItemBody", "LEGACY_ITEM_KEYS",
+    "LOOSEN_POLICIES",
     "MARKET_CLOSES",
     "NoticeBody", "PENDING_KEYS", "PRE_HEADER", "PRE_NOT_CONFIRMED_RELEASE", "PRE_NOT_CONFIRMED_TEXT",
     "PREVIOUS_POST_PENDING", "PendingBody", "Q10_REARM", "Q10_TELL", "RenderSettings", "Rendered", "STILL_WORSE",

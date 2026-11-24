@@ -29,6 +29,16 @@ changed: the rows replace every row of the named adapters, the other adapters' r
 the latest version unchanged (the loader reads exactly one version), and an identical set writes nothing.
 The write is the leader's (fenced on the epoch in the statement) and serialised by an advisory lock, so
 two writers never mint the same version.
+
+The engine's saver builds its rows from a read taken before the lock (`latest()`), and the operator's
+`market-sessions accept` (`src/ops/market_sessions.py`) writes its own version under the same lock
+(operations.md §10 Accept). So an accept is never lost to a save based on an older read, `save` re-merges under
+the lock: a `reviewed_config` row of a named adapter that the current version holds and the saver's read version
+did not (committed after that read) is kept over the saver's row for its symbol. The saver never saw it, so its
+row carries no decision about it; the next save, with a read that includes it, applies the refresher's usual merge
+(`src/runtime/schedule_refresh.py`: a reviewed row is kept where the broker gave nothing or only a flagged
+default). The read version is the one passed as `base_version`, else the one this store's last `latest()`
+returned (fix 2026-11-25, live review round 3).
 """
 from __future__ import annotations
 
@@ -52,6 +62,10 @@ SQL_LATEST_ROWS: Final = (
     "SELECT calendar_version, adapter_id, symbol, timezone, schedule, holidays, source, is_default, holidays_known, "
     "note FROM market_sessions "
     "WHERE calendar_version = (SELECT max(calendar_version) FROM market_sessions) ORDER BY adapter_id, symbol"
+)
+SQL_VERSION_ROWS: Final = (
+    "SELECT calendar_version, adapter_id, symbol, timezone, schedule, holidays, source, is_default, holidays_known, "
+    "note FROM market_sessions WHERE calendar_version = $1::bigint ORDER BY adapter_id, symbol"
 )
 SQL_INSERT_VERSION: Final = (
     "INSERT INTO market_sessions (calendar_version, adapter_id, symbol, timezone, schedule, holidays, source, "
@@ -138,6 +152,18 @@ def merge_rows(latest: Iterable[MarketSessionRow], fresh: Iterable[MarketSession
     return [out[k] for k in sorted(out)]
 
 
+def keep_accepted_since(merged: Iterable[MarketSessionRow], latest: Iterable[MarketSessionRow],
+                        base: Iterable[MarketSessionRow], adapters: Collection[str]) -> list[MarketSessionRow]:
+    """`merged` with every `reviewed_config` row of `adapters` that `latest` holds and `base` (the saver's read
+    version) did not hold as is: an operator's accept committed after that read is kept, not overwritten."""
+    seen = {r.key: r.content() for r in base}
+    out = {r.key: r for r in merged}
+    for r in latest:
+        if r.adapter_id in adapters and r.source == "reviewed_config" and seen.get(r.key) != r.content():
+            out[r.key] = r
+    return [out[k] for k in sorted(out)]
+
+
 def same_content(a: Iterable[MarketSessionRow], b: Iterable[MarketSessionRow]) -> bool:
     return sorted(r.content() for r in a) == sorted(r.content() for r in b)
 
@@ -153,18 +179,23 @@ class PgMarketSessionStore:
 
     def __init__(self, db: EngineDb) -> None:
         self._db = db
+        self._read_version: int | None = None     # the version the last latest() returned (the saver's read)
 
     async def latest(self) -> tuple[int, list[MarketSessionRow]]:
         async with self._db.source.acquire() as conn:
             rows = await conn.fetch(SQL_LATEST_ROWS)
         version = int(rows[0][0]) if rows else 0
+        self._read_version = version
         return version, [row_from_db(r) for r in rows]
 
-    async def save(self, rows: Sequence[MarketSessionRow], *, adapters: Collection[str]) -> SaveResult:
+    async def save(self, rows: Sequence[MarketSessionRow], *, adapters: Collection[str],
+                   base_version: int | None = None) -> SaveResult:
         """Store `rows` as the full set of the named `adapters` in a new calendar_version, when that changes
         anything. Every row must belong to one of `adapters` and parse (ScheduleError otherwise, nothing is
         written). Pass only adapters whose fetch succeeded: an adapter with no rows here loses its rows.
-        A lost fence raises EpochMismatch (the caller hard-exits)."""
+        `base_version` is the version `rows` were built from (default: this store's last `latest()`); a
+        `reviewed_config` row of a named adapter committed after it is kept (an operator's accept is never lost,
+        operations.md §10). A lost fence raises EpochMismatch (the caller hard-exits)."""
         wanted = set(adapters)
         if not wanted:
             raise ValueError("adapters is empty")
@@ -176,12 +207,18 @@ class PgMarketSessionStore:
                 raise ScheduleError(f"{r.adapter_id}:{r.symbol}: duplicate row")
             seen.add(r.key)
             r.validate()
+        base = self._read_version if base_version is None else base_version
+        self._read_version = None       # one read serves one save
         async with self._db.transaction() as tx:
             await tx.fetchrow(SQL_LOCK, MARKET_SESSIONS_LOCK)
             current = await tx.fetch(SQL_LATEST_ROWS)
             version = int(current[0][0]) if current else 0
             latest = [row_from_db(r) for r in current]
             merged = merge_rows(latest, rows, wanted)
+            if base is not None and version > base:
+                # a version committed after the saver's read (an operator accept): keep its reviewed rows
+                read = [row_from_db(r) for r in await tx.fetch(SQL_VERSION_ROWS, base)] if base > 0 else []
+                merged = keep_accepted_since(merged, latest, read, wanted)
             if not merged or same_content(merged, latest):
                 return SaveResult(version, False)
             cols = list(zip(*(r.content() for r in merged)))
@@ -190,4 +227,4 @@ class PgMarketSessionStore:
 
 
 __all__ = ["MARKET_SESSIONS_LOCK", "MarketSessionRow", "PgMarketSessionStore", "SOURCES", "SaveResult",
-           "SessionSource", "merge_rows", "row_from_db", "same_content"]
+           "SessionSource", "keep_accepted_since", "merge_rows", "row_from_db", "same_content"]

@@ -1,12 +1,14 @@
-"""Live review 2026-11-24 (catch-up run 71: '2 history rows without a broker revision / time skipped', complete=False,
-PAGE[high]): the real StoneX adapter's REST rows, run through the real IngestionOrchestrator.
+"""Live review round 3 (2026-11-25): the real StoneX adapter's REST rows, run through the real IngestionOrchestrator,
+after round 1's history filter and its widening of the accepted deviation were reverted.
 
-- A reconnect catch-up over a window with an open position whose nested stop / limit children are untimed, and a
-  working bracketed stop entry whose children are listed on their own (no Status or time), records complete with
-  no 'without a broker revision' note and pages nothing HIGH: the untimed working rows are present state the
-  snapshot committed, never history rows, and the entry's children carry the entry's broker time.
-- A snapshot after the stream stated the children PENDING agrees with it (PENDING, BROKER time), so a later stream
-  Pending re-send is no illegal transition (it was WORKING -> PENDING, parked in the DLQ)."""
+- ``adapter-isolation.md`` §4: fetch_history offers every working row, untimed or not. ``operations.md`` §17 step 3:
+  an untimed history row in a broker-time domain is skipped and reported, never labelled with the watermark, so a
+  catch-up over an open position's untimed children (and a working entry's own-row children, which keep the plain
+  untimed WORKING mapping) is **incomplete** (``oversee-rules.md`` §8 ``catchup_unverified``); the HIGH page names
+  the skipped ids and the uncovered window.
+- The 2026-11-21 accepted deviation (IfDone shape only) still holds end to end: a snapshot after the stream stated
+  the IfDone children PENDING agrees with it (PENDING at BROKER time), and a later stream re-send is no illegal
+  transition."""
 from __future__ import annotations
 
 import asyncio
@@ -20,17 +22,18 @@ from src.adapters.base import BrokerHistory
 from src.adapters.stonex.adapter import StoneXAdapter
 from src.db.uptime_store import Coverage
 from src.dto import OrderDTO, OrderStatus, PositionDTO
+from src.runtime.catchup import CatchupCoordinator, CatchupMetrics
 from tests.adapters.conftest import EURUSD_ID, TRADING, FakeStoneX, make_adapter, wcf
 from tests.adapters.test_stonex_history import trade
 from tests.pubsub.conftest import ManualClock, ev
 from tests.pubsub.test_catchup_hooks import HistoryAdapter
 from tests.pubsub.test_orchestrator import K, make, wait_for
-from src.runtime.catchup import CatchupCoordinator, CatchupMetrics
 from tests.runtime.test_catchup import FAST, Db, Rig, start
 
 T0 = 1_767_225_600_000
 NOW = T0 + 3_600_000
 _D = TypeVar("_D", OrderDTO, PositionDTO)
+IF_DONE = [{"Stop": {"OrderId": 971, "TriggerPrice": 1.083}}, {"Limit": {"OrderId": 972, "TriggerPrice": 1.075}}]
 
 
 @pytest.fixture(autouse=True)
@@ -47,9 +50,10 @@ def as_mock(dto: _D) -> _D:
     return replace(dto, adapter_id="mock", account_id="A1")
 
 
-def entry_row(oid: int, ts: int) -> dict[str, Any]:
+def entry_row(oid: int, ts: int, **extra: Any) -> dict[str, Any]:
     return {"OrderId": oid, "MarketId": int(EURUSD_ID), "Direction": "Sell", "Quantity": 10000, "TriggerPrice": 1.08,
-            "Type": 2, "ParentOrderId": None, "TradingAccountId": int(TRADING), "LastChangedDateTimeUTC": wcf(ts)}
+            "Type": 2, "ParentOrderId": None, "TradingAccountId": int(TRADING), "LastChangedDateTimeUTC": wcf(ts),
+            **extra}
 
 
 def child_row(oid: int, type_: int, parent: int) -> dict[str, Any]:
@@ -107,11 +111,12 @@ async def stonex_rig(tmp_path: Path, clock: ManualClock, ad: HistoryAdapter, db:
     return Rig(env, ad, db, coord, pages, stop, [asyncio.create_task(committer())])
 
 
-async def test_a_reconnect_catchup_over_untimed_working_children_is_complete_and_pages_nothing_high(
+async def test_a_catchup_over_untimed_working_rows_is_incomplete_and_pages_the_ids_and_window(
         tmp_path: Path, clock: ManualClock) -> None:
     stonex = await connected(live_book())
     snapshot_orders = [as_mock(o) for o in await stonex.fetch_open_orders()]
-    assert {o.broker_order_id for o in snapshot_orders if o.broker_updated_at_ms == 0} == {"901", "902"}
+    untimed = {o.broker_order_id for o in snapshot_orders if o.broker_updated_at_ms == 0}
+    assert untimed == {"901", "902", "971", "972"}            # own-row children keep the plain untimed WORKING
     ad = StoneXBacked(stonex)
     ad.open_orders = snapshot_orders
     ad.positions = [as_mock(p) for p in await stonex.fetch_positions()]
@@ -125,37 +130,36 @@ async def test_a_reconnect_catchup_over_untimed_working_children_is_complete_and
         await r.close()
         await stonex.close()
     ((_epoch, rec),) = r.db.records
-    assert rec.complete, rec.notes
-    assert not any("without a broker revision" in n for n in rec.notes)
-    assert not any(sev in ("high", "critical") for sev, _t, _b in r.pages), r.pages
-    for cid in ("971", "972"):                                    # the bracket children carry the entry's time
-        assert (r.db.orders[cid].status, r.db.orders[cid].broker_updated_at_ms) == (OrderStatus.PENDING,
-                                                                                     T0 + 120_000)
+    assert not rec.complete
+    (note,) = [n for n in rec.notes.split("; ") if "without a broker revision" in n]
+    assert all(oid in note for oid in untimed), note
+    high = [(t, b) for sev, t, b in r.pages if sev == "high" and "catch-up incomplete" in t]
+    assert len(high) == 1, r.pages
+    body = high[0][1]
+    assert "uncovered window" in body and "skipped (no version)" in body
+    assert all(oid in body for oid in untimed), body
 
 
-async def test_a_snapshot_after_the_streams_pending_children_keeps_them_pending_at_broker_time(
+async def test_a_snapshot_after_the_streams_pending_if_done_children_keeps_them_pending_at_broker_time(
         tmp_path: Path, clock: ManualClock) -> None:
     fake = FakeStoneX()
-    fake.actives = [entry_row(970, T0), child_row(971, 2, 970), child_row(972, 3, 970)]
+    fake.actives = [entry_row(970, T0, IfDone=IF_DONE)]
     stonex = await connected(fake)
     try:
         rest = {o.broker_order_id: as_mock(o) for o in await stonex.fetch_open_orders()}
     finally:
         await stonex.close()
+    assert all((rest[c].status, rest[c].broker_updated_at_ms) == (OrderStatus.PENDING, T0) for c in ("971", "972"))
     env = make(tmp_path, clock)
     for s in ("orders", "account", "prices"):
         env.item(s, ev(K.SUBSCRIBED, s))
     for oid in ("970", "971", "972"):                       # the stream states the children Pending at T0
-        stream = rest[oid] if oid == "970" else replace(rest[oid], status=OrderStatus.PENDING,
-                                                                broker_updated_at_ms=T0)
-        env.item("orders", stream)
+        env.item("orders", rest[oid])
     env.orders()
     env.adapter.open_orders = list(rest.values())
     await env.orch.run_snapshot("mock")
-    snap = {o.broker_order_id: o for o in env.orders()}
+    env.orders()
     for cid in ("971", "972"):
-        if cid in snap:                                     # identical key and content may be a no-op
-            assert snap[cid].status is OrderStatus.PENDING and snap[cid].broker_time_source == "BROKER"
         stored = env.orch.runtime("mock").orders.get(f"mock:{cid}")
         assert stored is not None and stored.status is OrderStatus.PENDING and stored.broker_time_source == "BROKER"
     # an entry amendment re-sends the children Pending: no illegal transition
