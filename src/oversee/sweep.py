@@ -35,7 +35,7 @@ from src.oversee.notify import (
     alerts_for_transitions,
     is_acknowledged,
 )
-from src.oversee.risk import RiskUnknown, effective_stop_detail, needs_stop
+from src.oversee.risk import STOP_KIND_INCONSISTENT, RiskUnknown, effective_stop_detail, needs_stop
 from src.oversee.rules import (
     INPUT_FLAG_RULES,
     STALE_ACCOUNT_IMAGE,
@@ -862,6 +862,12 @@ class RiskSweep:
                       if not held and (why is None or not _input_flag_state(s))
                       and not _closed_market_stale_mark(s, evals, snap)]
             self._dispatcher.mark_alerted(alerted, now)
+            # oversee-rules.md §6: a stop_kind_inconsistent re-page names only the inconsistent child ids, like its
+            # transition alert. This pass's ids only (never stored, never in the reason or the dedupe key).
+            self._dispatcher.stage_repage_details(
+                {k: ev.outcome.detail for k, ev in evals.items()
+                 if isinstance(ev.outcome, Unknown) and ev.outcome.reason == STOP_KIND_INCONSISTENT
+                 and ev.outcome.detail})
             try:
                 await self._dispatcher.queue_repages(states, snap.acks, now)
             except Exception as exc:

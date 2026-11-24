@@ -172,7 +172,7 @@ def _price(raw: JsonObj, *names: str) -> Decimal | None:
     return value if value is not None and value != 0 else None
 
 
-def rest_ts(raw: JsonObj) -> int:
+def _rest_ts(raw: JsonObj) -> int:
     """LastChangedDateTimeUTC when present; else 0 (untimed: labelled by the orchestrator)."""
     return parse_broker_time_ms(get_ci(raw, "LastChangedDateTimeUTC", "LastChangedDateTimeUtc")) or 0
 
@@ -193,7 +193,7 @@ def map_open_position(raw: JsonObj, *, account_id: str, lookup: SpecLookup,
         units=u.units, instrument_unknown=u.instrument_unknown, raw_qty=u.raw_qty,
         entry_price=_price(raw, "Price", "OpenPrice", "TriggerPrice"), status="OPEN",
         opened_by_client_order_id=position_id,
-        broker_updated_at_ms=rest_ts(raw), source="REST",
+        broker_updated_at_ms=_rest_ts(raw), source="REST",
     )
 
 
@@ -210,11 +210,9 @@ def map_stop_limit_order(raw: JsonObj, *, account_id: str, lookup: SpecLookup, p
     On the active list (or nested in a position) a missing Status means WORKING. With ``strict_status`` (a
     by-id read, which also returns orders that are no longer active) a missing or unrecognised Status is
     unmappable: the adapter never invents a status (IMPLEMENTATION_PLAN 8.1).
-    ``default_status`` / ``default_ts`` are for any child of a working (unfilled) entry, which carries neither:
-    nested in the entry's IfDone list, nested directly as its StopOrder / LimitOrder, or listed as its own active
-    row (live review 2026-11-24). The stream states such a child Pending, and the entry row carries the broker
-    time (``AttachedOrder.parent_ts``), so a snapshot agrees with the stream instead of reading WORKING untimed.
-    A Status or LastChangedDateTimeUTC the row states itself always wins over the defaults."""
+    ``default_status`` / ``default_ts`` are for an if-done child nested in a working entry's row, which carries
+    neither: the stream states such a child Pending, and the row it is nested in carries the broker time
+    (``AttachedOrder.parent_ts``), so a snapshot agrees with the stream instead of reading WORKING untimed."""
     order_id = to_id(get_ci(raw, "OrderId"))
     side = parse_side(get_ci(raw, "Direction")) or parse_side(default_side)
     if order_id is None or side is None:
@@ -236,7 +234,7 @@ def map_stop_limit_order(raw: JsonObj, *, account_id: str, lookup: SpecLookup, p
         ordered_units=u.units, remaining_units=remaining if not u.instrument_unknown else None,
         instrument_unknown=u.instrument_unknown, raw_qty=u.raw_qty,
         is_reduce_only=parent_id is not None, linked_position_id=parent_id,
-        broker_updated_at_ms=rest_ts(raw) or default_ts, source="REST",
+        broker_updated_at_ms=_rest_ts(raw) or default_ts, source="REST",
         order_kind=order_kind if order_kind is not None else order_kind_of(stop_limit_type(raw)),
     )
 
@@ -267,7 +265,7 @@ def map_trade_order(raw: JsonObj, *, account_id: str, lookup: SpecLookup, reduce
         ordered_units=u.units, remaining_units=remaining if not u.instrument_unknown else None,
         instrument_unknown=u.instrument_unknown, raw_qty=u.raw_qty,
         is_reduce_only=reduce_only, linked_position_id=linked_position_id,
-        broker_updated_at_ms=rest_ts(raw), source="REST",
+        broker_updated_at_ms=_rest_ts(raw), source="REST",
     )
 
 
@@ -282,10 +280,7 @@ class AttachedOrder:
     parent_side: str | None
     parent_qty: Decimal | None
     parent_market_id: str | None
-    # nested in the parent's IfDone list, not directly in it. Informational only: whether a child is an entry's
-    # bracket (PENDING at the entry's time) depends on its holder row being a working entry, never on the nesting
-    # (a working entry may hold its children directly as StopOrder / LimitOrder; live review 2026-11-24).
-    if_done: bool = False
+    if_done: bool = False   # nested in the parent's IfDone list (an entry's bracket), not directly in it
     parent_ts: int = 0      # the parent row's LastChangedDateTimeUTC (0 when it has none)
 
 
@@ -297,7 +292,7 @@ def attached_orders(parent: JsonObj) -> list[AttachedOrder]:
     side = get_ci(parent, "Direction")
     qty = to_decimal(get_ci(parent, "Quantity", "Qauantity"))
     market_id = to_id(get_ci(parent, "MarketId"))
-    parent_ts = rest_ts(parent)
+    parent_ts = _rest_ts(parent)
     found: list[AttachedOrder] = []
     holders = [parent, *get_list(parent, "IfDone")]
     for holder in holders:

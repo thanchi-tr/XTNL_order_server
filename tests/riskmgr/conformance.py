@@ -243,8 +243,6 @@ def _declarations(problems: list[str], owner: str, registry: ArmRegistry, strate
         problems.append(f"{owner}: loosen_policy is not a LoosenPolicy")
     if not isinstance(_call(problems, f"{owner}: latch", lambda: strategy.latch(params)), bool):
         problems.append(f"{owner}: latch is not a bool")
-    if not isinstance(_call(problems, f"{owner}: target_is_entry", lambda: strategy.target_is_entry(params)), bool):
-        problems.append(f"{owner}: target_is_entry is not a bool")
     if not isinstance(_call(problems, f"{owner}: arming_requirements",
                             lambda: strategy.arming_requirements(params)), ArmingRequirements):
         problems.append(f"{owner}: arming_requirements is not ArmingRequirements")

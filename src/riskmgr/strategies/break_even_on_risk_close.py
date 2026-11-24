@@ -150,11 +150,6 @@ class BreakEvenOnRiskClose:
     def latch(self, params: StrategyParams) -> bool:
         return params.param("latch") == "on"
 
-    def target_is_entry(self, params: StrategyParams) -> bool:
-        """`be_offset_r = 0` (Q6 default): the target `E + σ·be_offset_r·max(R, 0)` is `E` itself (notice wording
-        only, §B8; never read by a decision)."""
-        return Decimal(params.param("be_offset_r")) == 0
-
     def required_indicators(self, params: StrategyParams) -> tuple[IndicatorNeed, ...]:
         return ()
 

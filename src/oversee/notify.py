@@ -24,7 +24,7 @@ from typing import Final, Literal, Protocol
 
 from src.oversee.risk import STOP_KIND_INCONSISTENT
 from src.oversee.snapshot import BreachAck
-from src.oversee.types import BreachState, Level, Transition
+from src.oversee.types import BreachState, Level, StateKey, Transition
 
 AlertKind = Literal["episode", "repage", "trip", "info"]
 Severity = Literal["info", "high", "critical"]
@@ -154,13 +154,19 @@ def episode_key(rule_id: str, subject_type: str, subject_id: str, activation_id:
     return (rule_id, subject_type, subject_id, activation_id or 0, int(level))
 
 
-def _reason_text(t: Transition) -> str:
+def _with_detail(reason: str, detail: str | None) -> str:
     """The alert's reason: the reason code, plus, for `stop_kind_inconsistent`, the result's detail naming only the
     inconsistent child ids (oversee-rules.md §6; ids only, no prices). Other UNKNOWN details stay out of the alert
-    text, as before. The detail is never part of `t.reason`, so the code stays the first token of the body."""
-    if t.detail and t.reason == STOP_KIND_INCONSISTENT:
-        return f"{t.reason}: {t.detail}"
-    return t.reason
+    text, as before. The detail is never part of the stored reason, so the code stays the first token of the body
+    and acknowledgement and dedupe (reason, episode key) are unchanged."""
+    if detail and reason == STOP_KIND_INCONSISTENT:
+        return f"{reason}: {detail}"
+    return reason
+
+
+def _reason_text(t: Transition) -> str:
+    """A transition alert's reason (`_with_detail` of its own result's detail)."""
+    return _with_detail(t.reason, t.detail)
 
 
 def alerts_for_transitions(transitions: Iterable[Transition]) -> list[OutboxRow]:
@@ -197,7 +203,8 @@ def repage_candidate(state: BreachState, acks: Sequence[BreachAck]) -> EpisodeKe
 
 def repages_due(states: Iterable[BreachState], acks: Sequence[BreachAck], last_sent: Mapping[EpisodeKey, int],
                 now_ms: int, escalate_after_ms: int,
-                held: Callable[[BreachState], bool] | None = None) -> list[OutboxRow]:
+                held: Callable[[BreachState], bool] | None = None,
+                details: Mapping[StateKey, str] | None = None) -> list[OutboxRow]:
     """Re-page **every** active rule state (FLAG included: info severity, so email only) every
     escalate_after_ms unless acknowledged (oversee-rules.md §10, §2 "capped states ... re-page").
 
@@ -205,8 +212,14 @@ def repages_due(states: Iterable[BreachState], acks: Sequence[BreachAck], last_s
     delivered (held back by the AlertInhibitor, or written by an earlier leader whose relay never sent it) runs
     from the state's `active_since`, so it is not silent for ever. `held(state)`: the state's re-page is held back
     now (its adapter's dependent alerts are suppressed: maintenance window or epoch-change settle). The RiskSweep
-    passes no state at all for a flat account (oversee-rules.md §10 accepted deviation, `sweep._flat_account`)."""
+    passes no state at all for a flat account (oversee-rules.md §10 accepted deviation, `sweep._flat_account`).
+
+    `details`: this pass's UNKNOWN detail per state key. A `stop_kind_inconsistent` re-page names only the
+    inconsistent child ids, like its transition alert (oversee-rules.md §6 "naming only the inconsistent child ids",
+    "re-pages"; `_with_detail`). Only the current pass's ids are shown: a state without a detail now (for example one
+    whose result is known again and is releasing) re-pages with its reason alone, never with stale ids."""
     rows: list[OutboxRow] = []
+    detail_of = details or {}
     for s in states:
         if not s.active or is_acknowledged(s, acks):
             continue
@@ -218,7 +231,8 @@ def repages_due(states: Iterable[BreachState], acks: Sequence[BreachAck], last_s
             sent = s.active_since
         if sent is not None and now_ms - sent >= escalate_after_ms:
             rows.append(OutboxRow("repage", _severity(s.level), f"still {s.level.name} {s.rule_id} "
-                                  f"{s.subject_type}:{s.subject_id}", f"{s.reason} (cap {s.cap.value})",
+                                  f"{s.subject_type}:{s.subject_id}",
+                                  f"{_with_detail(s.reason, detail_of.get(s.key))} (cap {s.cap.value})",
                                   now_ms, key, s.account_id))
     return rows
 
@@ -300,6 +314,7 @@ class NotificationDispatcher:
         self._cadence: Callable[[], int] = _as_cadence(escalate_after_ms)
         self._lease_valid = lease_valid
         self._queued: dict[EpisodeKey, int] = {}   # re-page rows queued, by episode (pruned after a cadence)
+        self._staged_details: Mapping[StateKey, str] = {}   # `stage_repage_details`, taken by the next queue_repages
 
     def follow_cadence(self, escalate_after_ms: int | Callable[[], int]) -> None:
         """Re-page cadence from now on: a fixed value, or a callable re-read on every use."""
@@ -351,12 +366,23 @@ class NotificationDispatcher:
         for k in episodes:
             self._queued[k] = now_ms
 
+    def stage_repage_details(self, details: Mapping[StateKey, str]) -> None:
+        """This pass's UNKNOWN details per state key, for the very next `queue_repages` call only (it takes them and
+        clears them before its first await, so no later call sees them). The RiskSweep stages them right before it
+        queues; `queue_repages` keeps its three-argument signature, so the runtime's liveness wrapper that overrides
+        it still passes the child ids through (oversee-rules.md §6). In memory, no I/O."""
+        self._staged_details = dict(details)
+
     async def queue_repages(self, states: Iterable[BreachState], acks: Sequence[BreachAck], now_ms: int) -> int:
         """Queue the re-pages due (`repages_due`: every active state, FLAG included). One row per episode per
         cadence at most: a row the sender has not recorded in `notification_dedupe` yet (still pending, or
         suppressed by a sender whose own cadence is longer, or just alerted: `mark_alerted`) is not queued again
         on every pass. A state whose re-page is held back is simply not passed in (the RiskSweep filters the
-        stale / FENCE states of a suppressed adapter, and every state of a flat account: `sweep._flat_account`)."""
+        stale / FENCE states of a suppressed adapter, and every state of a flat account: `sweep._flat_account`).
+        The details staged by `stage_repage_details` (this pass's UNKNOWN details per state key, shown only for
+        `stop_kind_inconsistent`, `repages_due`) are taken here, before the first await. The signature stays the
+        plain three-argument one, which the runtime's liveness wrapper (`src/runtime/session.py`) overrides."""
+        details, self._staged_details = self._staged_details, {}
         cadence = self.escalate_after_ms
         self._queued = {k: at for k, at in self._queued.items() if now_ms - at < cadence}
         states = list(states)
@@ -365,7 +391,7 @@ class NotificationDispatcher:
         # Only the `notification_dedupe` rows of this pass's candidates are read (IMPLEMENTATION_PLAN 8.2): the
         # table grows with every episode ever paged, so a full read per account pass would grow without bound.
         last_sent = await self._dedupe.last_sent_of(wanted) if wanted else {}
-        rows = [r for r in repages_due(states, acks, last_sent, now_ms, cadence)
+        rows = [r for r in repages_due(states, acks, last_sent, now_ms, cadence, details=details)
                 if r.episode is None or r.episode not in self._queued]
         if rows:
             await self._outbox.add(rows)

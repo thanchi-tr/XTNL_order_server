@@ -48,7 +48,7 @@ from src.adapters.base import (
 from src.adapters.ratelimit import RestBudget, RestPriority, rest_priority
 from src.adapters.sessions import canonical
 from src.adapters.stonex.bars import RANGE_CAP, decode_bar_history, interval_for
-from src.adapters.stonex.codes import StoneXOrderType, canonical_status, order_kind_of, parse_side, parse_status
+from src.adapters.stonex.codes import StoneXOrderType, order_kind_of, parse_side
 from src.adapters.stonex.history import (
     map_stop_limit_history,
     map_trade_history_window,
@@ -72,7 +72,6 @@ from src.adapters.stonex.mapping import (
     map_trade_order,
     parent_of,
     parse_account_directory,
-    rest_ts,
 )
 from src.adapters.stonex.orders import ORDER_FIELDS, OrderItem, OrderStreamMapper
 from src.adapters.stonex.rest import OrderNotAccessibleError, StoneXRestClient, rest_get_only
@@ -554,7 +553,6 @@ class StoneXAdapter(BrokerAdapter):
         nested += [(client, child, True) for client, row in actives for child in attached_orders(row)]
         for _client, child, _entry in nested:
             self._mapper.learn_parent(str(to_id(get_ci(child.raw, "OrderId"))), child.parent_id)
-        entries = self._working_entries(actives)
 
         out: list[OrderDTO] = []
         seen: set[str] = set()
@@ -565,14 +563,9 @@ class StoneXAdapter(BrokerAdapter):
                 continue
             explicit = parent_of(row)
             self._mapper.learn_parent(order_id, explicit)
-            parent = self._mapper.parent_of(order_id)
-            # A child of a working entry listed as its own row (live review 2026-11-24: no Status or time of its
-            # own) is Pending at the entry row's broker time, as for a nested child below.
-            entry_ts = entries.get(parent) if parent is not None else None
             try:
-                dto = map_stop_limit_order(row, account_id=client, lookup=self._lookup, parent_id=parent,
-                                           default_status=OrderStatus.PENDING if entry_ts is not None else None,
-                                           default_ts=entry_ts or 0)
+                dto = map_stop_limit_order(row, account_id=client, lookup=self._lookup,
+                                           parent_id=self._mapper.parent_of(order_id))
             except UnmappableError as exc:
                 self._unmapped("orders", f"active order skipped: {exc}")
                 continue
@@ -583,12 +576,10 @@ class StoneXAdapter(BrokerAdapter):
             order_id = to_id(get_ci(child.raw, "OrderId"))
             if order_id is None or order_id in seen:
                 continue
-            # A child of a working (not yet filled) entry is Pending on the stream and its nested row has no status
-            # or time of its own: it takes Pending and the entry row's broker time, so a snapshot agrees with the
-            # stream (and heals a child the stream committed unlinked) instead of an untimed WORKING. Whatever the
-            # nesting (IfDone, or directly StopOrder / LimitOrder: live review 2026-11-24); a position's children,
-            # and those of an active row that is itself a child, stay WORKING.
-            bracket = of_entry and child.parent_id in entries
+            # An if-done child of a working (not yet filled) entry is Pending on the stream and its nested row has
+            # no status or time of its own: it takes Pending and the entry row's broker time, so a snapshot agrees
+            # with the stream (and heals a child the stream committed unlinked) instead of an untimed WORKING.
+            bracket = of_entry and child.if_done
             try:
                 dto = map_stop_limit_order(child.raw, account_id=client, lookup=self._lookup,
                                            parent_id=child.parent_id, default_side=child_side(child.parent_side),
@@ -603,22 +594,6 @@ class StoneXAdapter(BrokerAdapter):
             seen.add(order_id)
             out.append(dto)
         return out
-
-    def _working_entries(self, actives: Sequence[tuple[str, JsonObj]]) -> dict[str, int]:
-        """``{entry OrderId: its row's LastChangedDateTimeUTC (0 when untimed)}`` for every active row that is a
-        working entry: no ParentOrderId and no parent learnt (call after the nested children's ``learn_parent``,
-        so a row that is itself someone's nested child is never an entry), and no terminal Status stated. Rows on
-        activestoplimitorders are unfilled by definition; the Status check is only a guard."""
-        entries: dict[str, int] = {}
-        for _client, row in actives:
-            order_id = to_id(get_ci(row, "OrderId"))
-            if order_id is None or parent_of(row) is not None or self._mapper.parent_of(order_id) is not None:
-                continue
-            code = parse_status(get_ci(row, "Status"))
-            if code is not None and canonical_status(code).terminal:
-                continue
-            entries[order_id] = rest_ts(row)
-        return entries
 
     async def fetch_order_status(self, broker_order_id: str) -> OrderDTO | None:
         """GET order/{id} (active orders only); None when StoneX no longer lists it: an HTTP 404 or an answer whose
@@ -719,9 +694,7 @@ class StoneXAdapter(BrokerAdapter):
         history since ``since_ms`` (paged while pages come back full and oldest-first), the stop / limit order
         history when ``stop_limit_history`` is on (unconfirmed endpoint, default off), then the open positions
         and the active stop / limit orders (newest truth, read last). Rows the broker returns after
-        ``until_ms`` are kept (they are newer; the version compare orders them). Of the working rows, only those
-        changed in the window are listed: an untimed one (no time of its own nor its working entry's) is present
-        state the snapshot before this catch-up committed, never a history row (live review 2026-11-24).
+        ``until_ms`` are kept (they are newer; the version compare orders them).
 
         Incomplete (``complete=False``) when: the stop / limit history is off (stop / limit orders placed and
         cancelled while offline cannot be listed), a page stays full, a row cannot be mapped (counted on this
@@ -760,19 +733,9 @@ class StoneXAdapter(BrokerAdapter):
             map_stop_limit_history(stop_limits, since_ms=since_ms, until_ms=max(until_ms, since_ms),
                                    lookup=self._lookup, known_parent=self._mapper.parent_of,
                                    adapter_id=self.adapter_id, out=mapped, trade_rows=trades)
-            # Working now and changed in the window. An untimed working row is present state, not history: the
-            # snapshot this catch-up follows committed it (the orchestrator refuses an untimed history row in a
-            # broker-time domain, operations.md §17 step 3), and the by-id re-read covers the rest. Always mapped,
-            # so its parent and market are still learnt.
-            untimed: list[str] = []
             for dto in self._map_open_orders(positions, actives):
-                if dto.broker_updated_at_ms <= 0:
-                    untimed.append(dto.broker_order_id)
-                elif dto.broker_updated_at_ms >= since_ms:
-                    mapped.add_order(dto)
-            if untimed:
-                log.info("stonex history: %d untimed working order(s) left to the snapshot: %s", len(untimed),
-                         ",".join(untimed[:20]))
+                if dto.broker_updated_at_ms == 0 or dto.broker_updated_at_ms >= since_ms:
+                    mapped.add_order(dto)      # working now and changed in the window (or untimed: cannot tell)
             for why in mapped.unmapped:
                 self._unmapped("orders", f"history: {why}")
         if read.unmapped > 0:                 # history rows + open rows of the window: retryable (this side)
