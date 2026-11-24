@@ -1099,7 +1099,8 @@ class EngineSession:
                 ready=self._adapter_streaming, wanted_symbols=self._schedule_symbols,
                 stored_symbols=self._stored_symbols, reload=self._reload_calendar,
                 calendar_version=lambda: self.calendar.version, pager=self.page, clock_ms=ctx.clock_ms,
-                refresh_ms=self._t.schedule_refresh_ms, retry_ms=self._t.schedule_retry_ms)
+                refresh_ms=self._t.schedule_refresh_ms, retry_ms=self._t.schedule_retry_ms,
+                review_dedupe=ports.dedupe)    # the review page: once per change, not once per term
 
         # --- Oversee ----------------------------------------------------------------------------------
         # Dependent (stale / FENCE) alert rows are held back during an adapter's maintenance window (no settle

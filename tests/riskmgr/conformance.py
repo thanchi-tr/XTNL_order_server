@@ -90,6 +90,10 @@ class StrategyCase:
     evaluations: tuple[EvalCase, ...]
     old_states: tuple[tuple[int, StrategyState], ...] = ()
     """`(from_impl_version, state)` for `migrate_state`: at least one per older registered version of the KIND."""
+    break_even_target: bool = False
+    """The kind advises break-even or beyond (kind (a)): at every bar-end evaluation, REOPEN included, the target and
+    every proposed level are at or beyond `ctx.entry` (never on the loss side), and `at_target` never holds while a
+    handle is on the loss side of `ctx.entry` (a release is break-even confirmed; live review)."""
 
 
 @dataclass(frozen=True)
@@ -318,6 +322,14 @@ def _evaluations(problems: list[str], owner: str, strategy: SlStrategy, params: 
             current = {HandleRef(h.kind, h.handle_id) for h in ev.ctx.handles}
             if not {h for h, _ in evaluation.proposal.targets} <= current:
                 problems.append(f"{where}: the proposal names a handle the context does not hold")
+        if case.break_even_target and ev.event in BAR_END_EVENTS:
+            sig = 1 if ev.ctx.side == "BUY" else -1
+            levels = ([evaluation.target] if evaluation.target is not None else []) + [
+                t for _, t in (evaluation.proposal.targets if evaluation.proposal is not None else ())]
+            if any(sig * (t - ev.ctx.entry) < 0 for t in levels):
+                problems.append(f"{where}: a target on the loss side of entry")
+            if result[1] is True and any(sig * (h.level - ev.ctx.entry) < 0 for h in ev.ctx.handles):
+                problems.append(f"{where}: at_target with a handle on the loss side of entry")
         if ev.event in BAR_END_EVENTS:
             if not isinstance(result[1], bool):
                 problems.append(f"{where}: at_target is not a bool")
@@ -434,11 +446,38 @@ def check_registry(registry: ArmRegistry, strategy_cases: Mapping[tuple[str, int
 
 
 # ---------------------------------------------------------------------------------------------------- the engine's cases
+def reopen_after_repin_evals() -> tuple[EvalCase, ...]:
+    """REOPEN after an E re-pin (live review, finding 1), long and short: a trigger recorded at E = 1.20000 with
+    offset 0 (target 1.20000), then E re-pinned 0.00010 further from the stop; the stored state is what the tracker
+    writes with the re-pin (`state_after_entry_repin`: the target dropped, `latched` kept). One handle at the new S0,
+    one at the old target (on the loss side of the new E): neither may get a loss-side target or count as at target."""
+    from decimal import Decimal
+
+    from src.riskmgr.tracker import state_after_entry_repin
+    out: list[EvalCase] = []
+    for sig, side in ((1, "BUY"), (-1, "SELL")):
+        old_e = Decimal("1.20000")
+        new_e = old_e + sig * Decimal("0.00010")
+        s0 = new_e - sig * Decimal("0.00100")
+        recorded = StrategyState.of(latched=True, target=old_e)
+        kept = StrategyState.decode(state_after_entry_repin(recorded.encode(), frozenset({"latched", "target"}),
+                                                            repinned=True))
+        assert kept is not None
+        close = str(new_e + sig * Decimal("0.00390"))
+        for handle in (s0, old_e):
+            ctx = kind_a.s_ctx(close, side=side, event=ArmEvent.REOPEN, entry=str(new_e), s0=str(s0),
+                               stop=str(handle), handles=[str(handle)])
+            out.append(EvalCase(ctx, kept, ArmEvent.REOPEN, True))
+    return tuple(out)
+
+
 STRATEGY_CASES[("break_even_on_risk_close", 1)] = StrategyCase(
     params=kind_a.strategy_row(),
     invalid_params=kind_a.STRATEGY_INVALID,
     arm_ctx=kind_a.s_arm_ctx(),
-    evaluations=tuple(EvalCase(ctx, state, event, met) for ctx, state, event, met in kind_a.strategy_evals()),
+    evaluations=(*(EvalCase(ctx, state, event, met) for ctx, state, event, met in kind_a.strategy_evals()),
+                 *reopen_after_repin_evals()),
+    break_even_target=True,
 )
 GUARD_CASES[("first_bar", 1)] = GuardCase(
     params=kind_a.GUARD_PARAMS,

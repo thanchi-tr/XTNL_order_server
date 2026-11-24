@@ -258,7 +258,9 @@ class MissingStopLossRule:
         since = snap.stop_watch.get((subject.subject_type, subject.subject_id))
         if since is not None and ctx.now_ms - since >= self.cfg.grace_ms:
             return Result(Level.SOFT_HALT, "missing_stop_loss")
-        return Result(Level.PASS, "stop_grace")
+        # The grace holds an active state (a stop removed under a stop_kind_inconsistent or missing_stop_loss
+        # state): never a 'resolved / No action' alert while the entity has no stop, and the same episode goes on.
+        return Result(Level.PASS, "stop_grace", release_level=Level.SOFT_HALT, holds=True)
 
 
 @dataclass

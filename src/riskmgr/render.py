@@ -65,6 +65,17 @@ PRE_HEADER: Final = "PROVISIONAL, final advice after the bar closes"
 COMPLETE_TEXT: Final = "released: the bar end confirmed break-even; the ARM no longer manages this position"
 Q10_TELL: Final = "if the stop is moved back below the target later, you are told only"
 Q10_REARM: Final = "if the stop is moved back below the target later, the ARM manages the position again"
+"""`Q10_TELL` / `Q10_REARM` are the long (BUY) forms of `q10_text`, kept for existing readers."""
+_LOOSER: Final = {"BUY": "below", "SELL": "above"}
+"""The direction a stop moves when it is loosened past the target: below it for a long, above it for a short."""
+
+
+def q10_text(side: str, rearm: bool) -> str:
+    """The Q10 release sentence for a position of `side`: "below" the target for a long, "above" it for a short, and
+    side-neutral ("past") for an empty or unknown side (an older body), never a guessed direction."""
+    tail = "the ARM manages the position again" if rearm else "you are told only"
+    return f"if the stop is moved back {_LOOSER.get(side, 'past')} the target later, {tail}"
+
 NO_BROKER_BAR_PRE_REASON: Final = "pre_not_confirmed"
 """The `NO_BROKER_BAR` reason after this bar's PRE proposed a move (`pipeline.NO_TRADE_PRE_NOT_CONFIRMED`): the item
 is shown as not confirmed (S38c review)."""
@@ -497,7 +508,12 @@ class Favour:
 def favour_figures(item: ItemBody, bars: Mapping[tuple[str, int], Bar] | None,
                    keyring: Keyring | None) -> Favour | None:
     """Favour R and favour / risk from a re-read bar whose keyed hash verifies (R11-M14); None otherwise, and always
-    None for a PRE item (C5)."""
+    None for a PRE item (C5). Favour / risk divides by `current_risk_r` (the stop read now), which is the stop the
+    trigger tested only when nothing moved it after the bar end: it is shown only for a plain on-time POST with no
+    `pre_basis_held` / `stop_changed_after_bar_end` caveat and no `AT_PRE` basis, and only when it agrees with the
+    decision (`>= 1` with the trigger met, `< 1` without; within `PER_RISK_BAND` of 1 either way, or `borderline`,
+    since `ge` / `gt` and the 0.01 R rounding blur it). Otherwise it is omitted rather than shown contradicting the
+    decision (live review: a stop moved after the bar end gave "favour / risk 2.000" next to BELOW_TRIGGER)."""
     if item.event == "PRE" or bars is None or keyring is None or item.trigger_input is None:
         return None
     ref = parse_input(item.trigger_input)
@@ -515,9 +531,24 @@ def favour_figures(item: ItemBody, bars: Mapping[tuple[str, int], Bar] | None,
         return None
     favour = RMultiple.of(sig * (bar.close - item.entry) / r)
     per_risk = None
-    if item.current_risk_r is not None and item.current_risk_r > 0:
-        per_risk = Ratio.of(favour.value / item.current_risk_r)
+    if item.current_risk_r is not None and item.current_risk_r > 0 and _per_risk_basis_known(item):
+        ratio = favour.value / item.current_risk_r
+        near = item.borderline or abs(ratio - 1) <= PER_RISK_BAND
+        if near or (ratio >= 1) is item.trigger_met:
+            per_risk = Ratio.of(ratio)
     return Favour(favour, per_risk)
+
+
+PER_RISK_BAND: Final = Decimal("0.03")
+"""Favour / risk this close to 1 is consistent with either decision (the strategy's borderline band)."""
+_PER_RISK_UNKNOWN_BASIS: Final = frozenset({"pre_basis_held", "stop_changed_after_bar_end"})
+
+
+def _per_risk_basis_known(item: ItemBody) -> bool:
+    """`current_risk_r` is the risk the trigger tested: a plain on-time POST with a decided trigger, no caveat saying
+    the tested stop differs from the current one, and no `AT_PRE` basis."""
+    return (item.event == "POST" and not item.late and item.trigger_met is not None
+            and item.stop_basis != "AT_PRE" and not _PER_RISK_UNKNOWN_BASIS.intersection(item.caveats))
 
 
 # ---------------------------------------------------------------------------------------------------- the renderer
@@ -586,7 +617,7 @@ def outcome_text(item: ItemBody, settings: RenderSettings) -> str:
             return f"provisional: the rule would move the stop{stop}{detail} {STILL_WORSE}"
         return f"ADJUST: move the stop{stop}{detail} {STILL_WORSE}"
     if o == Outcome.COMPLETE.value:
-        return f"{COMPLETE_TEXT} ({Q10_REARM if item.loosen_policy == 'REARM' else Q10_TELL})"
+        return f"{COMPLETE_TEXT} ({q10_text(item.side, item.loosen_policy == 'REARM')})"
     if o == Outcome.PRE_NOT_CONFIRMED.value:
         why = "at target, not yet confirmed" if item.reason == Outcome.AT_TARGET_UNCONFIRMED.value \
             else _reason_text(item)
@@ -595,7 +626,7 @@ def outcome_text(item: ItemBody, settings: RenderSettings) -> str:
         return AT_TARGET_TEXT
     if o == Outcome.LOOSENED_AFTER_COMPLETE.value:
         # the outcome exists only for a TELL_ONLY pin (a REARM pin re-arms instead): always the tell-only text
-        return f"the stop was moved back after release ({Q10_TELL})"
+        return f"the stop was moved back after release ({q10_text(item.side, False)})"
     if o == Outcome.BROKER_AHEAD.value:
         return "the broker stop is already at or beyond the proposed level; nothing to move"
     if o in (Outcome.STRATEGY_REASON.value, Outcome.GUARD_REASON.value):
@@ -711,6 +742,7 @@ __all__ = [
     "NoticeBody", "PENDING_KEYS", "PRE_HEADER", "PRE_NOT_CONFIRMED_RELEASE", "PRE_NOT_CONFIRMED_TEXT",
     "PREVIOUS_POST_PENDING", "PendingBody", "Q10_REARM", "Q10_TELL", "RenderSettings", "Rendered", "STILL_WORSE",
     "bar_reads",
-    "decode_body", "encode_body", "esc", "favour_figures", "item_lines", "outcome_text", "parse_input", "render",
+    "decode_body", "encode_body", "esc", "favour_figures", "item_lines", "outcome_text", "parse_input", "q10_text",
+    "render",
     "subject", "times", "trigger_input",
 ]

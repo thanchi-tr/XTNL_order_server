@@ -512,9 +512,9 @@ async def test_repeating_condition_pages_are_latched() -> None:
     sweep = env2.sweep
     env2.pages.clear()
     for _ in range(3):
-        sweep._check_pass_time(T0, T0 + 2500)
-    sweep._check_pass_time(T0 + 3000, T0 + 3200)          # a fast pass ends the condition
-    sweep._check_pass_time(T0 + 4000, T0 + 6000)
+        sweep._check_pass_time(2500, 2500)
+    sweep._check_pass_time(200, 3200)                     # a fast pass ends the condition
+    sweep._check_pass_time(2000, 6000)
     assert [p.code for p in env2.pages] == ["slow_pass", "slow_pass"]
 
 

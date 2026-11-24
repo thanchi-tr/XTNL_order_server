@@ -25,7 +25,9 @@ For each account whose image is **fresh** (no fence, no integrity incident, catc
   included: E, units and S0 re-pinned, bar 0 kept), any other units increase (SUSPENDED: notice and page, re-paged
   every 6 h), a units decrease (pinned units lowered, so a later scale-in still suspends), `ROLL_ADJUST` (E kept; noted
   once, durably, by the `roll_note` fingerprint in `state_reason`, so a takeover neither re-pins nor re-notices it)
-  and entry corrections (E re-pinned, noted). An `ESTIMATED` entry time is upgraded to `STREAM` / `BROKER` while bar
+  and entry corrections (E re-pinned, noted). Every re-pin of E or S0 (fill progress, entry correction, local rearm)
+  drops the recorded `target` from the strategy state in the same CAS (`state_after_entry_repin`; `latched` kept), so a
+  REOPEN recomputes it from the new E and S0 and never advises, or releases at, a target on the loss side of entry. An `ESTIMATED` entry time is upgraded to `STREAM` / `BROKER` while bar
   0's `decision_cap` has not passed (§B7). A pinned version this node cannot load suspends the position.
 * **Ended rows**: an OPEN position whose row is CLOSED or DISARMED (an `arm_disarm`, or a position that came back) is
   never armed again and never counted as "assigned, not armed" (one `ArmStateStore.position` read per position and
@@ -484,6 +486,27 @@ def guards_json(params: StrategyParams) -> str:
     return json.dumps([g.canonical() for g in params.guards], sort_keys=True, separators=(",", ":"))
 
 
+REPIN_STALE_FIELD: Final = "target"
+"""The `STATE_SCHEMA` field a re-pin of E or S0 makes stale (kind (a)'s recorded target, `REOPEN_POLICY =
+REUSE_TARGET`): it was computed from the old E and S0 (`E + σ·be_offset_r·max(R, 0)`), so after a re-pin it can sit on
+the loss side of the new E."""
+
+
+def state_after_entry_repin(state_json: str, schema: frozenset[str] | None, *, repinned: bool) -> str:
+    """The stored strategy state to write with a re-pin of E or S0 (FILL_PROGRESS, ENTRY_CORRECTION, local rearm):
+    `REPIN_STALE_FIELD` dropped when the pinned version's `STATE_SCHEMA` declares it and the state holds it, every
+    other field (`latched`) kept. A REOPEN then recomputes the target from the re-pinned E and S0, so it never reuses a
+    target recorded under the old E (a stop advised on the loss side of entry, or a release with the stop there).
+    Unchanged when nothing was re-pinned, the version is unknown (`schema` None), the schema has no such field or the
+    state does not decode."""
+    if not repinned or schema is None or REPIN_STALE_FIELD not in schema:
+        return state_json
+    state = StrategyState.decode(state_json)
+    if state is None or state.text(REPIN_STALE_FIELD) is None:
+        return state_json
+    return StrategyState(tuple((k, v) for k, v in state.fields if k != REPIN_STALE_FIELD)).encode()
+
+
 @dataclass(frozen=True)
 class _Plan:
     entry: StrategyEntry
@@ -846,6 +869,13 @@ class ArmTracker:
         except ParamError:
             return A.PIN_REFUSED
 
+    def _repinned_state(self, row: ArmPositionRow, entry: Decimal, s0: Decimal) -> str:
+        """`row.strategy_state_json` for a row whose E / S0 become `entry` / `s0` (`state_after_entry_repin`, written in
+        the same CAS as the new levels)."""
+        strategy = self._registry.strategy(row.strategy_kind, row.strategy_impl_version)
+        return state_after_entry_repin(row.strategy_state_json, None if strategy is None else strategy.STATE_SCHEMA,
+                                       repinned=entry != row.entry_level or s0 != row.s0_level)
+
     def _pinned(self, row: ArmPositionRow) -> StrategyParams | None:
         """The stored pin re-parsed (`new_pin=False`), or None when this node cannot load it."""
         try:
@@ -1129,6 +1159,7 @@ class ArmTracker:
                           updated_at_ms=now)
             if s0 is not None:
                 new = replace(new, s0_level=s0.level, s0_source=s0.source.value)
+            new = replace(new, strategy_state_json=self._repinned_state(row, new.entry_level, new.s0_level))
             if await self._cas(row, new):
                 self.counters.repinned += 1
                 self._notice(NoticeKind.REPINNED, row, "fill_progress", now)
@@ -1143,8 +1174,10 @@ class ArmTracker:
             if await self._cas(row, replace(row, state_reason=A.roll_note(ref, p.entry_price), updated_at_ms=now)):
                 self._notice(NoticeKind.ROLL_ADJUST, row, "roll_adjust", now)
         elif change is A.Change.ENTRY_CORRECTION:
+            state_json = self._repinned_state(row, p.entry_price, row.s0_level)
             if await self._cas(row, replace(row, entry_level=p.entry_price, pinned_units=p.units,
-                                            state_reason="entry_corrected", updated_at_ms=now)):
+                                            strategy_state_json=state_json, state_reason="entry_corrected",
+                                            updated_at_ms=now)):
                 self.counters.repinned += 1
                 self._notice(NoticeKind.ENTRY_CORRECTED, row, "entry_corrected", now)
 
@@ -1439,7 +1472,9 @@ class ArmTracker:
         seq = row.decision_seq + 1 if span is not None else row.decision_seq
         new = replace(row, state=t.state.value, prior_state=None if t.prior_state is None else t.prior_state.value,
                       state_reason="local_rearm", entry_level=p.entry_price, pinned_units=p.units,
-                      s0_level=s0.level, s0_source=s0.source.value, last_decided_bar=frontier.cursor_ms,
+                      s0_level=s0.level, s0_source=s0.source.value,
+                      strategy_state_json=self._repinned_state(row, p.entry_price, s0.level),
+                      last_decided_bar=frontier.cursor_ms,
                       last_decided_hash=frontier.last_hash, decision_seq=seq, pending_event=None,
                       pending_bar_end_ms=None, updated_at_ms=now)
         span_row = None if span is None else self._span_row(new, span, spec, seq, now)
@@ -1506,5 +1541,5 @@ __all__ = [
     "SPAN_FIRST_BAR_STALE", "TASK", "TrackerCounters", "TrackerNotice", "TrackerNoticePort", "TrackerRequest",
     "TrackerSettings", "TrackerSnapshotPort", "FIRST_BAR_SCAN_BUCKETS", "FIRST_BAR_SCAN_MS", "GUARD_SCAN_BARS",
     "first_bar_end", "guard_horizon_end", "guards_apply", "guards_json", "moot", "open_bar_ends_after", "params_json",
-    "past_guards", "refused", "version_scopes",
+    "past_guards", "refused", "version_scopes", "REPIN_STALE_FIELD", "state_after_entry_repin",
 ]

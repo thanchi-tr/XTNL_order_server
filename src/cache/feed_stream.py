@@ -3,24 +3,38 @@
 The single Redis reader of the feed. The entry record (`FeedEntry`) and the consumer-group name live here
 so src.oversee.feed can import them without a cycle (src.oversee.feed re-exports all three).
 
-* `read_group`: XREADGROUP > (new entries for this consumer; first delivery).
+* `read_group`: XREADGROUP > (new entries for this consumer; first delivery). A client-side socket timeout
+  on the BLOCK read (redis.exceptions.TimeoutError, e.g. after an event-loop stall) reads as empty: redis-py
+  has already dropped that connection, and anything Redis put in the PEL is recovered by `read_own_pending`
+  (the observer's drain after an empty read) or, failing that, XAUTOCLAIM. Only
+  timeouts that persist without a single good read for `max_timeout_streak_s` re-raise, so a Redis that keeps
+  timing out still ends the feed task and reaches the supervisor. Connection errors are never swallowed.
 * `autoclaim`: XAUTOCLAIM entries idle >= min_idle_ms, then ONE XPENDING range over the claimed ids for
   their delivery counts (the claim itself counts as a delivery), so a batch costs two round trips.
+* `read_own_pending`: XREADGROUP 0 (this consumer's own PEL, e.g. entries of a timed-out read), with counts.
 * `ack`: XACK. `boot_id`: GET redis:boot_id (the observer consumes nothing until it equals run_id:epoch).
 * `ensure_group`: XGROUP CREATE ... 0 MKSTREAM; BUSYGROUP counts as success (SM8 step 2).
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+import logging
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, cast
 
 import redis.asyncio as aioredis
 from redis.exceptions import ResponseError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from src.cache import keys as K
 
 FEED_GROUP: Final = "oversee"
+# Below the feed-observer task's 30 s max stamp age: a streak of read timeouts this long re-raises.
+MAX_TIMEOUT_STREAK_S: Final = 20.0
+_WARN_EVERY_S: Final = 60.0
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -51,11 +65,17 @@ def _fields(raw: object) -> dict[str, str]:
 
 class RedisFeedStream:
     def __init__(self, redis: aioredis.Redis, consumer: str, *, stream: str = K.FEED,
-                 group: str = FEED_GROUP) -> None:
+                 group: str = FEED_GROUP, max_timeout_streak_s: float = MAX_TIMEOUT_STREAK_S,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
         self._r = redis
         self._consumer = consumer
         self._stream = stream
         self._group = group
+        self._max_streak_s = max_timeout_streak_s
+        self._mono = monotonic
+        self._timeout_since: float | None = None   # start of the current run of read timeouts
+        self._last_warn: float | None = None
+        self.read_timeouts = 0                     # total timed-out BLOCK reads (diagnostics)
 
     async def boot_id(self) -> str | None:
         v = await self._r.get(K.BOOT_ID)
@@ -69,18 +89,57 @@ class RedisFeedStream:
                 raise
 
     async def read_group(self, count: int, block_ms: int) -> list[FeedEntry]:
-        resp: Any = await self._r.xreadgroup(self._group, self._consumer, {self._stream: ">"}, count=count,
-                                             block=block_ms)
+        try:
+            resp: Any = await self._r.xreadgroup(self._group, self._consumer, {self._stream: ">"}, count=count,
+                                                 block=block_ms)
+        except RedisTimeoutError:
+            return self._on_read_timeout()
+        self._timeout_since = None
         out: list[FeedEntry] = []
         for _name, items in cast(list[tuple[object, list[tuple[object, object]]]], resp or []):
             out += [FeedEntry(_s(i), _fields(f), 1) for i, f in items if f is not None]
         return out
+
+    def _on_read_timeout(self) -> list[FeedEntry]:
+        """A timed-out BLOCK read means the same as an empty one, unless the timeouts have lasted too long."""
+        now = self._mono()
+        self.read_timeouts += 1
+        if self._timeout_since is None:
+            self._timeout_since = now
+        elif now - self._timeout_since >= self._max_streak_s:
+            raise RedisTimeoutError(f"oversee:feed XREADGROUP timed out continuously for "
+                                    f"{now - self._timeout_since:.0f} s")
+        if self._last_warn is None or now - self._last_warn >= _WARN_EVERY_S:
+            self._last_warn = now
+            log.warning("oversee:feed XREADGROUP read timed out (TimeoutError); treated as empty "
+                        "(%d timed-out reads so far)", self.read_timeouts)
+        return []
 
     async def autoclaim(self, min_idle_ms: int, count: int) -> list[FeedEntry]:
         resp: list[Any] = await self._r.xautoclaim(self._stream, self._group, self._consumer,
                                                    min_idle_time=min_idle_ms, start_id="0-0", count=count)
         items = [(_s(i), f) for i, f in cast(list[tuple[object, object]], resp[1] if len(resp) > 1 else [])
                  if f is not None]   # a trimmed entry comes back without fields: nothing to wake
+        return await self._with_deliveries(items, count)
+
+    async def read_own_pending(self, count: int) -> list[FeedEntry]:
+        """This consumer's own pending entries (XREADGROUP id 0, no BLOCK): entries Redis delivered to a read
+        whose reply was lost (a timed-out BLOCK read, a crash). Redis counts each such read as a delivery; the
+        counts come from one XPENDING range. A trimmed entry (no fields: nothing to wake) is XACKed here."""
+        resp: Any = await self._r.xreadgroup(self._group, self._consumer, {self._stream: "0"}, count=count)
+        items: list[tuple[str, object]] = []
+        trimmed: list[str] = []
+        for _name, rows in cast(list[tuple[object, list[tuple[object, object]]]], resp or []):
+            for i, f in rows:
+                if f is None or f == {} or f == []:
+                    trimmed.append(_s(i))
+                else:
+                    items.append((_s(i), f))
+        if trimmed:
+            await self._r.xack(self._stream, self._group, *trimmed)
+        return await self._with_deliveries(items, count)
+
+    async def _with_deliveries(self, items: list[tuple[str, object]], count: int) -> list[FeedEntry]:
         if not items:
             return []
         ids = sorted((i for i, _ in items), key=_id_key)

@@ -45,7 +45,9 @@ FILL: Final = B0 + 6 * 60_000
 @dataclass(frozen=True)
 class StrategyVector:
     """One strategy context and what a conforming version answers. `moves` is the number of handles the proposal
-    moves (None: not checked); `at_target` is checked on bar-end events only (None: not checked)."""
+    moves (None: not checked); `at_target` is checked on bar-end events only (None: not checked); `target` is the
+    level the evaluation and every proposed move must carry (None: not checked), so a version advising the wrong
+    level (a loss-side target, say) fails the probe."""
 
     name: str
     row: Mapping[str, object] = field(repr=False)
@@ -55,6 +57,7 @@ class StrategyVector:
     reason: str | None = None
     moves: int | None = None
     at_target: bool | None = None
+    target: Decimal | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -85,11 +88,12 @@ def strategy_row(**over: object) -> dict[str, object]:
     return row
 
 
-def _s_ctx(close: str, *, side: str = "BUY", stop: str | None = None, event: ArmEvent = ArmEvent.POST) -> BarContext:
-    """Entry 1.20000, S0 one hundred increments on the losing side (1 R = 0.00100), one child stop at `stop` (S0 by
-    default), the trigger-side final bar closing at `close` (bar-end events)."""
+def _s_ctx(close: str, *, side: str = "BUY", stop: str | None = None, event: ArmEvent = ArmEvent.POST,
+           s0: str | None = None, s0_source: S0Source = S0Source.AT_FILL) -> BarContext:
+    """Entry 1.20000, S0 one hundred increments on the losing side (1 R = 0.00100; or `s0`), one child stop at
+    `stop` (S0 by default), the trigger-side final bar closing at `close` (bar-end events)."""
     long = side == "BUY"
-    first = BASE - 100 * INCREMENT if long else BASE + 100 * INCREMENT
+    first = D(s0) if s0 is not None else (BASE - 100 * INCREMENT if long else BASE + 100 * INCREMENT)
     current = D(stop) if stop is not None else first
     bar_end = event in BAR_END_EVENTS
     c = D(close)
@@ -97,7 +101,7 @@ def _s_ctx(close: str, *, side: str = "BUY", stop: str | None = None, event: Arm
     return BarContext(
         position_id="V1", adapter_id=ADAPTER, symbol=SYMBOL, side="BUY" if long else "SELL", bar_spec=M15,
         event=event, bar_end_ms=B0 + 4 * Q, bar_index=3, entry=BASE, entry_time_ms=FILL,
-        entry_time_source=EntryTimeSource.STREAM, s0=first, s0_source=S0Source.AT_FILL,
+        entry_time_source=EntryTimeSource.STREAM, s0=first, s0_source=s0_source,
         handles=(HandleView(kind="CHILD_ORDER", handle_id="V1-S", level=current),), stop=current,
         stop_at_t=current if bar_end else None, price_increment=INCREMENT,
         bar=_bar(B0 + 3 * Q, c, c, c, c, trigger) if bar_end else None)
@@ -139,13 +143,22 @@ def _kind_a_vectors() -> tuple[StrategyVector, ...]:
     s0 = StrategyState.of(latched=False)
     row = strategy_row()
     return (
-        StrategyVector("above_trigger_long", row, _s_ctx("1.20101"), s0, True, moves=1, at_target=False),
+        StrategyVector("above_trigger_long", row, _s_ctx("1.20101"), s0, True, moves=1, at_target=False,
+                       target=D("1.20010")),
         StrategyVector("equal_is_not_above", row, _s_ctx("1.20100"), s0, False, reason="BELOW_TRIGGER"),
         StrategyVector("not_in_favour", row, _s_ctx("1.19950"), s0, False, reason="NOT_IN_FAVOUR"),
         StrategyVector("above_trigger_short", row, _s_ctx("1.19899", side="SELL"), s0, True, moves=1,
-                       at_target=False),
+                       at_target=False, target=D("1.19990")),
+        StrategyVector("short_equal_is_not_above", row, _s_ctx("1.19900", side="SELL"), s0, False,
+                       reason="BELOW_TRIGGER"),
+        StrategyVector("short_not_in_favour", row, _s_ctx("1.20050", side="SELL"), s0, False,
+                       reason="NOT_IN_FAVOUR"),
         StrategyVector("stop_at_target", row, _s_ctx("1.20101", stop="1.20010"), s0, True, moves=0,
-                       at_target=True),
+                       at_target=True, target=D("1.20010")),
+        # S0 first seen already in profit (R < 0): no buffer, so the target is E itself, never past it on the loss side
+        StrategyVector("r_negative_no_buffer", strategy_row(be_offset_r="0.5"),
+                       _s_ctx("1.20200", stop="1.19950", s0="1.20050", s0_source=S0Source.FIRST_SEEN), s0, True,
+                       moves=1, at_target=False, target=BASE),
         StrategyVector("late_below_trigger", row, _s_ctx("1.20050", event=ArmEvent.LATE), s0, False,
                        reason="BELOW_TRIGGER"),
     )
@@ -200,6 +213,9 @@ def _strategy_problems(registry: ArmRegistry, kind: str, version: int, owner: st
             problems.append(f"{owner}: {v.name}: reason")
         if v.moves is not None and len(ev.proposal.targets if ev.proposal is not None else ()) != v.moves:
             problems.append(f"{owner}: {v.name}: moves")
+        if v.target is not None and (ev.target != v.target or any(
+                t != v.target for _, t in (ev.proposal.targets if ev.proposal is not None else ()))):
+            problems.append(f"{owner}: {v.name}: target")
         if v.at_target is not None and v.ctx.event in BAR_END_EVENTS and \
                 strategy.at_target(params, v.ctx, v.state) is not v.at_target:
             problems.append(f"{owner}: {v.name}: at_target")

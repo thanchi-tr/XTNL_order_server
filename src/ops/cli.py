@@ -26,6 +26,10 @@
     ruleset add <file.json>                --operator A --reason "..." [--approver B]   (stored inactive)
     ruleset activate <version>             --operator A --approver B --reason "..."
     audit tail [--limit N] [--command C]
+    market-sessions show [--adapter A]     (read-only: the latest SM10 calendar rows, source and review flags)
+    market-sessions accept --adapter A --symbols S1,S2 [--holidays FILE.json]   --operator A --reason "..."
+                                           [--approver B] (store the reviewed schedule as reviewed_config rows:
+                                           a new calendar version, fenced, audited; src/ops/market_sessions.py)
     arm config show [--pending]            (read-only; --pending reads the Supabase document: row diff, validation,
                                            admission, the nodes' registries; not audited)
     arm config accept <hash>               --operator A --reason "..." [--approver B]
@@ -75,6 +79,7 @@ import asyncio
 import getpass
 import hashlib
 import importlib
+import json
 import os
 import sys
 import time
@@ -89,6 +94,7 @@ from src.db.settings import StorageSettings, redact
 from src.ops.arm import ArmContext, gates_report
 from src.ops.arm_view import ArmViews
 from src.ops.etcd import OpsEtcd, endpoints_from_env, make_etcd
+from src.ops.market_sessions import check_holidays, parse_symbols, sessions_accept, sessions_show
 from src.ops.md_acl import read_env_file
 from src.ops.model import Actor, OpsRefused, OpsUsageError, Report, iso_ms
 from src.ops.rulesets import MAX_DOCUMENT_BYTES, check_document, summary
@@ -359,6 +365,18 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--limit", type=int, default=20)
     a.add_argument("--adapter", default=None)
 
+    g = groups.add_parser("market-sessions", help="SM10 calendar rows (market_sessions): review and accept"
+                          ).add_subparsers(dest="cmd", required=True)
+    a = g.add_parser("show", help="read-only: the latest calendar version's rows, source and review flags")
+    a.add_argument("--adapter", default=None)
+    a = g.add_parser("accept", help="store the reviewed schedule of these symbols as reviewed_config rows "
+                     "(new calendar version; the review page then leaves them out)")
+    a.add_argument("--adapter", required=True, help="adapter id, e.g. stonex")
+    a.add_argument("--symbols", required=True, help="comma separated, e.g. EURUSD,AUDUSD")
+    a.add_argument("--holidays", default=None,
+                   help="JSON list of holidays ({\"date\": \"YYYY-MM-DD\"} or start / end); sets holidays_known")
+    _actor_args(a)
+
     g = groups.add_parser("audit", help="operator_audit").add_subparsers(dest="cmd", required=True)
     a = g.add_parser("tail")
     a.add_argument("--limit", type=int, default=20)
@@ -496,6 +514,12 @@ async def dispatch(svc: OpsService, ns: argparse.Namespace) -> Report:
         return await svc.ruleset_add(read_document(ns.file), ns.file, _actor(ns))
     if key == ("ruleset", "activate"):
         return await svc.ruleset_activate(ns.version, _actor(ns))
+    if key == ("market-sessions", "show"):
+        return await sessions_show(svc, ns.adapter)
+    if key == ("market-sessions", "accept"):
+        holidays = None if ns.holidays is None else read_holidays(ns.holidays)
+        return await sessions_accept(svc, ns.adapter, parse_symbols(ns.symbols), holidays, _actor(ns),
+                                     holidays_source=ns.holidays)
     if key == ("audit", "tail"):
         return await svc.audit_tail(limit=_limit(ns.limit), command=ns.command)
     if key == ("uptime", "show"):
@@ -518,6 +542,16 @@ def read_document(path: str) -> str:
         return raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise OpsUsageError(f"{path} is not UTF-8") from exc
+
+
+def read_holidays(path: str) -> list[dict[str, Any]]:
+    """`market-sessions accept --holidays`: a UTF-8 JSON list (at most MAX_DOCUMENT_BYTES)."""
+    text = read_document(path)
+    try:
+        doc = json.loads(text)
+    except ValueError as exc:
+        raise OpsUsageError(f"{path} is not JSON") from exc
+    return check_holidays(doc)
 
 
 def validate_offline(path: str) -> Report:

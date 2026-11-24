@@ -412,7 +412,9 @@ class SlStrategy(Protocol):
         ...
 
     def at_target(self, params: StrategyParams, ctx: BarContext, state: StrategyState) -> bool:
-        """Every current handle at or beyond the rounded target. Only a bar-end check may release (§B6.3 (7a)); at
+        """Every current handle at or beyond the unrounded target (`σ·(level − target) ≥ 0`; for on-grid levels this
+        equals at or beyond the target rounded toward profit, and a handle exactly at an off-grid `E` with offset 0
+        counts). Only a bar-end check may release (§B6.3 (7a)); at
         PRE the pipeline (S21) reads it only to drop the item ("at PRE a position with at_target gets no item"), so
         it must be a pure function of the context at PRE too."""
         ...

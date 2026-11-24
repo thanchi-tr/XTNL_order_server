@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Final, Literal, Protocol
@@ -460,8 +461,12 @@ class RiskSweep:
                  pager: Callable[[Page], None] | None = None,
                  dispatcher: NotificationDispatcher | None = None,
                  on_fence_lost: Callable[[BaseException], None] | None = None,
-                 inhibitor: AlertInhibitor | None = None) -> None:
-        """`on_fence_lost(exc)`: called once, before the exception propagates out of `run_pass()`, when any
+                 inhibitor: AlertInhibitor | None = None,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
+        """`monotonic` (seconds): schedules the full passes and times them for `slow_pass`, so a wall-clock step
+        (a w32time correction) neither fakes nor hides a slow pass; `clock` (wall ms) stamps everything else.
+
+        `on_fence_lost(exc)`: called once, before the exception propagates out of `run_pass()`, when any
         sweep write (the account batch, sweep_quarantine, the evaluation_failed row, a halt trip / clear,
         unlisted-state resolution, re-page queueing) raises an `EpochMismatch`; production passes the
         runtime hard exit. A lost fence is never an account failure: it propagates out of `run_pass()` and
@@ -501,6 +506,7 @@ class RiskSweep:
         self._on_fence_lost = on_fence_lost
         self._quarantine_released: set[str] = set()   # accounts whose sweep_quarantine row is known released
         self._inhibitor = inhibitor
+        self._mono = monotonic
 
     # -- ruleset -------------------------------------------------------------------------------
     def install_ruleset(self, ruleset: InstallableRuleset) -> None:
@@ -1085,11 +1091,16 @@ class RiskSweep:
             self._page(page)
 
     async def run(self) -> None:
-        """Supervised loop: a full pass every interval_ms, signalled accounts at once in between."""
+        """Supervised loop: a full pass every interval_ms, signalled accounts at once in between. Scheduling and
+        the pass timing use the monotonic clock, so a wall-clock step neither delays the next full pass nor fakes
+        or hides a slow one."""
+        def mono_ms() -> int:
+            return int(self._mono() * 1000)
+
         interval = self._cfg.sweep.interval_ms
-        next_full = self._clock()
+        next_full = mono_ms()
         while not self._stopping:
-            now = self._clock()
+            now = mono_ms()
             if now >= next_full:
                 accounts: list[str] | None = None
                 next_full = now + interval
@@ -1104,14 +1115,17 @@ class RiskSweep:
                 except TimeoutError:
                     pass
                 continue
-            started = self._clock()
+            started = mono_ms()
             await self.run_pass(accounts)
             if accounts is None:
-                self._check_pass_time(started, self._clock())
+                ended = mono_ms()
+                self._check_pass_time(ended - started, ended)
 
-    def _check_pass_time(self, started: int, ended: int) -> None:
-        """A full pass slower than the interval pages, latched until a full pass is fast again (§2)."""
-        if ended - started > self._cfg.sweep.interval_ms:
-            self._latched_page(Page("high", "slow_pass", None, f"{ended - started} ms", ended))
+    def _check_pass_time(self, elapsed_ms: int, ended_ms: int) -> None:
+        """A full pass slower than the interval pages, latched until a full pass is fast again (§2). `elapsed_ms`
+        is the pass's duration on the monotonic clock (so a wall-clock step neither fakes nor hides one) and
+        `ended_ms` its monotonic end; the page is stamped with wall time."""
+        if elapsed_ms > self._cfg.sweep.interval_ms:
+            self._latched_page(Page("high", "slow_pass", None, f"{elapsed_ms} ms", self._clock()))
         else:
             self._unlatch("slow_pass", None)

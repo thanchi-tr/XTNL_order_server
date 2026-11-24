@@ -223,20 +223,27 @@ class HaltSwitch:
 
     async def resolve_unlisted(self, listed: AbstractSet[str], *, now_ms: int, sweep_id: int
                                ) -> tuple[BreachState, ...]:
-        """Resolve every active rule state of an account that is no longer listed for the sweep (no
+        """Resolve every unresolved rule state of an account that is no longer listed for the sweep (no
         account_state row, open position or live order): its entities are gone, so nothing will evaluate or
         resolve those states again, and they would hold the level forever (§2 Release: an entity gone from
         the snapshot resolves). Called by the RiskSweep. Under HALT_LOCK the current rows are read, so no
-        CAS is needed; clear_generation is bumped so any in-flight write built from an older read fails."""
+        CAS is needed; clear_generation is bumped so any in-flight write built from an older read fails. An
+        inactive row (a pending / UNKNOWN episode that never activated) is resolved with no transition or alert."""
         async with self._store.transaction() as tx:
             gone = [s for s in await tx.breach_states()
-                    if s.active and s.resolved_at is None and s.account_id not in listed]
+                    if s.resolved_at is None and s.account_id not in listed]
             if not gone:
                 return ()
             updated: list[BreachState] = []
             events: list[Transition] = []
             for s in sorted(gone, key=lambda b: b.key):
                 by: ResolvedBy = "sweep" if s.rule_id == EVALUATION_RULE_ID else "entity_end"
+                if not s.active:   # a pending / UNKNOWN row that never activated: resolve it, no transition
+                    updated.append(replace(
+                        s, pending_level=None, pending_since=None, release_pending_since=None, unknown_since=None,
+                        unknown_origin=False, resolved_at=now_ms, resolved_by=by, last_pass_ms=now_ms,
+                        last_sweep_id=sweep_id, clear_generation=s.clear_generation + 1))
+                    continue
                 updated.append(replace(
                     s, level=Level.PASS, pending_level=None, pending_since=None, release_pending_since=None,
                     unknown_since=None, unknown_origin=False, resolved_at=now_ms, resolved_by=by,

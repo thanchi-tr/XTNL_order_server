@@ -214,6 +214,9 @@ class CatchupResult:
     anomalies: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     uncovered: tuple[int, int] | None = None
+    #: Entity keys (ids only) of history rows skipped for want of a broker revision / time; named in their own
+    #: clause of the incomplete page, so the 600-character cut of the notes can never drop them.
+    unversioned: list[str] = field(default_factory=list)
     #: Incomplete for a cause on this side (failed reads / re-reads, rows not committed or parked on a full
     #: topic): coverage is held back and the catch-up runs again (module doc).
     retryable: bool = False
@@ -545,8 +548,12 @@ class CatchupCoordinator:
             notes.append(f"{len(res.not_found)} stored working entities not found by id at the broker")
         if res.reread_errors:
             notes.append(f"{len(res.reread_errors)} by-id re-reads failed")
-        if res.unversioned:
-            notes.append(f"{len(res.unversioned)} history rows without a broker revision / time skipped")
+        unversioned = sorted(set(res.unversioned))     # entity keys (ids only); one entity may skip several rows
+        if unversioned:
+            notes.append(f"{len(res.unversioned)} history rows without a broker revision / time skipped: "
+                         + _id_list(unversioned))
+            # No broker time: nothing narrows when they changed, so the whole read window is unverified for them.
+            uncovered = _span(uncovered, (gap_start, gap_end))
         if res.skipped:
             notes.append(f"{len(res.skipped)} history rows of another adapter or type skipped")
         if res.unmapped:
@@ -569,7 +576,7 @@ class CatchupCoordinator:
             finished_at_ms=max(finished, started), orders_seen=len(all_o), orders_new=o_new, orders_updated=o_upd,
             positions_seen=len(all_p), positions_new=p_new, positions_closed=p_closed, cash_flows_new=cf_new,
             anomalies=len(anomalies), complete=complete, notes="; ".join(notes))
-        result = CatchupResult(rec, anomalies, notes, uncovered, retryable=retryable and not complete)
+        result = CatchupResult(rec, anomalies, notes, uncovered, unversioned, retryable=retryable and not complete)
         await self._store.record(self._epoch(), rec)
         self._finish(result, req)
         return result
@@ -656,6 +663,8 @@ class CatchupCoordinator:
             window = "" if result.uncovered is None else (
                 f"; uncovered window {iso_utc(result.uncovered[0])} .. {iso_utc(result.uncovered[1])}")
             ids = "" if not result.anomalies else "; anomalies: " + ", ".join(result.anomalies[:20])
+            if result.unversioned:
+                ids += "; skipped (no version): " + _id_list(result.unversioned)
             self._page("high", f"downtime catch-up incomplete: {aid}",
                        f"{aid} ({rec.reason}): {rec.orders_seen} orders / {rec.positions_seen} positions seen, "
                        f"{rec.anomalies} anomalies{window}{ids}; {'; '.join(result.notes)[:600]}{retry_note}. The "
@@ -665,6 +674,12 @@ class CatchupCoordinator:
 def _span(cur: tuple[int, int] | None, add: tuple[int, int]) -> tuple[int, int]:
     """The smallest window holding both (the uncovered part named in the page)."""
     return add if cur is None else (min(cur[0], add[0]), max(cur[1], add[1]))
+
+
+def _id_list(keys: Sequence[str], limit: int = 10) -> str:
+    """At most `limit` ids, then how many more (ids only, never an amount)."""
+    more = len(keys) - limit
+    return ", ".join(keys[:limit]) + (f" (+{more} more)" if more > 0 else "")
 
 
 __all__ = ["CLOCK_BACK_TOLERANCE_MS", "CatchupCoordinator", "CatchupMetrics", "CatchupReason", "CatchupResult",
