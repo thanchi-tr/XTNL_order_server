@@ -465,15 +465,15 @@ def _strategy_code(strategy: SlStrategy, evaluation: Evaluation, *, pre_not_conf
 
 def _unconfirmed_basis(side: Side, entry: Decimal, s_at_t: StopAtT, stored: PreBasis | None,
                        this_bar_pre: PreBasis | None) -> PreBasis | None:
-    """The basis a `PRE_NOT_CONFIRMED` stores (§B6.3 C1): the farther of the stored basis and this bar's PRE levels,
-    where the stored one is kept only while its `S_pre` is farther from entry than the bar-end `S_at_T` (the rule
-    `trigger_basis` applies at every bar end), and this bar's PRE levels ("the handle levels the PRE used, before the
-    move it prompted") are left out when `S_at_T` is already beyond them away from entry: the stop was loosened back
-    past them before the bar end, so the current, larger risk already applies. A stop still at the PRE's level (no
-    move yet) keeps them, so a move made later on the heads-up is still discounted."""
+    """The basis a `PRE_NOT_CONFIRMED` stores (§B6.3 C1): the farther of the stored basis and this bar's PRE levels.
+    The stored one is kept only while its `S_pre` is farther from entry than the bar-end `S_at_T` (the clear rule
+    `trigger_basis` applies at every bar end). This bar's PRE levels are always stored ("a `PRE_NOT_CONFIRMED` stores
+    ... the handle levels the PRE used, before the move it prompted"), even when `S_at_T` is already beyond them: the
+    clear sentence belongs to the later bar-end trigger tests, where `trigger_basis` drops the basis while that bar's
+    `S_at_T` is at or beyond `S_pre` (so a stop still loosened is tested at its own, larger risk). Clearing it here
+    would let a move made after `T` on this unconfirmed heads-up make the next bar's test easier ("So a move made on
+    an unconfirmed heads-up never makes a later bar's test easier"; live review round 5 reverts round 4's clear)."""
     old = trigger_basis(side, entry, s_at_t.level, s_at_t.basis, stored).stored
-    if this_bar_pre is not None and farther_from_entry(side, entry, s_at_t.level, this_bar_pre.s_pre):
-        this_bar_pre = None
     return farther_basis(side, entry, old, this_bar_pre)
 
 

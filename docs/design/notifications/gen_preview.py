@@ -259,8 +259,8 @@ VISUALS: tuple[tuple[str, str, str, str, str], ...] = (
     ("V2", "rule-ladder", "Rule-level ladder", "PASS · FLAG · SOFT · HARD, the current level marked; HARD dashed "
      "when capped at SOFT.", "L1"),
     ("V3", "halt-ladder", "Halt-level ladder", "NONE · SOFT · HARD with what each level lets through.", "L2"),
-    ("V4", "stop-ladder", "Ordinal stop ladder", "Proposed stop, current stop and (with show_levels) entry in price "
-     "order, fixed spacing, not to scale.", "L5 ADJUST"),
+    ("V4", "stop-ladder", "Ordinal stop ladder", "Proposed stop, current stop and entry in price order, fixed "
+     "spacing, not to scale; only with show_levels (Q13).", "L5 ADJUST"),
     ("V5", "advice-steps", "Advice stepper", "Heads-up → Final advice (→ Released), the current step marked.",
      "L5 ADJUST, COMPLETE"),
     ("V6", "count-tiles", "Count tiles", "Big number over its label (catch-up counts, ALIVE counts).", "L3, L6"),

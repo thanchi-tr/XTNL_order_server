@@ -94,21 +94,31 @@ Round 4 had 3 open items and 10 new items from a regression review of round 3 (w
 | Fix | Requirement it follows |
 |---|---|
 | ADJUST headline: "break-even" for every `break_even_on_risk_close` target again (round-1 change reverted) | §B8 notice texts (single wording); §20 Q6 |
-| PRE_NOT_CONFIRMED no longer stores a PRE basis that the bar-end `S_at_T` has already loosened past | §B6.3 C1 (cleared once the current S, = bar-end `S_at_T`, is farther from entry) |
+| PRE_NOT_CONFIRMED no longer stores a PRE basis that the bar-end `S_at_T` has already loosened past (*reverted in round 5*: see the round 5 "PRE basis store" item) | §B6.3 C1 (cleared once the current S, = bar-end `S_at_T`, is farther from entry) |
 | A REOPEN that does not end the re-check (PRICE_THROUGH_LEVEL) is retried; the last result is written when the re-check ends | §B6.3 REOPEN (retryable outcomes) |
 | The xtnl ARM email shows the bar-0 conditional PRE label, "valid until", the DELAYED delay and every decision caveat | §B6.5 bar-0 PRE label; §B5.2 DELAYED; §B6.3 / §B7 caveats; §B8 |
 | Tests for duplicate bar-end events, an older-bar CORRECTED item, PRE pre-guards (1)-(3b), the 15m grid / roll caveat / 17:00 New York fills across both 2026 DST changes, and REOPEN across a weekend restart | §B6.6, §A13, §B6.3, Q7, Q14, SM10, C3 |
 
 **Decided from the requirement text: the C1 tie.** When `S_at_T` equals `S_pre` exactly, the PRE basis is kept, which is the as-built behaviour. The literal clear sentence ("at or farther") and C1's purpose sentence ("a move made on an unconfirmed heads-up never makes a later bar's test easier") conflict at the tie. Clearing at the tie would let a heads-up move made after T make the next test easier, which the purpose sentence forbids. The pipeline docstring follows the purpose sentence.
 
-## Round 5 (to do)
+## Round 5
 
-- **Increment leak.** The xtnl note "Moves the stop N pips/points" prints the price increment when the move is one increment. `riskmgr.md` §5 forbids any increment or pip size in a notice; the owner's exception covers only each stop's distance from entry in pips. Drop the numeric move size.
-- **Current stop with `show_levels` off.** Both HTML themes show the current stop when `show_levels` is off. Q13's built default is "proposed stop and R only", and §B8 says "entry and current stop only if Q13".
-- **NO_BROKER_BAR basis.** NO_BROKER_BAR folds this bar's PRE levels into `pre_basis` without the C1 clear that round 4 added to every other non-confirming bar end (`arm-implementation-plan.md` S38c fix (a): "as every other non-confirming bar end").
-- **Latch on, CORRECTED re-run.** With `latch = on` (not the Q11 default), a CORRECTED re-run of the bar that recorded the trigger reads its own committed state, so a withdrawn trigger keeps re-proposing. Check whether §B6.6 ("re-run on the recorded order state, `commit_state` re-applied") decides the state to re-run on.
-- **REOPEN clean-spread retry.** Needs the Oversee clean-spread threshold injected in `src/runtime/optional_plan.py` (§B6.3 REOPEN).
-- **Regression review of round 4.**
+Round 5 verified 5 open items plus 2 regression findings on round 4. The skeptics had to quote the requirement text they relied on. 6 were confirmed, and 5 were fixed (one was superseded).
+
+| Fix | Requirement it follows |
+|---|---|
+| The xtnl note says only the direction ("Moves the stop tighter."), never a numeric move size, which could equal the price increment | `riskmgr.md` §5 (never an increment or pip size; the owner exception covers only each stop's distance from entry in pips) |
+| With `show_levels` off, no HTML theme shows the entry or current stop level | Decisions table Q13 (built default "proposed stop and R only"); §B8 ("entry and current stop only if Q13") |
+| The Oversee clean-spread threshold reaches the ARM REOPEN path, so an unclean exit spread is retryable. Spread values are never logged | §B6.3 REOPEN |
+| The held REOPEN row is written before the first post-open POST that ends its re-check, so it never outranks that POST as the newest advice (round-4 regression) | §B6.6 (newest decision = max `decision_seq` among advice rows); §B6.3 REOPEN |
+| **Reverted:** round 4's C1 clear at the PRE_NOT_CONFIRMED bar. A PRE_NOT_CONFIRMED stores the PRE's handle levels again; the basis clears only on a later bar whose current S is farther than `S_pre` | §B6.3 C1 ("a `PRE_NOT_CONFIRMED` stores ... the handle levels the PRE used, before the move it prompted"; its Tests bullet: "a next close just beyond entry is still managed until a bar end confirms against the pre-move stop") |
+
+**Open, not decided by any requirement: CORRECTED re-run with `latch = on`.** A CORRECTED re-run of the latching bar reads that bar's own committed strategy state, so a withdrawn trigger keeps re-proposing. §B6.6 and §B6.3 settle which SM11 state and target a re-run uses, but not which strategy state it uses. This cannot happen with the configured default (Q11: latch off), so the recommended path is to keep latch off until the owner decides.
+
+## Left open (the owner stopped the review after round 5)
+
+- **`moved_on_final_advice` caveat.** NO_BROKER_BAR drops this bar's PRE levels under the round-14 "moved on final advice" rule but does not add the `moved_on_final_advice` caveat that §B6.3 requires (fuzz: 170 cases, `shown = False`).
+- **Regression review of round 5.**
 
 ## Operator items (not code)
 

@@ -127,7 +127,7 @@ C3b now shows an order's levels where an alert is about a stop. A **Levels** blo
 - **Each stop.** Its price and its distance from the entry in pips ("34.0 pips below entry"), with a bar showing that distance. The longest distance fills the bar; the level this email is about is highlighted in the severity colour.
 - **A missing stop.** Shows **NONE · no limit** in the severity colour, with a dashed bar.
 
-The ARM advice puts the price into the headline and the step ("Move the stop on ORD-DEMO-5 (GBP/USD) to 1.27020, 12.0 pips below the entry"). It also shows how much the move tightens the stop: 22.0 pips closer. The closed missing-stop alert says where the stop was seen (1.08250, 32.0 pips below the entry).
+The ARM advice puts the price into the headline and the step ("Move the stop on ORD-DEMO-5 (GBP/USD) to 1.27020, 12.0 pips below the entry"). It also says which way the move goes ("Moves the stop tighter."), never by how much: `riskmgr.md` rule 5 allows only each stop's distance from the entry, and a one-increment move would show the increment (synced with the built behaviour, live review round 5). The closed missing-stop alert says where the stop was seen (1.08250, 32.0 pips below the entry).
 
 All prices are made up. These are order levels, not market data. The instrument's pip size, spreads and any market price are never shown. How pips would be computed when this is wired in is in the [C2 spec](prototype-C2-spec.md), under "Data the renderer would need".
 
@@ -160,9 +160,10 @@ The plain-text part, the subjects and the push messages are unchanged, so `tests
 - The operator block, with the old subject, the codes, ids, UTC time, node and epoch.
 
 **ARM notices** add the Levels block:
-- the entry (only with `show_levels`);
-- the current stop and the proposed stop, each with its distance from the entry in pips;
-- the size of the move ("22.0 pips tighter").
+- the entry and the current stop (only with `show_levels`: Q13 / §B8 "entry and current stop only if Q13");
+- the proposed stop;
+- each stop's distance from the entry in pips (only when the entry is shown);
+- the direction of the move ("Moves the stop tighter."), never its size.
 
 **Stage 2, not built yet:**
 - the full story (first alert time, reminder number, linked halt events from `oversee_events` / `halt_events`);

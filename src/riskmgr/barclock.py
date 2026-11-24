@@ -26,7 +26,9 @@ A scheduler over the `(adapter, bar_spec)` set pinned by live `arm_positions` ro
    `T` is stored and its indicators are updated for `T` (the evaluation port says `NotReady` until then), `LATE` once
    its POST notice has gone, `REOPEN` for a pre-close re-check from the open + settle (every 5 s; §B6.3: only an
    `ADJUST` or `COMPLETE` ends it early, any other result is retried with no row, and the last one is written with its
-   reason, changing no state, when the first post-open POST is decided or its cap passes). A POST decided after
+   reason, changing no state, when the first post-open POST is decided or its cap passes; when that POST ends it,
+   the REOPEN row is written just before the POST, so it never outranks the newer bar's decision, §B6.6). A POST
+   decided after
    `T + post_grace` carries the caveat `delayed` (§B5.2); a series still waiting at `T + post_grace` pages once per
    episode. A non-final result (a POST-time `DATA_UNAVAILABLE`, a job fault) writes **no row** and does not advance
    the cursor: the position is marked `pending_event` once, the reason is kept as the bar's expiry reason, and the bar
@@ -833,6 +835,9 @@ class BarClock:
             retried: set[str] = set()
             for ask, res in await self._run_asks(asks, now) or ():
                 r = self._bar_end_result(ask, res, now)
+                if r.recheck is not None:                 # the held REOPEN row, committed before the POST
+                    writes.setdefault((ArmEvent.REOPEN, r.recheck[0]), []).append(r.recheck[1])
+                    self._reopen_last.pop(ask.pos.ref, None)
                 if r.write is not None:
                     writes.setdefault((ask.event, ask.bar_end_ms), []).append(r.write)
                 if r.go_on:
@@ -866,11 +871,45 @@ class BarClock:
             log.warning("%s: SM11 refused the %s of %s for %s (%s)", TASK, ask.event.value, ask.bar_end_ms,
                         ask.pos.ref, transition.reason)
             return self._not_ready(ask, SM11_REFUSED, now)
+        ended = self._recheck_ended_by(ask)
+        if ended is not None:
+            # this final POST / LATE of the first post-open bar ends a re-check whose last REOPEN result is held:
+            # that row is written first (it decides nothing newer), then the POST is built on the row it leaves, so
+            # the POST takes the higher `decision_seq` and stays the position's newest advice (§B6.6: "'Newest
+            # decision' for Phase 2 = max(`decision_seq`) among `advice` rows"). The two writes are chained by the
+            # `row_version` CAS and commit oldest bar first: if the REOPEN write fails, the POST misses its CAS and
+            # both are decided again on a later pass.
+            drop = self._drop_recheck(ask.pos, ended, now)
+            assert drop.position is not None
+            chained = _Pos(replace(drop.position.row, row_version=drop.position.expected_row_version + 1),
+                           ask.pos.spec, ask.pos.skew)
+            write = self._final_write(_Ask(chained, ask.event, ask.bar_end_ms), res, now, transition)
+            return _Result(ask, write=write, go_on=True, recheck=(ended, drop))
         return _Result(ask, write=self._final_write(ask, res, now, transition), go_on=True)
 
+    def _recheck_ended_by(self, ask: _Ask) -> int | None:
+        """The pending re-check (its pre-close bar end) that this final POST / LATE ends, when a REOPEN result of it
+        is held: §B6.3 REOPEN, "the first post-open bar's POST decision ... ends it ... on expiry the last HOLD is
+        sent with its reason". None when the ask is not that bar's POST or nothing is held (a restart since: the
+        planner's `DropRecheck` clears the re-check with no row, as before)."""
+        p = ask.pos
+        bar = p.row.reopen_bar_end_ms
+        if ask.event not in (ArmEvent.POST, ArmEvent.LATE) or bar is None:
+            return None
+        held = self._reopen_hold.get(p.ref)
+        if held is None or held[0] != bar or held[1].decision is None:
+            return None
+        nxt = self._next_open(p, bar)
+        if nxt is None or nxt <= bar:
+            return None
+        if ask.bar_end_ms < reopen_check(bar, nxt, p.spec, p.skew).first_open_bar_ms:
+            return None
+        return bar
+
     def _drop_recheck(self, p: _Pos, bar_end_ms: int, now: int) -> Decided:
-        """The re-check ends undecided (the planner's `DropRecheck`: the first post-open bar's POST was decided, or
-        its `decision_cap` passed). The last retryable result of this re-check, when one is held, is written now as
+        """The re-check ends undecided (the planner's `DropRecheck`: its `decision_cap` passed, or the first
+        post-open bar was decided with nothing held; or, through `_recheck_ended_by`, that bar's final POST / LATE,
+        written just after this row). The last retryable result of this re-check, when one is held, is written now as
         the REOPEN row and sent with its reason (§B6.3 REOPEN), in the same CAS that clears `reopen_bar_end_ms`. It
         changes no position state (no SM11 event, strategy state or basis: like every retried attempt it did not
         decide the re-check, and a later POST may already have decided the position). With nothing held (a restart
@@ -1643,6 +1682,8 @@ class _Result:
     write: Decided | None = None
     go_on: bool = False
     retry: bool = False
+    recheck: tuple[int, Decided] | None = None
+    """The held REOPEN row (its pre-close bar end and write) this POST ends, written before `write`."""
 
 
 _EVENT_ORDER: Final = {ArmEvent.POST: 0, ArmEvent.LATE: 1, ArmEvent.REOPEN: 2, ArmEvent.CORRECTED: 3,

@@ -127,7 +127,11 @@ async def test_the_first_post_open_post_ends_the_recheck_and_the_last_hold_is_wr
     assert len(attempts) == 2 and [x[0] for x in _rows(r)] == ["POST"]
     await r.step(FIRST_OPEN_BAR + SETTLE + 1_000)
     rows = _rows(r)
-    assert rows == [("POST", 0, "MARKET_CLOSED", None), ("POST", 9, "STRATEGY_REASON", "BELOW_TRIGGER"),
-                    ("REOPEN", 0, "PRICE_THROUGH_LEVEL", None)]
+    # live review round 5 (§B6.6 "newest decision" = max(decision_seq) among advice rows): the held REOPEN row of
+    # the pre-close bar is written before the POST that ended its re-check, so it never outranks that POST
+    assert rows == [("POST", 0, "MARKET_CLOSED", None), ("REOPEN", 0, "PRICE_THROUGH_LEVEL", None),
+                    ("POST", 9, "STRATEGY_REASON", "BELOW_TRIGGER")]
+    reopen, post = r.store.rows_of()[1:]
+    assert reopen.decision_seq < post.decision_seq
     row = row_of(r.store)
     assert row.reopen_bar_end_ms is None and row.last_decided_bar == FIRST_OPEN_BAR

@@ -1044,6 +1044,8 @@ class EngineSession:
         self.ruleset_source: RulesetSource | None = getattr(ports, "rulesets", None)
         self.ruleset_reloader: RulesetReloader | None = None
         clean_spread = ctx.clean_spread if ctx.clean_spread is not None else self.rules.clean_spread
+        self.clean_spread: Callable[[str, str], Decimal | None] = clean_spread
+        """The clean-spread threshold hook of this session (committer, orchestrator, the ARM's REOPEN retry)."""
         self.committer = TieredStateCommitter(ports.state_store, self.cache, clean_spread, clock_ms=ctx.clock_ms)
         self.hlc = HybridLogicalClock(ctx.clock_ms)
         live_store: LiveSampleStore | None = getattr(ports, "live_samples", None)

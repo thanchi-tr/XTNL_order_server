@@ -370,6 +370,12 @@ async def test_arm_plan_binds_the_budget_and_reports_failed(tmp_path: Path, redi
         assert {x.labels["queue"] for x in samples if x.name == "xtnl_md_queue_depth"} == {"closed_bars", "pending_ticks"}
         arm_components = {x.labels["component"] for x in samples if x.name == "xtnl_arm_events_total"}
         assert graph.tracker is not None and graph.clock is not None
+        # live review round 5 (§B6.3 REOPEN): the BarClock's evaluation port is the S21 join with the clean-spread
+        # retry, over the session's installed clean-spread hook (the committer's and the orchestrator's)
+        gate = graph.reopen_spread
+        assert gate is not None and graph.clock._evaluator is gate  # noqa: SLF001
+        assert gate._inner is graph.evaluator and gate._clean_spread == s.clean_spread  # noqa: SLF001
+        assert s.clean_spread == s.rules.clean_spread or s.ctx.clean_spread is not None
         assert {"failed", "budget", "tracker", "barclock", "stopreads", "notices", "evaluation"} <= arm_components
         assert {x.labels["view"] for x in samples if x.name == "xtnl_arm_positions"} == {
             "armed", "unmanaged", "overdue", "unarmed"}
