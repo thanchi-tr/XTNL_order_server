@@ -1140,7 +1140,9 @@ SlStrategy (Protocol)
   REQUIRED_GUARDS              guard KINDs every row of this strategy must list (kind a: first_bar)
   guards(params) -> [GuardSpec]                             # returns the parsed params.guards in declared order (contract below)
   loosen_policy(params) -> REARM | TELL_ONLY                # the engine never reads a strategy-specific key
-  REOPEN_POLICY = REUSE_TARGET | REPROPOSE                  # kind (a): REUSE_TARGET
+  REOPEN_POLICY = REUSE_TARGET | REPROPOSE                  # kind (a): REUSE_TARGET; a re-pin of E or S0 (fill progress,
+                                                            # entry correction, local rearm) drops the recorded target in
+                                                            # the same CAS, so REOPEN recomputes it from the new E and S0
   RELEASE_POLICY = ON_CONFIRMED_TARGET | NEVER              # kind (a): ON_CONFIRMED_TARGET; §B6.3 (7a) runs only under it (S38c)
   required_indicators(params) -> [IndicatorSpec]            # BROKER series only
   required_history(params) -> {SeriesSpec: bars}            # raw BROKER bars in ctx; leased, admitted, retention-checked like indicators
@@ -1246,7 +1248,8 @@ incident; consumers running; latest catch-up finished; an incomplete one is a ca
 (PR9 only: the newest read is older than its PR9 bound at decision time, 30 s for PRE and 15 s otherwise →
 `DATA_UNAVAILABLE(stop_stale)`); (3) an effective stop exists (PR1: `effective_stop_detail()` is not `None`; stop children that do not cover the position's units give `NO_STOP`, the same view as Oversee's `missing_stop_loss`); (3b) price increment
 known, else `DATA_UNAVAILABLE(increment_unknown)`; (4) a released position (`STRATEGY_COMPLETE`, §B12)
-gets no new advice: a handle below the target with `rearm_on_loosen` off → `LOOSENED_AFTER_COMPLETE` (once per
+gets no new advice: a handle on the loss side of the target (below it for a long, above it for a short) with
+`rearm_on_loosen` off → `LOOSENED_AFTER_COMPLETE` (once per
 episode, Q10); with it on, the position returns to `TRACKING` and goes on to (5); otherwise `COMPLETE`, recorded and
 never shown. Its FAULTs from (1)-(3b) are recorded, never shown and never page (Oversee's `MissingStopLossRule` still
 watches the stop). There is no other completion pre-guard: a managed position whose handles already sit at or beyond
@@ -1284,8 +1287,9 @@ moving) stays managed at target with the trigger met (`AT_TARGET_UNCONFIRMED`, T
 strategy kind of a policy gets the same rule (the conformance suite checks the meaning
 of `trigger_met`, §C2). It runs right after (7), before the post-guards, and only on a final bar-end decision: POST, or a LATE, REOPEN or CORRECTED decision that becomes advice (§B6.6). PRE never
 releases and never changes `arm_positions.state`, and a stop move seen between bars never releases a position on its
-own. `at_target` = every handle at or beyond the rounded target (a handle exactly at an off-grid `E` with offset 0
-counts), judged on the current handles (as the post-guards use them). A tightening stop move made after this
+own. `at_target` = every handle at or beyond the unrounded target (`σ·(level − target) ≥ 0`); for on-grid levels
+this equals at or beyond the target rounded toward profit, and a handle exactly at an off-grid `E` with offset 0
+counts. It is judged on the current handles (as the post-guards use them). A tightening stop move made after this
 bar's PRE proposed one is left out of `trigger_met` in (7) (the `AT_PRE` stop basis, §B6.4), so acting
 on the heads-up never makes the bar-end test easier; a trigger latched on an earlier bar does not count here. Then:
 * `trigger_met` on this bar's close and `at_target` → `COMPLETE`: the position is released (`STRATEGY_COMPLETE`, no
@@ -1371,7 +1375,8 @@ in `event_log` (never `DROPPED_STALE`) with origin `stream`, `stop_read`, `snaps
 rows never count, as for entry time, §B7). `history` versions never count: StoneX history keeps only the last level,
 stamped at placement, so it can show a level the stop did not have at `T`. A handle whose newest candidate does not
 count (a `history` version, or a watermark-labelled REST row with no broker time, which is newer by `seq` than the
-newest counting version) takes its newest earlier counting version (stop basis `PRIOR_VERSION`); with none,
+newest counting version at or before `T` and older by `seq` than the first counting version after `T`: a later APPLIED
+untimed row was read after that post-`T` version, so it shows state from after `T` and takes no part) takes its newest earlier counting version (stop basis `PRIOR_VERSION`); with none,
 `DATA_UNAVAILABLE(stop_at_bar_end)`. **Direction** (round 14, plan S38g): the newer non-counting version may show
 the level the handle held at `T` (a loosened amend seen only through an untimed REST read), so the handle's level is
 the farther from entry of the prior counting level and that newer level: a loosened stop is never tested at a

@@ -147,7 +147,7 @@ def test_release_texts_say_what_releases_the_position_now() -> None:
 
 
 def test_favour_figures_only_from_a_verified_bar() -> None:
-    i = item()
+    i = item(trigger_met=True)          # favour / risk is shown only next to a decided trigger it agrees with
     bars = {(BID.canonical, T): BAR}
     fav = favour_figures(i, bars, KEY)
     assert fav is not None and str(fav.favour_r.value) == "0.50" and fav.per_risk is not None

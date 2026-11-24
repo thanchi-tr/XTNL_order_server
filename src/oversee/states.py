@@ -89,6 +89,10 @@ def _step_known(s: BreachState, r: Result, p: StepParams) -> tuple[BreachState, 
     level, release = r.effective_level, r.effective_release_level
     trs: list[Transition] = []
     if s.unknown_origin and s.active:
+        if r.holds and level < Level.SOFT_HALT <= release:
+            # A holding PASS (a missing-stop grace): the capped unknown-origin state stays as it is, so neither
+            # 'resolved' nor an early 'uncapped' under the old reason is sent; it can't escalate while capped.
+            return replace(s, pending_level=None, pending_since=None, release_pending_since=None), []
         if level < Level.SOFT_HALT:  # resolves once a known result is below SOFT
             out, trs = _set_level(s, level, r.cap, r.reason, p)
             return replace(out, unknown_origin=False), trs
@@ -111,13 +115,13 @@ def _step_known(s: BreachState, r: Result, p: StepParams) -> tuple[BreachState, 
         s = replace(s, release_pending_since=rps)
     else:
         s = replace(s, release_pending_since=None)
+    if level == cur:   # before a capped / uncapped transition, so its alert names the current reason
+        s = replace(s, reason=r.reason)
     if r.cap != s.cap and cur >= Level.SOFT_HALT:
         s = replace(s, cap=r.cap)
         trs.append(_transition(s, "capped" if r.cap is Cap.SOFT else "uncapped", p))
     elif r.cap != s.cap:
         s = replace(s, cap=r.cap)
-    if level == cur:
-        s = replace(s, reason=r.reason)
     return s, trs
 
 
@@ -136,7 +140,8 @@ def step_state(prev: BreachState | None, rule_id: str, subject: Subject, outcome
     dt = 0 if s.last_pass_ms is None else max(0, min(p.now_ms - s.last_pass_ms, 2 * p.cfg.interval_ms))
     if isinstance(outcome, Result):
         s, trs = _step_known(s, outcome, p)
-        if s.active and s.level >= Level.SOFT_HALT and outcome.cap is Cap.NONE and prev_level >= Level.SOFT_HALT:
+        if (s.active and s.level >= Level.SOFT_HALT and outcome.cap is Cap.NONE and s.cap is Cap.NONE
+                and prev_level >= Level.SOFT_HALT):
             s = replace(s, uncapped_ms=s.uncapped_ms + dt)
     else:
         s, trs = _step_unknown(s, outcome.reason, p)
@@ -145,6 +150,12 @@ def step_state(prev: BreachState | None, rule_id: str, subject: Subject, outcome
     inert = not s.active and s.pending_since is None and s.unknown_since is None
     if inert and prev is None:
         return None, trs
+    if inert and prev is not None and s.resolved_at is None:
+        # A pending / UNKNOWN episode that ended without activating: store it resolved once, with no transition
+        # (it was never alerted), so the row is not reloaded as unresolved on every pass. A later >PASS or
+        # UNKNOWN result reopens it through _reopen.
+        return replace(s, resolved_at=p.now_ms, resolved_by="sweep", last_pass_ms=p.now_ms,
+                       last_sweep_id=p.sweep_id), trs
     if inert and prev is not None:   # nothing tracked and nothing changed: no write is needed
         unchanged = replace(s, last_pass_ms=prev.last_pass_ms, last_sweep_id=prev.last_sweep_id)
         if unchanged == prev:
@@ -163,9 +174,12 @@ def _cool_down_reset(s: BreachState, p: StepParams) -> BreachState:
 def resolve_state(prev: BreachState, by: ResolvedBy, p: StepParams) -> tuple[BreachState, list[Transition]]:
     """Resolve at once: entity terminal / CLOSED / gone, day end, ruleset reload or operator (§2)."""
     if not prev.active:
-        cleared = replace(prev, pending_level=None, pending_since=None, unknown_since=None,
-                          release_pending_since=None)
-        return _cool_down_reset(cleared, p), []
+        cleared = _cool_down_reset(replace(prev, pending_level=None, pending_since=None, unknown_since=None,
+                                           release_pending_since=None), p)
+        if prev.resolved_at is None:   # never activated (pending / UNKNOWN only): resolve once, no transition
+            return replace(cleared, resolved_at=p.now_ms, resolved_by=by, unknown_origin=False,
+                           last_pass_ms=p.now_ms, last_sweep_id=p.sweep_id), []
+        return cleared, []
     prev_level = prev.level
     out, trs = _set_level(prev, Level.PASS, prev.cap, prev.reason, p, by)
     out = _below_soft(prev_level, out, p.now_ms)

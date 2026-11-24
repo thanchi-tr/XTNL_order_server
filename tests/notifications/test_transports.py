@@ -236,7 +236,9 @@ async def test_pushover_form_and_emergency_priority() -> None:
     await t.deliver(AlertMessage("HALT HARD", "x" * 5000, "critical", "trip"))
     assert seen[0]["token"] == ["apptoken"] and seen[0]["user"] == ["userkey"] and seen[0]["priority"] == ["1"]
     assert seen[1]["priority"] == ["2"] and seen[1]["retry"] == ["60"] and seen[1]["expire"] == ["3600"]
-    assert len(seen[1]["message"][0]) == 1024
+    cut = seen[1]["message"][0]
+    assert len(cut) <= 1024 and cut.endswith("... (truncated: 0 more lines, see email)")
+    assert cut.startswith("x" * 900)
 
 
 async def test_pushover_rejections() -> None:

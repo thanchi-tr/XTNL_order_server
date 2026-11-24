@@ -178,7 +178,11 @@ def _card_block(inner: str) -> str:
 def adjust_headline(item: ItemBody) -> str:
     sym, side = _id(item.symbol) or "position", _side(item.side)
     proposed = _dec(item.proposed_stop)
-    be = item.strategy_kind == BREAK_EVEN_KIND
+    # "break-even" only when the body proves it: the proposed stop equals the pinned entry (Decimal compare, so
+    # 1.1 == 1.10000). With be_offset_r > 0, or a target rounded toward profit off an off-grid entry, the level is
+    # beyond entry and the generic wording is the truthful one.
+    be = (item.strategy_kind == BREAK_EVEN_KIND and item.entry is not None and item.proposed_stop is not None
+          and item.proposed_stop == item.entry)
     if item.event == "PRE":
         target = "break-even" if be else (proposed or "a new level")
         return f"Heads-up: {sym} {side} stop would move to {target}"

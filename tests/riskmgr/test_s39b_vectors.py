@@ -7,6 +7,7 @@ Planted defects are subclasses of the engine's classes registered in a private `
 from __future__ import annotations
 
 import threading
+from decimal import Decimal
 
 import pytest
 
@@ -42,6 +43,15 @@ class Inverted(BreakEvenOnRiskClose):
     def propose(self, params: StrategyParams, ctx: BarContext, state: StrategyState, event: ArmEvent) -> Evaluation:
         ev = super().propose(params, ctx, state, event)
         return Evaluation(False, reason="BELOW_TRIGGER") if ev.trigger_met else ev
+
+
+class WrongTarget(BreakEvenOnRiskClose):
+    """Subtracts the buffer: advises a target on the loss side of entry (live review: the vectors must catch it)."""
+
+    def target(self, params: StrategyParams, ctx: BarContext) -> Decimal:
+        c = self.DECIMAL_CONTEXT
+        offset = c.multiply(Decimal(params.param("be_offset_r")), max(ctx.r, Decimal(0)))
+        return c.subtract(ctx.entry, c.multiply(Decimal(ctx.sigma), offset))
 
 
 class AlwaysPass(FirstBarGuard):
@@ -87,6 +97,7 @@ async def test_a_raising_version_fails_the_probe() -> None:
 
 @pytest.mark.parametrize("strategy,guard,scope", [
     (Inverted(), None, STRATEGY),
+    (WrongTarget(), None, STRATEGY),
     (BREAK_EVEN_ON_RISK_CLOSE_V1, AlwaysPass(), GUARD),
 ])
 async def test_a_version_answering_its_vectors_wrongly_fails_the_probe(strategy: object, guard: object | None,
@@ -111,4 +122,5 @@ async def test_a_version_without_vectors_fails_the_probe(monkeypatch: pytest.Mon
 def test_a_problem_names_the_vector_and_field_only() -> None:
     problems = V.vector_problems(_registry(Inverted()), "strategy", "break_even_on_risk_close", 1)
     assert problems and not any("1.2" in p for p in problems)
-    assert all(p.rsplit(":", 1)[-1].strip() in {"trigger_met", "reason", "moves", "at_target"} for p in problems)
+    assert all(p.rsplit(":", 1)[-1].strip() in {"trigger_met", "reason", "moves", "at_target", "target"}
+               for p in problems)

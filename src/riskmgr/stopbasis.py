@@ -13,7 +13,9 @@ stamped at placement, so it can show a level the stop did not have at `T`. Per h
 * the newest candidate does not count (a `history` or watermark-labelled version) → the newest earlier counting
   version, basis `PRIOR_VERSION`; with none, the handle is unresolved. `event_log` stores a watermark-labelled
   version with `broker_time_ms` NULL, so an `APPLIED` version with no broker time that is newer by `seq` than the
-  newest counting candidate is taken as such a non-counting newest candidate;
+  newest counting candidate (at or before `T`) and older by `seq` than the first counting version after `T` is taken
+  as such a non-counting newest candidate (one newer than a post-`T` counting version was read after it and shows
+  state from after `T`);
 * **direction of the newer version** (round 14, plan S38g): the newer non-counting version may show a level the
   handle held at `T` (a loosened amend seen only through an untimed REST row, or a history row). Its level is order
   state and is read with it; the handle's level is then the **farther from entry** of the prior counting level and
@@ -141,13 +143,19 @@ def _order_key(v: StopVersion) -> tuple[int, int]:
     return (v.broker_time_ms if v.broker_time_ms is not None else -1, v.seq)
 
 
-def _untimed_newer(versions: Sequence[StopVersion], newest_counting: StopVersion | None) -> list[StopVersion]:
+def _untimed_newer(versions: Sequence[StopVersion], newest_counting: StopVersion | None,
+                   bar_end_ms: int) -> list[StopVersion]:
     """The `APPLIED` versions with no broker time (a watermark-labelled read: `event_log.broker_time_ms` is NULL
-    unless `broker_time_source` is BROKER) newer by `seq` than the newest counting candidate. Their broker time is
-    unknown, so each is taken as a non-counting newest candidate: it may show a level the handle held at `T`."""
+    unless `broker_time_source` is BROKER) newer by `seq` than the newest counting candidate and older by `seq` than
+    the first counting version after `T`. Their broker time is unknown, so each is taken as a non-counting newest
+    candidate: it may show a level the handle held at `T`. One newer by `seq` than a counting version timed after `T`
+    was read after it (a stale REST read never overwrites a newer stream update), so it shows state from after `T`
+    and takes no part (live review: a stop loosened after `T` must not withhold a bar that met the trigger)."""
     floor = newest_counting.seq if newest_counting is not None else None
+    after = [v.seq for v in versions if v.counts and v.broker_time_ms is not None and v.broker_time_ms > bar_end_ms]
+    ceiling = min(after) if after else None
     return [v for v in versions if v.status is VersionStatus.APPLIED and v.broker_time_ms is None
-            and (floor is None or v.seq > floor)]
+            and (floor is None or v.seq > floor) and (ceiling is None or v.seq < ceiling)]
 
 
 def _newer_noncounting(candidates: Sequence[StopVersion], newest_counting: StopVersion | None,
@@ -165,7 +173,8 @@ def handle_at_bar_end(versions: Sequence[StopVersion], bar_end_ms: int, *, side:
     `T` (no candidate, or the counting version ends it), or `StopUnavailable` when its newest candidate does not
     count and no earlier version does, or when a newer non-counting version cannot be resolved against the prior
     level (module docstring). A version with no broker time (watermark) newer by `seq` than the newest counting
-    candidate is a non-counting newest candidate (`_untimed_newer`). `side` / `entry`: the position's, for the
+    candidate and older by `seq` than the first counting version after `T` is a non-counting newest candidate
+    (`_untimed_newer`). `side` / `entry`: the position's, for the
     direction rule (round 14): the farthest from entry of the prior counting level and every newer non-counting one
     (the reader returns all of them, bounded: `src/db/arm_versions.py`). A newer non-counting version that **ends**
     the handle with no level takes no part (accepted, design §B6.4): its time is not when the stop ended (StoneX
@@ -174,7 +183,7 @@ def handle_at_bar_end(versions: Sequence[StopVersion], bar_end_ms: int, *, side:
     candidates = sorted((v for v in versions if v.candidate(bar_end_ms)), key=_order_key)
     counting = [v for v in candidates if v.counts]
     newest_counting = counting[-1] if counting else None
-    untimed = _untimed_newer(versions, newest_counting)
+    untimed = _untimed_newer(versions, newest_counting, bar_end_ms)
     if not candidates and not untimed:
         return None
     if candidates and candidates[-1].counts and not untimed:

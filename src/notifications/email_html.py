@@ -371,6 +371,10 @@ UNKNOWN_REASONS: Final = frozenset({"risk_unknown", "mark_unknown", "live_unknow
                                     "stop_kind_inconsistent"})
 UNKNOWN_ACTION: Final = ("An input is unknown; capped at SOFT until it is known. Check instruments, prices and the "
                          "account feed.")
+STOP_KIND_INCONSISTENT_CODE: Final = "stop_kind_inconsistent"
+STOP_KIND_INCONSISTENT_ACTION: Final = (
+    "A stop order of this {what} sits at or beyond the market: touched and awaiting its fill, or a take-profit "
+    "entered as a stop. Capped at SOFT until it fills or is corrected; check its stop at the broker.")
 REPAGE_ACK: Final = "Acknowledge it to silence re-pages if it is expected."
 _LEVEL_NAMES: Final = {0: "PASS", 1: "FLAG", 2: "SOFT_HALT", 3: "HARD_HALT"}
 SOD_PARTIAL: Final = "sod_partial_session"
@@ -401,7 +405,12 @@ def _cap_text(cap: str) -> str:
 
 def rule_action(rule_id: str, level: int, reason: str, subject_type: str) -> str | None:
     """The "what to do" line of a rule state (§4 context A)."""
-    if any(code in UNKNOWN_REASONS for code in re.split(r"[\s,;:()]+", reason)):
+    codes = re.split(r"[\s,;:()]+", reason)
+    if STOP_KIND_INCONSISTENT_CODE in codes:
+        # a specific UNKNOWN (still capped at SOFT): a STOP child at or beyond the market, not a missing input
+        what = "order" if subject_type == "order" else "position" if subject_type == "position" else "entity"
+        return STOP_KIND_INCONSISTENT_ACTION.format(what=what)
+    if any(code in UNKNOWN_REASONS for code in codes):
         return UNKNOWN_ACTION
     soft = level >= 2
     if rule_id == "max_position_risk":

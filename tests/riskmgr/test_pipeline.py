@@ -63,8 +63,11 @@ from tests.riskmgr.kind_a import (
     FIVE,
     INC,
     Q,
+    S0_LONG,
+    S0_SHORT,
     atr_id,
     atr_value,
+    bar,
     bar0_with_range,
     flat_history,
     s_ctx,
@@ -273,6 +276,46 @@ def test_bar0_volatile_without_pre_is_a_guard_hold() -> None:
     post = post_run("0", ctx=_bar0_ctx(ArmEvent.POST), live="1.20150", s_at_t=StopAtT(E, StopBasis.STREAM))
     assert post.outcome is Outcome.GUARD_REASON and post.code is not None
     assert (post.code.owner, post.code.reason, post.code.category) == ("first_bar", FIRST_BAR_VOLATILE, Category.HOLD)
+
+
+def _ctx_at(side: str, close: str, bucket: int) -> BarContext:
+    """A bar-end context for the bar in `bucket` (bar 0 = the fill bucket `B0`): a flat trigger-side bar at `close`,
+    plus the guard's inputs (bid history ending in a volatile bar 0, range 0.00900 against an ATR of 0.00500, and a
+    warm ATR value). The guard inputs stay on later bars too, so a guard that wrongly applied after bar 0 would HOLD."""
+    base = s_ctx(close, side=side, bar_index=(bucket - B0) // Q)
+    assert base.bar is not None
+    c = D(close)
+    hist = (*flat_history(FIVE, D("0.00500")), bar0_with_range(FIVE, D("0.00900")))
+    return replace(base, bar_end_ms=bucket + Q, entry_time_ms=FILL,
+                   bar=bar(FIVE, bucket, c, c, c, c, side=base.bar.series.side),
+                   history=((series(FIVE), hist),), indicators=(((atr_id(FIVE), "value"), (atr_value(FIVE, B0),)),))
+
+
+@pytest.mark.parametrize("sign,side", [(1, "BUY"), (-1, "SELL")])
+@pytest.mark.parametrize("bar1_close,proposes", [("0.00150", True), ("0.00050", False)])
+def test_volatile_bar0_then_bar1_retests(sign: int, side: str, bar1_close: str, proposes: bool) -> None:
+    """Q2: a volatile trigger bar 0 delays the trail by exactly one bar. Bar 1 re-tests the trigger on its own
+    close: met -> ADJUST straight to break-even; not met -> no proposal (the delay is a re-test, not a latch)."""
+    s0 = S0_LONG if sign == 1 else S0_SHORT
+    r0 = post_run("0", ctx=_ctx_at(side, lv(sign, "0.00150"), B0), live=lv(sign, "0.00150"),
+                  s_at_t=StopAtT(s0, StopBasis.STREAM), arm=ArmState.ARMED)
+    assert r0.outcome is Outcome.GUARD_REASON and r0.code is not None
+    assert (r0.code.owner, r0.code.reason, r0.code.category) == ("first_bar", FIRST_BAR_VOLATILE, Category.HOLD)
+    assert not r0.trigger_met and r0.targets == () and r0.final
+    assert r0.state == FRESH and r0.pre_basis is None
+    assert steps(ArmState.ARMED, r0.sm11_events) == Transition(ArmState.TRACKING)
+
+    close1 = lv(sign, bar1_close)
+    r1 = post_run("0", ctx=_ctx_at(side, close1, B0 + Q), live=close1, s_at_t=StopAtT(s0, StopBasis.STREAM),
+                  state=r0.state, arm=ArmState.TRACKING, pre_basis=r0.pre_basis)
+    assert r1.guard_verdicts == ()                                     # FirstBarGuard does not apply at bar 1
+    if proposes:
+        assert r1.outcome is Outcome.ADJUST and r1.trigger_met is True
+        assert dict(r1.targets) == {HandleRef("CHILD_ORDER", "O1"): E}
+        for _, target in r1.targets:                                   # never loosen, never past entry
+            assert sign * (target - s0) > 0 and sign * (target - E) <= 0
+    else:
+        assert r1.outcome is not Outcome.ADJUST and not r1.trigger_met and r1.targets == ()
 
 
 class SpyFirstBar(FirstBarGuard):
