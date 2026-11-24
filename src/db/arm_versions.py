@@ -21,7 +21,9 @@ Redis keys `position:{adapter_id}:{position_id}` / `order:{adapter_id}:{broker_o
   `snapshot` or `dlq` (never `history`) and `broker_time_ms <= T`. Its level is the handle's level. The
   non-counting read returns **every** version newer than that counting one that does not count (round 14 review: a
   `history` or unlabelled version with a broker time at or before `T`, newer by (broker time, seq); a version with no
-  broker time (watermark), newer by seq) **with their order-state fields** (level, status, units, kind; plan S38g):
+  broker time (watermark), newer by seq and older by seq than every counting version timed after `T`: one newer than
+  a post-`T` counting version was read after it and shows state from after `T`, so it takes no part, as in
+  `stopbasis._untimed_newer`, live review 2026-11-25) **with their order-state fields** (level, status, units, kind; plan S38g):
   a newer non-counting version gives `PRIOR_VERSION`, and the pure rule (`src/riskmgr/stopbasis.py`) tests the
   farthest from entry of the prior counting level and every one of theirs, so a loosen followed by a re-tighten, or a
   loosened amend seen only through an untimed REST row, is never tested at a smaller risk. Their levels alone never
@@ -97,8 +99,9 @@ _FIELDS_NAMED: Final = (
 #: Every version of each handle newer than its newest counting version at or before `$3` (= T) that does not count,
 #: with their order-state fields (round 14 review: the direction rule of `stopbasis.handle_at_bar_end` takes the
 #: farthest of them): timed non-counting ones at or before T newer by (broker time, seq) than every counting one, and
-#: untimed ones newer by `seq_id`. At most `$4` per handle, newest by `seq_id` first (the reader asks
-#: `NONCOUNTING_LIMIT + 1`, so it can tell that more exist).
+#: untimed ones newer by `seq_id` and older by `seq_id` than every counting version timed after T (§B6.4: a later
+#: untimed row was read after that post-T version and shows state from after T; `stopbasis._untimed_newer`). At most
+#: `$4` per handle, newest by `seq_id` first (the reader asks `NONCOUNTING_LIMIT + 1`, so it can tell that more exist).
 SQL_STOP_NONCOUNTING: Final = (
     "SELECT entity_key, seq_id, broker_time_ms, origin, level, status, units, order_kind FROM ("
     f"SELECT e.entity_key, e.seq_id, e.broker_time_ms, e.origin, {_FIELDS_NAMED}, "
@@ -108,7 +111,10 @@ SQL_STOP_NONCOUNTING: Final = (
     "AND NOT EXISTS (SELECT 1 FROM event_log c WHERE c.entity_type = e.entity_type AND c.entity_key = e.entity_key "
     f"AND c.action = 'APPLIED' AND c.origin IN {COUNTING_SQL} AND c.broker_time_ms IS NOT NULL "
     "AND c.broker_time_ms <= $3::bigint AND CASE WHEN e.broker_time_ms IS NULL THEN c.seq_id > e.seq_id "
-    "ELSE (c.broker_time_ms, c.seq_id) > (e.broker_time_ms, e.seq_id) END)"
+    "ELSE (c.broker_time_ms, c.seq_id) > (e.broker_time_ms, e.seq_id) END) "
+    "AND (e.broker_time_ms IS NOT NULL OR NOT EXISTS (SELECT 1 FROM event_log a WHERE a.entity_type = e.entity_type "
+    f"AND a.entity_key = e.entity_key AND a.action = 'APPLIED' AND a.origin IN {COUNTING_SQL} "
+    "AND a.broker_time_ms > $3::bigint AND a.seq_id < e.seq_id))"
     ") AS v WHERE rn <= $4::int ORDER BY entity_key, seq_id"
 )
 #: Marker (no level): the newest counting `stop_read` version after `$3` per handle (stop changed after bar end).

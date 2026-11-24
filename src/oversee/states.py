@@ -89,10 +89,6 @@ def _step_known(s: BreachState, r: Result, p: StepParams) -> tuple[BreachState, 
     level, release = r.effective_level, r.effective_release_level
     trs: list[Transition] = []
     if s.unknown_origin and s.active:
-        if r.holds and level < Level.SOFT_HALT <= release:
-            # A holding PASS (a missing-stop grace): the capped unknown-origin state stays as it is, so neither
-            # 'resolved' nor an early 'uncapped' under the old reason is sent; it can't escalate while capped.
-            return replace(s, pending_level=None, pending_since=None, release_pending_since=None), []
         if level < Level.SOFT_HALT:  # resolves once a known result is below SOFT
             out, trs = _set_level(s, level, r.cap, r.reason, p)
             return replace(out, unknown_origin=False), trs
@@ -145,6 +141,8 @@ def step_state(prev: BreachState | None, rule_id: str, subject: Subject, outcome
             s = replace(s, uncapped_ms=s.uncapped_ms + dt)
     else:
         s, trs = _step_unknown(s, outcome.reason, p)
+        if outcome.detail:   # alert text only (oversee-rules.md §6: stop_kind_inconsistent names its child ids)
+            trs = [replace(t, detail=outcome.detail) if t.reason == outcome.reason else t for t in trs]
     s = _below_soft(prev_level, s, p.now_ms)
     s = _cool_down_reset(s, p)
     inert = not s.active and s.pending_since is None and s.unknown_since is None

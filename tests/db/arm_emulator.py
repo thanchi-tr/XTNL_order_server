@@ -412,16 +412,21 @@ class ArmEmulator:
         return (v["entity_key"], v["seq_id"], v["broker_time_ms"], v["origin"], v["payload"].get("order_kind"))
 
     def _stop_noncounting(self, a: tuple[Any, ...]) -> list[tuple[Any, ...]]:
-        """Every non-counting version newer than the handle's newest counting one at or before T, at most `a[3]` per
-        handle, newest by seq first (`SQL_STOP_NONCOUNTING`, round 14 review)."""
+        """Every non-counting version newer than the handle's newest counting one at or before T (an untimed one also
+        older by seq than every counting version after T), at most `a[3]` per handle, newest by seq first
+        (`SQL_STOP_NONCOUNTING`, round 14 review, live review 2026-11-25)."""
         mine = self._versions(a[0], keys=a[1])
         counting = [v for v in mine if v["origin"] in COUNTING and v["broker_time_ms"] is not None
                     and v["broker_time_ms"] <= a[2]]
 
+        after = [v for v in mine if v["origin"] in COUNTING and v["broker_time_ms"] is not None
+                 and v["broker_time_ms"] > a[2]]
+
         def newer(v: dict[str, Any]) -> bool:
             same = [c for c in counting if c["entity_key"] == v["entity_key"]]
-            if v["broker_time_ms"] is None:
-                return not any(c["seq_id"] > v["seq_id"] for c in same)
+            if v["broker_time_ms"] is None:     # live review 2026-11-25: never one read after a post-T counting version
+                return not any(c["seq_id"] > v["seq_id"] for c in same) and not any(
+                    c["entity_key"] == v["entity_key"] and c["seq_id"] < v["seq_id"] for c in after)
             return not any((c["broker_time_ms"], c["seq_id"]) > (v["broker_time_ms"], v["seq_id"]) for c in same)
 
         picked = [v for v in mine if newer(v) and (

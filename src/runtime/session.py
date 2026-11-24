@@ -128,6 +128,7 @@ import redis.asyncio as aioredis
 from src.adapters.base import BrokerAdapter
 from src.adapters.ratelimit import RestBudget, RestPriority, rest_priority
 from src.cache import keys as K
+from src.cache.client import feed_redis_from
 from src.cache.feed_stream import FEED_GROUP, FeedEntry, RedisFeedStream
 from src.cache.halt_mirror import RedisHaltMirror
 from src.cache.live_reader import RunIdReader, info_run_id
@@ -167,7 +168,7 @@ from src.notifications.relay import RELAY_MAX_STAMP_AGE_S, Escalation, OutboxRel
 from src.notifications.rotation import RotatingChannels
 from src.notifications.settings import DeadmanSettings, NotificationSettings
 from src.oversee.config import OverseeConfig
-from src.oversee.feed import FeedObserver
+from src.oversee.feed import FeedConfig, FeedObserver
 from src.oversee.gate import Action, ActionGate, GateContextReader
 from src.oversee.halt import HaltStore, HaltSwitch, HaltTxn
 from src.oversee.inhibit import EPOCH_SETTLE_MS, AlertInhibitor
@@ -731,6 +732,11 @@ class _PacedFeedStream:
                 await asyncio.sleep(left)
         return out
 
+    async def read_own_pending(self, count: int) -> list[FeedEntry]:
+        """This consumer's own pending entries (XREADGROUP id 0, no BLOCK; oversee-rules.md §3 Consumer-Group
+        Recovery). A plain pass-through: an empty answer is the normal case and is never paced."""
+        return await self._inner.read_own_pending(count)
+
     async def autoclaim(self, min_idle_ms: int, count: int) -> list[FeedEntry]:
         return await self._inner.autoclaim(min_idle_ms, count)
 
@@ -1138,8 +1144,15 @@ class EngineSession:
             self.ruleset_reloader = RulesetReloader(
                 self.ruleset_source, self.rules, pager=self.page, accounts=self._known_accounts,
                 sweep_now=self.sweep.sweep_now, poll_s=self._t.ruleset_poll_s)
-        self.feed = FeedObserver(_PacedFeedStream(RedisFeedStream(redis, ctx.node_id)), self.sweep, self.identity.expected,
-                                 ports.feed_quarantine, ctx.clock_ms, pager=self._oversee_page)
+        # The feed observer's XREADGROUP BLOCK read gets a client of its own whose socket timeout leaves headroom over
+        # the BLOCK time (src/cache/client.py feed_redis_from), so an ordinary loop stall never times the read out;
+        # the gate, the sweep, SM8 and the integrity worker keep the engine client and its 2 s budget. Closed by
+        # `aclose` with the term.
+        feed_cfg = FeedConfig()
+        self.feed_redis = feed_redis_from(redis, feed_cfg.block_ms)
+        self.feed = FeedObserver(_PacedFeedStream(RedisFeedStream(self.feed_redis, ctx.node_id)), self.sweep,
+                                 self.identity.expected, ports.feed_quarantine, ctx.clock_ms, config=feed_cfg,
+                                 pager=self._oversee_page)
         self._gate_reader: GateContextReader = ports.gate_reader(GateInputs(
             node_epoch=self._node_epoch, lease_valid=self._lease_valid, settle_until_ms=lambda: self._settle_until,
             sweep_view=self.sweep.account_view, clock_ms=ctx.clock_ms, latest_open_ms=self._latest_open,
@@ -1487,6 +1500,12 @@ class EngineSession:
         if self._http is not None:
             steps.append(("http client", self._http.aclose, None))
         steps.append(("term pool", self.ports.close, self.ports.terminate))
+        feed_redis = self.feed_redis
+
+        async def close_feed_redis() -> None:
+            # the pool is this term's own (feed_redis_from): close it too, not just the client
+            await feed_redis.aclose(close_connection_pool=True)
+        steps.append(("feed redis", close_feed_redis, None))
         steps.extend(self._extra_closers)
         self._extra_closers = []
 

@@ -101,7 +101,7 @@ async def test_resolve_unlisted_resolves_inactive_rows_without_an_event() -> Non
     db.t.breaches[inert.key] = inert
     switch = HaltSwitch(db, db)
     resolved = await switch.resolve_unlisted({"A1"}, now_ms=5_000, sweep_id=20)
-    assert [s.key for s in resolved] == [inert.key]
+    assert resolved == ()      # stored resolved, but not returned: only rows that were active are paged (round 2)
     after = db.t.breaches[inert.key]
     assert after.resolved_at == 5_000 and after.resolved_by == "entity_end" and after.pending_since is None
     assert after.clear_generation == 1 and after.last_sweep_id == 20

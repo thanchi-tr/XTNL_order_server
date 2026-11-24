@@ -26,14 +26,24 @@
   count). Any other long gap is a stall: the fence names it (`process stalled N s`) and is an ordinary fence, so a
   loop of stalls still reaches the FAILED restart budget. With no suspend clock (none passed, an unknown platform, a
   failed read) every fence is ordinary. The fence itself is unchanged (still at once, still the same exit code).
+* **Exit before I/O** (live review 2026-11-25, §3 "hard-exits the engine (os._exit)"): a fence arms a backstop
+  (`os._exit` with the fence's exit code after `FENCE_BACKSTOP_S`, 12 s + 2 s < TTL 15 s) before the sleep-fence
+  hook and the fence function run, so a hook or a log write blocked on a stalled stderr pipe can never keep a
+  lease-less ex-leader alive; the fence function itself logs the reason (`hard_exit`). The keeper logger's records
+  go through an unbounded in-memory queue (`decouple_keeper_logging`, installed by `start()`): a stalled handler
+  never blocks the keeper thread, and no line is dropped (§17: the log is the only channel on the single PC).
 
 `tick()` performs one keeper iteration and is what the thread loops over; tests drive it directly
 with a fake monotonic clock and a fake EtcdClient.
 """
 from __future__ import annotations
 
+import atexit
 import ctypes
 import logging
+import logging.handlers
+import os
+import queue
 import sys
 import threading
 import time
@@ -43,7 +53,7 @@ from typing import Final, Literal
 
 from src.db.epoch import Epoch
 from src.runtime.etcd import LEADER_KEY, EtcdClient, EtcdError, KeyValue
-from src.runtime.exits import ExitFn, hard_exit
+from src.runtime.exits import ExitFn, exit_code, hard_exit
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +61,8 @@ DeadlineReason = Literal["init_failed", "abdicate"]
 ETCD_ELECTION_WORST_S: Final = 2 * 2.5
 ENDPOINT_FAILOVER_S: Final = 2.0
 SUSPEND_GAP_S: Final = 5.0
+FENCE_BACKSTOP_S: Final = 2.0
+"""A fence whose exit has not happened this long after it was armed is forced by `os._exit` (12 s + 2 s < TTL 15 s)."""
 """A gap between two keeper iterations above this means the process did not run; a suspend only when the suspend
 clock confirms it (round 14)."""
 
@@ -88,6 +100,80 @@ def system_suspend_clock() -> SuspendClock | None:
     except Exception:
         return None
     return read
+
+
+def _exit_now(reason: str) -> None:
+    """The production fence backstop: no logging, no stderr, no flush (nothing that can block)."""
+    os._exit(exit_code(reason))
+
+
+class _KeepRecordHandler(logging.handlers.QueueHandler):
+    """Enqueue the record itself (same process): the real handlers format it, the JSON formatter keeps `exc`."""
+
+    def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
+        return record
+
+
+class _ForwardToParents(logging.Handler):
+    """On the listener thread: hand a keeper record to the handlers it would have reached by propagation."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        super().__init__()
+        self._logger = logger
+
+    def emit(self, record: logging.LogRecord) -> None:
+        parent = self._logger.parent
+        if parent is not None:
+            parent.callHandlers(record)
+
+
+_LOG_QUEUE_LOCK = threading.Lock()
+_log_queue: tuple[logging.Handler, logging.handlers.QueueListener, queue.SimpleQueue[logging.LogRecord]] | None = None
+_DRAIN_AT_EXIT_S: Final = 1.0
+
+
+def decouple_keeper_logging() -> None:
+    """Route this module's log records through an unbounded in-memory queue drained by a listener thread into the
+    handlers they would have reached (the root stderr handler with its URL-redacting filter and JSON formatter), so
+    a log call on the keeper thread never blocks on a stalled stderr pipe. Nothing is dropped (operations.md §17).
+    Idempotent, process-wide; `start()` calls it."""
+    global _log_queue
+    with _LOG_QUEUE_LOCK:
+        if _log_queue is not None:
+            return
+        q: queue.SimpleQueue[logging.LogRecord] = queue.SimpleQueue()
+        handler = _KeepRecordHandler(q)
+        listener = logging.handlers.QueueListener(q, _ForwardToParents(log), respect_handler_level=True)
+        listener.start()
+        log.addHandler(handler)
+        log.propagate = False
+        _log_queue = (handler, listener, q)
+
+
+def restore_keeper_logging() -> None:
+    """Undo `decouple_keeper_logging` (tests): direct propagation again, the queued records delivered first."""
+    global _log_queue
+    with _LOG_QUEUE_LOCK:
+        if _log_queue is None:
+            return
+        handler, listener, _ = _log_queue
+        log.removeHandler(handler)
+        log.propagate = True
+        listener.stop()
+        _log_queue = None
+
+
+def _drain_keeper_log_queue() -> None:
+    """At a normal interpreter exit: give the listener up to 1 s to deliver what is queued (never blocks longer)."""
+    current = _log_queue
+    if current is None:
+        return
+    deadline = time.monotonic() + _DRAIN_AT_EXIT_S
+    while not current[2].empty() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+atexit.register(_drain_keeper_log_queue)
 
 
 @dataclass(frozen=True)
@@ -128,7 +214,8 @@ class LeaseKeeper:
                  clock: Callable[[], float] = time.monotonic, fence: ExitFn = hard_exit,
                  leader_key: str = LEADER_KEY, wall: Callable[[], float] = time.time,
                  on_suspended_fence: Callable[[float], None] | None = None,
-                 suspend_clock: SuspendClock | None = None) -> None:
+                 suspend_clock: SuspendClock | None = None, backstop: ExitFn | None = None,
+                 backstop_after_s: float = FENCE_BACKSTOP_S) -> None:
         self._etcd = etcd
         self.timings = timings or LeaseTimings()
         self._clock = clock
@@ -141,6 +228,11 @@ class LeaseKeeper:
         self._slept_s = 0.0
         self.suspended_fences = 0
         self._fence_fn = fence
+        # the fence's exit, forced after `backstop_after_s` (module docstring); production (fence = hard_exit) gets
+        # `os._exit`, an injected fence none unless one is injected too, so tests never exit
+        self._backstop: ExitFn | None = backstop if backstop is not None else (
+            _exit_now if fence is hard_exit else None)
+        self._backstop_after_s = backstop_after_s
         self._key = leader_key
         self._lock = threading.Lock()
         self._held: _Held | None = None
@@ -259,6 +351,12 @@ class LeaseKeeper:
             if self._fenced is not None:
                 return
             self._fenced = reason
+        if self._backstop is not None:
+            # armed before any I/O: the hook's file write and every log call below can block (stalled stderr pipe)
+            timer = threading.Timer(self._backstop_after_s, self._backstop, (reason,))
+            timer.daemon = True
+            timer.name = "lease-fence-backstop"
+            timer.start()
         if suspended:
             self.suspended_fences += 1
             hook = self.on_suspended_fence
@@ -267,8 +365,7 @@ class LeaseKeeper:
                     hook(slept)                 # best effort, synchronous: the fence follows at once
                 except Exception:
                     log.exception("sleep fence not recorded")
-        log.critical("FENCE: %s", reason)
-        self._fence_fn(reason)
+        self._fence_fn(reason)                  # production: hard_exit logs the reason after arming its own exit
 
     def _note_iteration(self, now: float) -> None:
         """The gap since the previous iteration (monotonic and wall: the process did not run) and the part of it
@@ -366,6 +463,7 @@ class LeaseKeeper:
     def start(self) -> None:
         if self._thread is not None:
             return
+        decouple_keeper_logging()
         self._thread = threading.Thread(target=self._run, name="lease-keeper", daemon=True)
         self._thread.start()
 

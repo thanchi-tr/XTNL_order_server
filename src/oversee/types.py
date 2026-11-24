@@ -71,9 +71,6 @@ class Result:
     release_level: Level | None = None
     stale_symbols: frozenset[SymbolKey] = frozenset()
     wants_cash_flows: bool = False
-    #: A PASS that holds an active SOFT-or-higher state where it is instead of resolving it (MissingStopLossRule's
-    #: grace after a stop disappears): with release_level SOFT_HALT, nothing is created, released or (re)capped.
-    holds: bool = False
 
     @property
     def effective_level(self) -> Level:
@@ -91,7 +88,7 @@ class Result:
 
     def capped(self) -> Result:
         return Result(self.level, self.reason, Cap.SOFT, self.risk_pct, self.release_level,
-                      self.stale_symbols, self.wants_cash_flows, self.holds)
+                      self.stale_symbols, self.wants_cash_flows)
 
 
 @dataclass(frozen=True)
@@ -163,6 +160,10 @@ class Transition:
     cap: Cap
     reason: str
     activation_id: int | None = None
+    #: The UNKNOWN result's own detail when the transition carries that result's reason (e.g. the inconsistent
+    #: child ids of `stop_kind_inconsistent`, oversee-rules.md §6). Alert text only: never part of `reason`, of the
+    #: `oversee_events` key or of the stored rule state, so every exact-equality use of `reason` is unchanged.
+    detail: str = ""
 
     @property
     def event_key(self) -> tuple[str, str, str, str, int]:

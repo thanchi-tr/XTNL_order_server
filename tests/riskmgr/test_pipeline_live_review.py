@@ -1,8 +1,9 @@
 """Live review of the SL edge rule through the pipeline (design §B6.3, §B6.4, §20 Q1, Q2, Q5; findings 1, 3, 7-11, 14).
 
 * Finding 1: a REOPEN after an E re-pin (the tracker drops the recorded target, `state_after_entry_repin`) never
-  gives a target on the loss side of E and never `COMPLETE` with a handle there; a final-advice target on the loss
-  side of the current E never counts as answered (`answers_final_advice`).
+  gives a target on the loss side of E and never `COMPLETE` with a handle there. A final-advice target left on the
+  loss side of a re-pinned E still counts as answered (`answers_final_advice`, §B6.4 round 14: SM11 has no re-pin
+  edge, so the advice stays outstanding; live review round 2).
 * Finding 3: a stop loosened after `T` and then seen through an untimed row does not withhold a bar that met the
   trigger at the real `S_at_T`.
 * Findings 7-11, 14: rounding toward profit on coarse and non-decimal grids, the step (12) gap from the rounded target
@@ -112,9 +113,10 @@ def test_reopen_after_any_re_pin_never_targets_or_releases_on_the_loss_side() ->
 
 
 @pytest.mark.parametrize("sign,side", [(1, "BUY"), (-1, "SELL")])
-def test_a_final_advice_target_on_the_loss_side_of_e_is_never_answered(sign: int, side: str) -> None:
-    """A final ADJUST target advised under an earlier E (now on the loss side of the re-pinned E) never counts as
-    answered, so the bar keeps its PRE levels; a target at the current E still does."""
+def test_a_final_advice_target_left_by_a_repin_still_counts(sign: int, side: str) -> None:
+    """§B6.4 round 14 ("a move on final advice is never discounted"): a final ADJUST target advised under an earlier
+    E, now on the loss side of the re-pinned E, still counts as answered while the position is ADVICE_OUTSTANDING
+    (SM11 has no re-pin edge), exactly as a target at the current E does."""
     new_e = E + sign * D("0.00010")
     s_pre = new_e - sign * D("0.00100")
     pre = PreBasis.of(side, new_e, [(O1, s_pre)], T)  # type: ignore[arg-type]
@@ -126,7 +128,7 @@ def test_a_final_advice_target_on_the_loss_side_of_e_is_never_answered(sign: int
                              this_bar_pre=pre, final_advice_target=target)
 
     assert answers_final_advice(inp(new_e, new_e))
-    assert not answers_final_advice(inp(E, E))          # the stale target, on the loss side of the new E
+    assert answers_final_advice(inp(E, E))              # the target advised before the re-pin: still answered
 
 
 # ---------------------------------------------------------------------------------------------------- finding 3

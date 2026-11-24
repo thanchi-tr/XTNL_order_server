@@ -14,10 +14,17 @@ bar, a `Wait`, a `Hold` or None; a REOPEN attempt that did not decide is marked 
 the BarClock lists, as `BarSlot`s, every bar end of an open bucket after the cursor up to now (a bucket of a closed
 period is not a bar and is not listed). Bars whose cap has passed undecided become **one**
 terminal `UNRESOLVED_RANGE(from, to, reason)` span per contiguous run with one reason (`bar_end_ms` = `to`, no
-`commit_state`, hash NULL), which advances the cursor; a bar still undecided at its cap is never decided. The reason
+`commit_state`, hash NULL), which advances the cursor; a bar still undecided at its cap is never decided
+(except a guard's wait, below). The reason
 is the one the slot carries: the reason the bar was last pending with while the ARM ran (FAULT: pages once per
 position episode and counts toward D7), or `downtime` / `paused` / `failed` (INFO) for a bar the ARM did not look at
 while running (the BarClock's default is `downtime`). A span containing bar 0 records `FIRST_BAR_UNKNOWN(stale)`.
+**A guard's wait is not spanned** (§B6.1, §B6.5; live review round 2): a slot whose last pending reason is a guard's
+`<kind>_pending` (`guard_timeout`: its broker bar was final and the pipeline reached the guards) is decided once at
+its cap instead (`POST`, or `LATE` once its POST notice has gone): the pipeline then runs at or after the guard's
+`until`, so `final_verdict` gives `on_timeout` under `unknown_policy` (bar 0: `FIRST_BAR_UNKNOWN(timeout)`, Q3) and
+the cursor advances. If that one decision is not final either, the BarClock clears the flag and the bar is spanned on
+the next pass, so the frontier never sticks.
 Then the first bar whose cap has not passed is decided when its inputs exist (`POST`, or `LATE` once its POST notice
 has gone), else the pass waits: bar n + 1 is never decided before bar n is decided or expired, and since bar n's cap is
 bar n + 1's first read, that never delays it. While the position's scope is FAILED or the ARM is paused the cursor
@@ -195,13 +202,16 @@ class BarSlot:
     ran, `broker_bar_not_final` while it awaits the broker's final bar, or `downtime` / `paused` / `failed`);
     `post_sent`: its POST notice has gone (a decision now is `LATE`);
     `next_open_ms`: set on a pre-close bar, the local time of the next open (a span of it with
-    `broker_bar_not_final` carries a `ReopenCheck`)."""
+    `broker_bar_not_final` carries a `ReopenCheck`);
+    `guard_timeout`: `reason` is a guard's `<kind>_pending` (the broker bar was final) and the bar has not yet been
+    tried at its cap: once expired it is decided (`Decide`), never joined to a span (§B6.1, §B6.5)."""
 
     bar_end_ms: int
     ready: bool = False
     reason: str = DOWNTIME
     post_sent: bool = False
     next_open_ms: int | None = None
+    guard_timeout: bool = False
 
 
 @dataclass(frozen=True)
@@ -286,6 +296,10 @@ def _slot_step(slots: Sequence[BarSlot], now_ms: int, *, spec: BarSpec, skew: Sk
     run: list[BarSlot] = []
     for slot in slots:
         expired = decision_cap_ms(slot.bar_end_ms, spec, skew) <= now_ms
+        if expired and slot.guard_timeout:
+            if run:
+                break          # the run before it is spanned first; this bar is decided on its own
+            return Decide(slot.bar_end_ms, ArmEvent.LATE if slot.post_sent else ArmEvent.POST)
         if expired and (not run or run[-1].reason == slot.reason):
             run.append(slot)
             if _reopen(slot, spec, skew) is not None:

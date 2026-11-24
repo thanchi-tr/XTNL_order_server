@@ -90,6 +90,23 @@ INCREMENT_UNKNOWN: Final = "increment_unknown"
 STOP_AT_BAR_END: Final = "stop_at_bar_end"
 GUARD_PENDING: Final = "guard_pending"
 FIRST_BAR_PENDING: Final = "first_bar_pending"
+GUARD_PENDING_SUFFIX: Final = "_pending"
+"""`DATA_UNAVAILABLE(<kind>_pending)`: a guard PENDING before its `until` (§B6.1; FirstBarGuard: `first_bar_pending`)."""
+_NOT_GUARD_PENDING: Final = frozenset({"previous_post_pending", "reopen_pending"})
+"""Codes of the same form that are not a guard's wait (a PRE caveat, a replay `Wait` reason)."""
+
+
+def guard_pending_reason(guard_kind: str) -> str:
+    """The `DATA_UNAVAILABLE` reason while guard `guard_kind` is PENDING (§B6.1, §B6.5)."""
+    return f"{guard_kind}{GUARD_PENDING_SUFFIX}"
+
+
+def is_guard_pending(reason: str | None) -> bool:
+    """`reason` is a guard's `<kind>_pending`: the bar's broker bar was final and the pipeline reached the guards
+    (step 6), so at `decision_cap` the bar is decided by the guard's `on_timeout` / `unknown_policy` (§B6.1, §B6.5),
+    never spanned for it."""
+    return (reason is not None and reason.endswith(GUARD_PENDING_SUFFIX) and reason not in _NOT_GUARD_PENDING
+            and len(reason) > len(GUARD_PENDING_SUFFIX) and bool(CODE_RE.fullmatch(reason)))
 EXIT_QUOTE_NOT_LIVE: Final = "exit_quote_not_live"
 
 # UNRESOLVED_RANGE / UNRESOLVED reasons (§B5.2, §B6.6).

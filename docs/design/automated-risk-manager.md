@@ -1398,7 +1398,8 @@ now (under PR9 a read at most 15 s old) and the live quote.
 **As built (S24, S36b):** `src/db/arm_versions.py` (new) reads `S_at_T` in one READ ONLY REPEATABLE READ snapshot with
 three statements: the newest counting version per handle at or before `T` (`history` and `DROPPED_STALE` excluded),
 **every** version newer than that counting one that does not count (timed non-counting candidates at or before `T`
-and untimed watermark versions, with their order-state fields since S38g; round 14 review: so a non-counting loosen
+and untimed watermark versions older by `seq` than every counting version after `T` (live review 2026-11-25),
+with their order-state fields since S38g; round 14 review: so a non-counting loosen
 followed by a non-counting re-tighten is tested at the loosened level; at most 32 per handle, and one more makes the
 handle unresolved, `DATA_UNAVAILABLE(stop_at_bar_end)`), and a level-less marker read of the newest `stop_read` after `T`, so
 `PRIOR_VERSION` and `stop_changed_after_bar_end` can be labelled and a non-counting level can only make the test

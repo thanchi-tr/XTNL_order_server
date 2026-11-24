@@ -228,13 +228,16 @@ class HaltSwitch:
         resolve those states again, and they would hold the level forever (§2 Release: an entity gone from
         the snapshot resolves). Called by the RiskSweep. Under HALT_LOCK the current rows are read, so no
         CAS is needed; clear_generation is bumped so any in-flight write built from an older read fails. An
-        inactive row (a pending / UNKNOWN episode that never activated) is resolved with no transition or alert."""
+        inactive row (a pending / UNKNOWN episode that never activated) is resolved with no transition or alert
+        (§2 Confirm). Returns only the rows that were active and got a 'resolved' transition, the ones the RiskSweep
+        may page and count as a drop below SOFT; the inactive ones are stored silently and not returned (§10)."""
         async with self._store.transaction() as tx:
             gone = [s for s in await tx.breach_states()
                     if s.resolved_at is None and s.account_id not in listed]
             if not gone:
                 return ()
             updated: list[BreachState] = []
+            was_active: list[BreachState] = []
             events: list[Transition] = []
             for s in sorted(gone, key=lambda b: b.key):
                 by: ResolvedBy = "sweep" if s.rule_id == EVALUATION_RULE_ID else "entity_end"
@@ -249,12 +252,13 @@ class HaltSwitch:
                     unknown_since=None, unknown_origin=False, resolved_at=now_ms, resolved_by=by,
                     below_soft_since=now_ms if s.level >= Level.SOFT_HALT else s.below_soft_since,
                     last_pass_ms=now_ms, last_sweep_id=sweep_id, clear_generation=s.clear_generation + 1))
+                was_active.append(updated[-1])
                 events.append(Transition(s.rule_id, s.subject_type, s.subject_id, s.account_id, "resolved", sweep_id,
                                          now_ms, Level.PASS, s.cap, "account_unlisted", s.activation_id))
             await tx.save_states(updated)
             await tx.insert_events(events)
             await tx.insert_outbox(alerts_for_transitions(events))
-        return tuple(updated)
+        return tuple(was_active)
 
     async def upsert_state(self, key: StateKey,
                            build: Callable[[BreachState | None], tuple[BreachState, Sequence[Transition]] | None]

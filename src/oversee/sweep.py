@@ -703,7 +703,7 @@ class RiskSweep:
             return
         self._unlisted_checked = True
         self._unlatch("unlisted_states_unresolved", None)
-        if resolved:
+        if resolved:   # only rows that were active: a never-activated episode is resolved silently (§2 Confirm)
             dropped = [s for s in resolved if s.below_soft_since is not None]
             if dropped:
                 self._unlisted_drop = max(dropped, key=lambda s: s.below_soft_since or 0)

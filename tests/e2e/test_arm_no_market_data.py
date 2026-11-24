@@ -64,6 +64,8 @@ from tests.riskmgr.tracker_fakes import ADAPTER
 D = Decimal
 NUMBER = re.compile(r"[-+]?\d*\.\d+(?:[eE][-+]?\d+)?|\d+[eE][-+]?\d+")
 """A decimal number in text (hex digests and integer ids / times carry no decimal point)."""
+MAX_ADJUSTED = 100
+"""A token whose magnitude is beyond 1e100 is a hex-hash fragment (`03e4200890`), never a market value."""
 INTEGER = re.compile(r"(?<![\w.+-])\d+(?![\w.])")
 """A bare integer in text (not part of a decimal, an exponent or a hex / word token)."""
 MAX_SCALE = 8
@@ -124,9 +126,13 @@ def numbers(leaves: Iterable[Any]) -> Iterator[tuple[str, Decimal | None]]:
             leaf = leaf.decode("utf-8", "replace")
         for token in NUMBER.findall(str(leaf)):
             try:
-                yield token, D(token)
+                value = D(token)
             except InvalidOperation:
                 yield token, None
+                continue
+            # a hex hash fragment such as `03e4200890` reads as 3E+4200890: no price, and `normalize()` would
+            # overflow on it; its digits are still checked for planted runs
+            yield token, value if abs(value.adjusted()) <= MAX_ADJUSTED else None
 
 
 def integers(leaves: Iterable[Any]) -> Iterator[int]:

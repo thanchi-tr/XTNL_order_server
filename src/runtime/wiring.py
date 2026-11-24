@@ -660,12 +660,15 @@ class Engine:
 
 
 def _production_optional_bootstrap(flags: OptionalFlags, raw: Mapping[str, str], config: RuntimeConfig,
-                                   settings: EngineSettings, control: ConnectionSource) -> OptionalBootstrap | None:
+                                   settings: EngineSettings, control: ConnectionSource,
+                                   source: SecretsSource | None = None) -> OptionalBootstrap | None:
     """S31: the production `optional-bootstrap` factory, built only when `XTNL_MD_ENABLED=1` (the modules of the
     optional services are not even imported otherwise). The ARM pool uses the engine DSN under its own
     `application_name` and `SET ROLE xtnl_arm`; the control pool reads the epoch, the previous term and this node's
     market-data record; the FAILED spool sits beside the DLQ spill file. S32: the production plan
-    (`src/runtime/optional_plan.py`) gives the tasks and the request handlers."""
+    (`src/runtime/optional_plan.py`) gives the tasks and the request handlers. `source` is the engine's secrets
+    source: the `XTNL_MD_*` / `XTNL_ARM_*` secrets come from it on AWS (operations.md §13) and the ARM channels follow
+    it like the Oversee channels (`RotatingChannels`, plan S29)."""
     if not flags.md_enabled:
         return None
     from src.runtime.optional import OptionalDeps, default_arm_pool, make_optional_bootstrap
@@ -674,9 +677,10 @@ def _production_optional_bootstrap(flags: OptionalFlags, raw: Mapping[str, str],
     unfiltered = tuple(sorted({StoneXAdapter.adapter_id for p in settings.adapters
                                if p.stonex is not None and p.stonex.price_unfiltered}))
     return make_optional_bootstrap(OptionalDeps(
-        environ=raw, repo_root=pathlib.Path(__file__).resolve().parents[2], spool_dir=config.spill_path.parent,
+        environ=raw, secrets=source, repo_root=pathlib.Path(__file__).resolve().parents[2],
+        spool_dir=config.spill_path.parent,
         arm_pool=default_arm_pool(settings.storage.dsn) if flags.arm_enabled else None, control=control,
-        unfiltered=unfiltered, plan=production_plan(raw)))
+        unfiltered=unfiltered, plan=production_plan(raw, secrets=source)))
 
 
 def build_engine(config: RuntimeConfig, *, environ: Mapping[str, str] | None = None,
@@ -883,7 +887,7 @@ def build_engine(config: RuntimeConfig, *, environ: Mapping[str, str] | None = N
         deadman_alert_after_s=deadman_alert_after_s,
         optional_flags=optional_flags, sleep_log=sleep_log,
         optional_bootstrap=h.optional_bootstrap or _production_optional_bootstrap(
-            optional_flags, raw, config, settings, control))
+            optional_flags, raw, config, settings, control, source))
 
     def session_factory(epoch: Epoch) -> EngineSession:
         return EngineSession(ctx, epoch)
