@@ -22,6 +22,7 @@ from src.armconfig.installer import document_json
 from src.db.pg import PgConnection
 from src.ops import arm_sql as A
 from src.ops import cli
+from src.ops.arm import bar_capable_adapters as ops_bar_capable_adapters
 from src.ops.arm import (
     HEARTBEAT_MAX_AGE_MS,
     MAX_PENDING_ARM_REQUESTS,
@@ -634,7 +635,9 @@ def test_bars_cap_follows_the_adapters_rule() -> None:
         assert config.default_bars_per_min(rate) == ratelimit.default_bars_per_min(rate)
         assert config.max_bars_per_min(rate) == ratelimit.max_bars_per_min(rate)
     c = ArmContext.from_env({"XTNL_ARM_STOP_READS": "1", "CTRADER_REST_BARS_PER_MIN": "30"})
-    assert c.stop_reads and c.bars_per_min["pepperstone"] == 30 and c.bar_capable == frozenset()
+    # the bar-capable set follows the go-live gate table (since 2026-11-26 no S39 blocker is open: {stonex})
+    assert c.stop_reads and c.bars_per_min["pepperstone"] == 30
+    assert c.bar_capable == ops_bar_capable_adapters() == frozenset({"stonex"})
     assert ArmContext.from_env({}).config_source() is None           # no DSN: no source
 
 

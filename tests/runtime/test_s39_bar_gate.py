@@ -33,9 +33,17 @@ def bars_capable(adapter_id: str) -> bool:
     return OptionalRuntime._bars_capable(runtime_with_bar_adapters(), adapter_id)  # noqa: SLF001 (the unit under test)
 
 
+#: A synthetic gate S39 waits for: since 2026-11-26 no real gate is OPEN, so the "while open" case uses this one.
+SYNTH_OPEN = golive.Gate("synth_open", "synthetic S39 blocker", golive.GateState.OPEN, "test only")
+
+
 def accept_every_open_gate(monkeypatch: pytest.MonkeyPatch) -> None:
-    ids = ",".join(g.gate_id for g in golive.GATES if g.state is golive.GateState.OPEN)
-    monkeypatch.setenv(golive.ACCEPT_VAR, ids)
+    """Every OPEN gate (the synthetic one) accepted in `XTNL_ARM_GOLIVE_ACCEPT`, which is not an S39 acceptance."""
+    gates = golive.GATES + (SYNTH_OPEN,)
+    monkeypatch.setattr(golive, "BY_ID", {g.gate_id: g for g in gates})
+    real = golive.s39_blockers           # the real function on the synthetic table (its default is bound at def time)
+    monkeypatch.setattr(golive, "s39_blockers", lambda gates=gates: real(gates))
+    monkeypatch.setenv(golive.ACCEPT_VAR, SYNTH_OPEN.gate_id)
     monkeypatch.setenv(golive.STOP_AT_ENTRY_VAR, "1")
 
 
@@ -52,9 +60,9 @@ def test_wildcard_assignment_never_arms_stonex_while_s39_gates_are_open(monkeypa
     import os
 
     accept_every_open_gate(monkeypatch)
-    assert golive.verdict(os.environ).allowed                     # XTNL_ARM_ENABLED=1 would start the ARM
-    assert golive.s39_blockers()                                  # but S39's gates are open in the table
-    assert golive.bar_capable_adapters() == frozenset() == ops_arm.BAR_CAPABLE_ADAPTERS
+    assert golive.verdict(os.environ, golive.GATES + (SYNTH_OPEN,)).allowed   # XTNL_ARM_ENABLED=1 would start it
+    assert golive.s39_blockers()                                  # but an S39 gate is open in the table
+    assert golive.bar_capable_adapters() == frozenset()
     assert not bars_capable(STONEX)
     grid = CalendarGrid(schedule_of=lambda _a, _s: None, bars_capable=bars_capable)
     assert grid.bar_sides(STONEX) == frozenset()
@@ -64,10 +72,11 @@ def test_wildcard_assignment_never_arms_stonex_while_s39_gates_are_open(monkeypa
     assert r.tracker.unmanaged() == ((f"{STONEX}:P1", "UNSUPPORTED", A.NO_BROKER_BARS),)
 
 
-def test_the_same_position_arms_once_no_s39_gate_is_open(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The control: with the table's S39 blockers closed, StoneX joins the one set and the position arms."""
-    monkeypatch.setattr(golive, "s39_blockers", lambda gates=golive.GATES: ())
-    assert golive.bar_capable_adapters() == golive.BROKER_BAR_ADAPTERS
+def test_the_same_position_arms_once_no_s39_gate_is_open() -> None:
+    """The control, on the real table (2026-11-26: no S39 blocker is OPEN): StoneX joins the one set and the
+    position arms."""
+    assert golive.s39_blockers() == ()
+    assert golive.bar_capable_adapters() == golive.BROKER_BAR_ADAPTERS == ops_arm.BAR_CAPABLE_ADAPTERS
     assert bars_capable(STONEX) and not bars_capable("pepperstone")
     grid = CalendarGrid(schedule_of=lambda _a, _s: None, bars_capable=bars_capable)
     r = stonex_wildcard_rig(grid)

@@ -187,6 +187,8 @@ takes StoneX-scoped assignments) only once every other gate is wired or recorded
 `src/riskmgr/golive.py` (the `arm gates` report's `s39_waits_for` and `bar_capable_adapters`), not in the env file.
 For `pr3_stop_children`, run `.venv/Scripts/python.exe -m src.adapters.stonex.probe_bars --check-stops` (your own
 shell, `STONE_X_*` set, the engine stopped) while a position with a stop is open; the report lists order ids only.
+Status 2026-11-26: `pr3_stop_children` measured (conclusive, wired) and `pr3_roll_prints` accepted by the user,
+so no gate is open and StoneX is bar-capable.
 
 ## Enable / disable (AWS)
 

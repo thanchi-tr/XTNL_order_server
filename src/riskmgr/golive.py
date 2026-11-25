@@ -13,7 +13,8 @@ The ARM may advise on real positions only when every go-live item is **wired** (
   bar-capable and any of them is still OPEN in this table. A user acceptance for S39 is recorded here (state ACCEPTED,
   with the date and the user's words in `detail`), never inferred; an `XTNL_ARM_GOLIVE_ACCEPT` entry never makes an
   adapter bar-capable. S39 is built (2026-11-17): StoneX `fetch_price_bars` serves bars and `pr3_finality` is wired,
-  but `bar_capable_adapters()` is derived from this table, so it stays empty until no S39 blocker is OPEN here. Both
+  but `bar_capable_adapters()` is derived from this table, so it stays empty until no S39 blocker is OPEN here
+  (2026-11-26: `pr3_stop_children` measured, `pr3_roll_prints` accepted by the user, so none is OPEN). Both
   readers use it: `arm config accept` / admission (`src/ops/arm.py`) and the runtime arm-tracker's `bar_sides`
   (`src/runtime/optional_plan.py::_bars_capable`: the adapter's `price_bars_supported` **and** membership here), so
   no assignment, wildcard or adapter-scoped, can arm a StoneX position while it is empty (S39 review, major).
@@ -21,8 +22,9 @@ The ARM may advise on real positions only when every go-live item is **wired** (
 A gate is OPEN until the stage that closes it changes its state here (and its test proves the wiring). The table
 holds ids, titles and states only.
 Plan S39b wired the six engineering gates (`uptime_suspend`, `receipt_gap_feed`, `replay_rerun`,
-`conformance_probe_partial`, `entry_time_source`, `corrections_restart`; `tests/riskmgr/test_s39b.py`); the open ones
-left are user decisions and PR3 measurements.
+`conformance_probe_partial`, `entry_time_source`, `corrections_restart`; `tests/riskmgr/test_s39b.py`). The two PR3
+items were closed 2026-11-26 (`pr3_stop_children` by the --check-stops measurement, `pr3_roll_prints` by the user's
+acceptance); no gate is OPEN. The OPEN path stays for a future gate.
 """
 from __future__ import annotations
 
@@ -90,12 +92,15 @@ GATES: Final[tuple[Gate, ...]] = (
          "StoneX fetch_price_bars enabled; finality stays two equal reads (trusts_next_bucket / "
          "trusts_partial_flag False), XTNL_STONEX_PRICE_UNFILTERED 0 (delivery filtered)",
          closed_by_s39=True),
-    Gate("pr3_stop_children", "PR9 stop children confirmed in activestoplimitorders", GateState.OPEN,
-         "not measured by PR3: XTNL_ARM_STOP_READS stays 0; run probe_bars --check-stops with an open position "
-         "that has a stop; manual stop moves on ORDERS and LastChangedDateTimeUTC on amendments are unmeasured"),
-    Gate("pr3_roll_prints", "StoneX bars across the daily roll compared", GateState.OPEN,
-         "not measured by PR3: whether 15m bid bars covering 16:45-17:15 New York carry break prints (several "
-         "days against TICK bars); roll_affected is set on every bar 0 overlapping 17:00 New York meanwhile"),
+    Gate("pr3_stop_children", "PR9 stop children confirmed in activestoplimitorders", GateState.WIRED,
+         "measured 2026-11-26 (probe_bars --check-stops, live_readonly, engine stopped): conclusive, every open "
+         "position's stop child listed in activestoplimitorders (1 of 1 attached, 0 positions without a stop "
+         "child); XTNL_ARM_STOP_READS stays 0; manual stop moves on ORDERS and LastChangedDateTimeUTC on "
+         "amendments are still unmeasured"),
+    Gate("pr3_roll_prints", "StoneX bars across the daily roll compared", GateState.ACCEPTED,
+         "accepted by the user 2026-11-26 (\"Probe 1, accept 2\", to turn the ARM on) without the several-day "
+         "comparison of 15m bid bars covering 16:45-17:15 New York against TICK bars; roll_affected stays set on "
+         "every bar 0 overlapping 17:00 New York"),
     # ---------------------------------------------------------------- S39b: the six engineering gates (wired)
     Gate("uptime_suspend", "BarClock uptime suspend signal", GateState.WIRED,
          "S39b: the uptime tracker's suspend signal reaches the BarClock and every strategy job "

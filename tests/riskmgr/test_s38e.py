@@ -171,22 +171,44 @@ STOP_RULE_ON = {golive.STOP_AT_ENTRY_VAR: "1"}
 """S38f: accepting `oversee_c4` counts only with the S07 Oversee stop rule switched on."""
 
 
-def _open_ids() -> list[str]:
-    return [g.gate_id for g in golive.GATES if g.state is golive.GateState.OPEN]
+#: Two synthetic OPEN gates on top of the real table: since 2026-11-26 no real gate is OPEN (pr3_stop_children measured,
+#: pr3_roll_prints accepted by the user), so the OPEN path is exercised on a table that still has some.
+SYNTH_OPEN = (golive.Gate("synth_a", "synthetic open gate a", golive.GateState.OPEN, "test only"),
+              golive.Gate("synth_b", "synthetic open gate b", golive.GateState.OPEN, "test only"))
+SYNTH_GATES = golive.GATES + SYNTH_OPEN
 
 
-def test_open_gates_refuse_the_arm_until_each_is_accepted() -> None:
-    assert len({g.gate_id for g in golive.GATES}) == len(golive.GATES)
-    v = golive.verdict({})   # switch off: the table-accepted oversee_c4 is refused as well
+def _open_ids(gates: tuple[golive.Gate, ...] = SYNTH_GATES) -> list[str]:
+    return [g.gate_id for g in gates if g.state is golive.GateState.OPEN]
+
+
+@pytest.fixture
+def synth_by_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`accepted_ids` checks ids against `golive.BY_ID`: the synthetic table's ids are known to it."""
+    monkeypatch.setattr(golive, "BY_ID", {g.gate_id: g for g in SYNTH_GATES})
+
+
+def test_no_real_gate_is_open_after_the_2026_11_26_decisions() -> None:
+    assert _open_ids(golive.GATES) == []
+    assert golive.verdict(dict(STOP_RULE_ON)).allowed
+    v = golive.verdict({})        # the table-accepted oversee_c4 still needs the S07 stop rule switched on
+    assert not v.allowed and [g.gate_id for g in v.refused] == ["oversee_c4"]
+
+
+def test_open_gates_refuse_the_arm_until_each_is_accepted(synth_by_id: None) -> None:
+    assert len({g.gate_id for g in SYNTH_GATES}) == len(SYNTH_GATES)
+    assert _open_ids() == ["synth_a", "synth_b"]
+    v = golive.verdict({}, SYNTH_GATES)   # switch off: the table-accepted oversee_c4 is refused as well
     assert not v.allowed and [g.gate_id for g in v.refused] == _open_ids() + ["oversee_c4"]
-    v = golive.verdict(dict(STOP_RULE_ON))
+    v = golive.verdict(dict(STOP_RULE_ON), SYNTH_GATES)
     assert not v.allowed and [g.gate_id for g in v.refused] == _open_ids()
-    v = golive.verdict({golive.ACCEPT_VAR: ",".join(_open_ids()[:-1]), **STOP_RULE_ON})
+    v = golive.verdict({golive.ACCEPT_VAR: ",".join(_open_ids()[:-1]), **STOP_RULE_ON}, SYNTH_GATES)
     assert not v.allowed and [g.gate_id for g in v.refused] == _open_ids()[-1:]
-    v = golive.verdict({golive.ACCEPT_VAR: " , ".join(_open_ids()) + ", clear_probes, nope", **STOP_RULE_ON})
+    v = golive.verdict({golive.ACCEPT_VAR: " , ".join(_open_ids()) + ", clear_probes, nope", **STOP_RULE_ON},
+                       SYNTH_GATES)
     assert v.allowed and v.accepted == tuple(sorted(_open_ids()))
     assert len(v.problems) == 2 and all(golive.ACCEPT_VAR in p for p in v.problems)
-    assert golive.refusal_text(golive.verdict(dict(STOP_RULE_ON))).count(",") == len(_open_ids()) - 1
+    assert golive.refusal_text(golive.verdict(dict(STOP_RULE_ON), SYNTH_GATES)).count(",") == len(_open_ids()) - 1
 
 
 def test_the_gates_s38e_closed_are_wired_and_the_rest_are_listed() -> None:
@@ -198,24 +220,29 @@ def test_the_gates_s38e_closed_are_wired_and_the_rest_are_listed() -> None:
     assert {"oversee_c4", "s21_c1", "q1_q2", "c2_c3_c5", "s25_registry", "claude_rules"} <= accepted
     # S39b wired the six engineering gates (tests/riskmgr/test_s39b.py::test_the_six_gates_are_wired)
     assert "uptime_suspend" in wired and "corrections_restart" in wired
-    # S39 wired pr3_finality after the PR3 probe; its unmeasured stop-read and roll items stay open
-    assert "pr3_finality" in wired and {"pr3_stop_children", "pr3_roll_prints"} <= set(_open_ids())
+    # S39 wired pr3_finality after the PR3 probe; 2026-11-26: the PR9 stop-children check was measured (wired) and
+    # the user accepted the roll-prints item, both recorded with the date and the user's words
+    assert {"pr3_finality", "pr3_stop_children"} <= wired and "pr3_roll_prints" in accepted
+    assert "2026-11-26" in golive.BY_ID["pr3_stop_children"].detail
+    assert "accepted by the user 2026-11-26" in golive.BY_ID["pr3_roll_prints"].detail
 
 
 def test_s39_waits_for_every_gate_it_does_not_close_itself() -> None:
     """S39 (an adapter in `BAR_CAPABLE_ADAPTERS`) is refused while any gate other than `pr3_finality` is OPEN in
     the table: a user acceptance for S39 is recorded there (state ACCEPTED), never inferred."""
     blockers = {g.gate_id for g in golive.s39_blockers()}
-    assert "pr3_finality" not in blockers and "pr3_stop_children" in blockers
-    assert not ops_arm.BAR_CAPABLE_ADAPTERS or not blockers, \
-        f"S39 enabled bars while go-live gates are open: {sorted(blockers)}"
+    assert "pr3_finality" not in blockers
+    assert not ops_arm.BAR_CAPABLE_ADAPTERS or not blockers,         f"S39 enabled bars while go-live gates are open: {sorted(blockers)}"
+    assert {g.gate_id for g in golive.s39_blockers(SYNTH_GATES)} == {"synth_a", "synth_b"}
+    assert golive.bar_capable_adapters(golive.s39_blockers(SYNTH_GATES)) == frozenset()
+    assert not blockers and ops_arm.BAR_CAPABLE_ADAPTERS == frozenset({"stonex"})     # 2026-11-26
 
 
 def test_ops_arm_gates_exits_3_while_enabling_would_be_refused(capsys: pytest.CaptureFixture[str]) -> None:
     assert ops_main(["arm", "gates"], environ={}) == 3
     out = capsys.readouterr().out
     assert "outcome: refused" in out and "arm_enable_allowed: False" in out and "gate=oversee_c4" in out
-    assert ops_main(["arm", "gates"], environ={golive.ACCEPT_VAR: ",".join(_open_ids()), **STOP_RULE_ON}) == 0
+    assert ops_main(["arm", "gates"], environ=dict(STOP_RULE_ON)) == 0
     assert "arm_enable_allowed: True" in capsys.readouterr().out
 
 
@@ -232,7 +259,7 @@ def test_ops_arm_gates_reads_the_engine_env_file_when_named(tmp_path: Any,
     out = capsys.readouterr().out
     assert "arm_enable_allowed: True" in out and f"settings_source: env_file:{env_file}" in out
     env_file.write_text(f"{golive.ACCEPT_VAR}=\n", encoding="utf-8")
-    everything = {golive.ACCEPT_VAR: ",".join(_open_ids()), **STOP_RULE_ON}
+    everything = dict(STOP_RULE_ON)        # the shell's switch is ignored when the env file is named
     assert ops_main(["arm", "gates", "--env-file", str(env_file)], environ=everything) == 3
     assert ops_main(["arm", "gates"], environ=shell) == 3
     assert "settings_source: process_environment" in capsys.readouterr().out
