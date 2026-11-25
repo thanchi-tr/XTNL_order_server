@@ -124,5 +124,5 @@ Round 5 verified 5 open items plus 2 regression findings on round 4. The skeptic
 
 - **PC sleep.** The PC slept at night (2026-11-23 and 2026-11-24). `docs/runbooks/single-pc-autostart.md` prerequisite 5 says: when plugged in, sleep after **Never**.
 - **Calendar review.** Check the StoneX EURUSD / AUDUSD default FX hours and holidays, then run `python -m src.ops market-sessions accept`.
-- **ARM switched off.** The ARM is off on the live server (`XTNL_MD_ENABLED` off). Turning it on needs the go-live gates the owner holds in `src/riskmgr/golive.py`.
+- **ARM switched on (2026-11-26).** The owner asked to "turn arm on". `pr3_stop_children` was measured with `probe_bars --check-stops` (conclusive, 1 of 1) and `pr3_roll_prints` was accepted by the owner ("Probe 1, accept 2"), both recorded in `src/riskmgr/golive.py`. The pending ARM config (`be_15m`) was accepted (`arm config accept`, audit 44). `XTNL_MD_ENABLED=1` and `XTNL_ARM_ENABLED=1` are set in `deploy/env/local.env`. A glued line in that file had made the ARM push URL invalid; it was split.
 - **Live-trading-server skill.** The `/live-trading-server` skill cannot be invoked by an agent (it is reserved for the user).

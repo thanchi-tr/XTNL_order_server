@@ -212,13 +212,15 @@ async def test_a_non_get_inside_a_bar_read_is_refused_before_it_is_sent(monkeypa
 
 
 # --- gates and the ops bar-capable set -----------------------------------------------------------------------
-def test_s39_wires_pr3_finality_and_leaves_stop_and_roll_items_open() -> None:
+def test_s39_wires_pr3_finality_and_the_stop_and_roll_items_are_closed() -> None:
+    """2026-11-26: pr3_stop_children measured by `probe_bars --check-stops` (WIRED), pr3_roll_prints accepted by the
+    user (ACCEPTED); neither is closed by S39 itself, so neither is an S39 blocker any more."""
     by_id = golive.BY_ID
     assert by_id["pr3_finality"].state is golive.GateState.WIRED
-    for gate_id in ("pr3_stop_children", "pr3_roll_prints"):
-        assert by_id[gate_id].state is golive.GateState.OPEN and not by_id[gate_id].closed_by_s39
-    blockers = {g.gate_id for g in golive.s39_blockers()}
-    assert {"pr3_stop_children", "pr3_roll_prints"} <= blockers and "pr3_finality" not in blockers
+    assert by_id["pr3_stop_children"].state is golive.GateState.WIRED
+    assert by_id["pr3_roll_prints"].state is golive.GateState.ACCEPTED
+    assert not by_id["pr3_stop_children"].closed_by_s39 and not by_id["pr3_roll_prints"].closed_by_s39
+    assert golive.s39_blockers() == ()
 
 
 def test_bar_capable_adapters_follow_the_gate_table() -> None:
@@ -226,6 +228,9 @@ def test_bar_capable_adapters_follow_the_gate_table() -> None:
     assert ops_arm.bar_capable_adapters([]) == frozenset({"stonex"})                  # every blocker closed
     assert ops_arm.bar_capable_adapters([object()]) == frozenset()
     assert ops_arm.BAR_CAPABLE_ADAPTERS == ops_arm.bar_capable_adapters()
-    if golive.s39_blockers():                                                        # today: user gates open
+    if golive.s39_blockers():                                                        # a gate S39 waits for is open
         assert ops_arm.BAR_CAPABLE_ADAPTERS == frozenset()
         assert ops_arm.ArmContext.from_env({}).bar_capable == frozenset()
+    else:                                                                            # since 2026-11-26
+        assert ops_arm.BAR_CAPABLE_ADAPTERS == frozenset({"stonex"})
+        assert ops_arm.ArmContext.from_env({}).bar_capable == frozenset({"stonex"})

@@ -453,13 +453,27 @@ async def test_a_missing_arm_channel_leaves_the_arm_idle_with_one_page(
         assert pages.titles() == ["ARM not started"] and "push" in pages.items[0][2]
 
 
+#: Two synthetic OPEN gates: since 2026-11-26 no real gate is OPEN (pr3_stop_children measured, pr3_roll_prints
+#: accepted by the user), so the refusal path runs on a table that still has some.
+SYNTH_OPEN_GATES = golive.GATES + (
+    golive.Gate("synth_a", "synthetic open gate a", golive.GateState.OPEN, "test only"),
+    golive.Gate("synth_b", "synthetic open gate b", golive.GateState.OPEN, "test only"))
+
+
 async def test_open_go_live_gates_leave_the_arm_idle_with_one_page(
-        tmp_path: Path, redis: Any, md_redis: Any) -> None:
+        tmp_path: Path, redis: Any, md_redis: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """S38e: `XTNL_ARM_ENABLED=1` with a go-live gate open and not accepted: the ARM stays idle for the term (no pool
     is built), one page names the gate ids, and the market-data layer still runs."""
+    import src.runtime.optional as optional_mod
+
+    real_verdict = golive.verdict
+    monkeypatch.setattr(golive, "BY_ID", {g.gate_id: g for g in SYNTH_OPEN_GATES})
+    monkeypatch.setattr(optional_mod, "golive_verdict",
+                        lambda environ, gates=SYNTH_OPEN_GATES, **kw: real_verdict(environ, gates, **kw))
     pages = Pages()
     s = make_session(tmp_path, redis, flags=OptionalFlags(md_enabled=True, arm_enabled=True), pages=pages)
-    open_ids = [g.gate_id for g in golive.GATES if g.state is golive.GateState.OPEN]
+    open_ids = [g.gate_id for g in SYNTH_OPEN_GATES if g.state is golive.GateState.OPEN]
+    assert open_ids == ["synth_a", "synth_b"]
     partial = {**ARM_CHANNELS, golive.ACCEPT_VAR: ",".join(open_ids[1:]) + ",no_such_gate"}
     pools = Pools()
     runner = OptionalBootstrapRunner(s, deps(tmp_path, md_redis, {**MD_ENV, **partial}, arm_pool=pools))
